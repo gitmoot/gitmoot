@@ -1,7 +1,9 @@
 package pluginpack
 
 import (
+	"bytes"
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +12,7 @@ import (
 	"testing/fstest"
 
 	"github.com/gitmoot/gitmoot/internal/buildinfo"
+	"github.com/gitmoot/gitmoot/skills"
 )
 
 func TestBuildCodexPackage(t *testing.T) {
@@ -472,24 +475,57 @@ func TestBuildDefaultPackageDir(t *testing.T) {
 	assertFileContains(t, filepath.Join(want, "skills", "gitmoot", "SKILL.md"), "Gitmoot")
 }
 
-func TestBuildUsesEmbeddedSkillByDefault(t *testing.T) {
-	out := filepath.Join(t.TempDir(), "gitmoot")
-	_, err := Build(BuildOptions{
-		Provider: ProviderCodex,
-		OutDir:   out,
-		Info:     buildinfo.Info{Version: "0.1.0"},
+// TestBuildServesTheCanonicalSkillBytes pins the one-source rule (#2595): both
+// plugin packages carry exactly the files of skills/gitmoot, byte for byte, and
+// nothing else.
+func TestBuildServesTheCanonicalSkillBytes(t *testing.T) {
+	want := map[string][]byte{}
+	err := fs.WalkDir(skills.FS, skillRoot, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		data, err := fs.ReadFile(skills.FS, path)
+		want[strings.TrimPrefix(path, skillRoot+"/")] = data
+		return err
 	})
 	if err != nil {
-		t.Fatalf("Build() error = %v", err)
+		t.Fatal(err)
 	}
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "Gitmoot Agent Skill")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "gitmoot agent ask <agent>")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "gitmoot job open --agent <agent>")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "CLI.md"), "gitmoot agent ask project-planner --repo owner/repo")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "WORKFLOWS.md"), "Current-Chat Agent Work")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "RESULT_CONTRACT.md"), "gitmoot_result")
-	if _, err := os.Stat(filepath.Join(out, "skills", "gitmoot", "agent-templates")); !os.IsNotExist(err) {
-		t.Fatalf("built package must not contain agent-templates dir, stat err = %v", err)
+	for _, rel := range []string{"SKILL.md", "references/CLI.md", "references/RESULT_CONTRACT.md", "references/SAFETY.md", "references/WORKFLOWS.md"} {
+		if _, ok := want[rel]; !ok {
+			t.Fatalf("canonical skill is missing %s", rel)
+		}
+	}
+	for _, provider := range []Provider{ProviderCodex, ProviderClaude} {
+		out := filepath.Join(t.TempDir(), "gitmoot")
+		if _, err := Build(BuildOptions{Provider: provider, OutDir: out, Info: buildinfo.Info{Version: "0.1.0"}}); err != nil {
+			t.Fatalf("Build(%s) error = %v", provider, err)
+		}
+		skillDir := filepath.Join(out, "skills", PluginName)
+		got := map[string][]byte{}
+		err := filepath.WalkDir(skillDir, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return err
+			}
+			rel, err := filepath.Rel(skillDir, path)
+			if err != nil {
+				return err
+			}
+			data, err := os.ReadFile(path)
+			got[filepath.ToSlash(rel)] = data
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s package has %d skill files, canonical skill has %d", provider, len(got), len(want))
+		}
+		for rel, data := range want {
+			if !bytes.Equal(got[rel], data) {
+				t.Fatalf("%s package %s differs from skills/gitmoot/%s", provider, rel, rel)
+			}
+		}
 	}
 }
 

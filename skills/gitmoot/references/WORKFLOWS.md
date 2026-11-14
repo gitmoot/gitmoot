@@ -1,416 +1,145 @@
 # Gitmoot Workflows
 
-## External-coordinator workflows
+Three end-to-end walkthroughs. Every command is in
+[CLI.md](CLI.md) with its full flags.
 
-Use `--workflow <label>` when an external coordinator needs one durable group
-across Gitmoot jobs without lifecycle state. The flag works on `agent ask`,
-`agent review`, and `job open`.
-
-```sh
-gitmoot agent ask planner "Run release checks." --repo owner/repo --background --workflow release-42
-gitmoot workflow describe release-42 "Validate and ship release 42."
-gitmoot workflow note release-42 "Kickoff." --author operator --status "Release checks running"
-gitmoot workflow note release-42 "Canary passed." --author operator
-gitmoot workflow show release-42
-gitmoot workflow close release-42 --reason "Release 42 shipped and verified."
-```
-Before any job exists, explicitly register durable intent with
-`gitmoot workflow register <label> "<description>"`. Repeating registration
-does not overwrite existing intent. The registered workflow appears in workflow
-reads and accepts notes, messages and escalations without a dummy job.
-`workflow note` reports a journal save, not message delivery; use
-`message send ROLE "TEXT"` when a recipient needs a notification. Ordinary
-messages do not need a workflow; `--workflow LABEL` optionally associates one.
-
-
-`description` is the stable human "what/why" line. Gitmoot seeds it on the first
-note from a referenced issue title available in local workflow jobs, otherwise
-the first note sentence, otherwise the campaign portion of the label. Override
-it with `workflow describe <label> "<text>"`. The legacy note flag `--summary`
-remains an alias for description and mirrors the value into the retained
-`summary` field for older clients; omitting it preserves both, while an explicit
-empty value clears them until a later note seeds description again.
-
-`status` is the live line. `workflow note --status "..."` is the manual escape
-hatch. For workflow-linked PRs, the daemon writes visibly marked `[auto:pr:...]`
-notes as author `daemon` and updates status at open, checks-green/ready-to-merge,
-and merged or closed-without-merging transitions. Repeated polls do not duplicate
-the same workflow/PR/transition note. Description and status are stored verbatim
-with independent 300-byte limits.
-
-When `workflow note` runs inside Herdr and `--pane`, `--session`, or `--workdir`
-is omitted, it fills each omitted value from `herdr pane current --current`.
-The pane label, full agent session UUID, and pane working directory become the
-latest handoff; explicit flags always win. Use `--no-auto` to disable this for a
-script. Lookup failures are ignored so the note still lands, and author is never
-inferred. The dashboard only builds a resume command from a full UUID.
-
-In `gitmoot dashboard --web`, labeled jobs cluster around workflow hubs in
-Galaxy; a labeled run links to `/workflows/<label>`, which shows the complete
-run forest, state totals, best-effort token totals, and shared journal.
-The dashboard Config page also includes a read-only, names-only Keychain section
-with live file status, registry modes, and configured proxy placement.
-Credential values and value-derived data are never projected.
-
-The append-only journal stores text and authors verbatim. JSON show output keeps
-them verbatim; terminal text output sanitizes escapes/control bytes and caps each
-field to one line. V1 has no group lifecycle controls and allows reuse.
-
-## First Repo Setup
-
-The supported one-liner is `gitmoot setup`, which registers the repo and an
-agent in one command (`--watch-issues` defaults on, so the daemon comes up
-tagging-ready). `--repo`, `--agent`, `--runtime`, and `--session` are all
-**required** (setup exits with an error if any is missing); `--session` takes a
-runtime session reference (for omp a session UUID or `fresh:<suffix>`, never
-`last`) or a shell command:
+## Set up a repository for reviews
 
 ```sh
-gitmoot setup --repo owner/repo --agent reviewer --runtime omp --session fresh:reviewer --start-daemon
-```
-
-Or the manual path:
-
-1. Confirm the repo identity and GitHub auth.
-2. Run `gitmoot doctor` to validate `gh auth`, the required `omp` runtime, and
-   registered agent runtimes before anything can stall on them.
-3. Start the daemon.
-4. Start or subscribe at least one agent.
-5. Verify the agent is healthy before asking PR comments to route jobs.
-
-```sh
-gh repo view --json nameWithOwner
-gh auth status
-gitmoot doctor
+gitmoot init
+gitmoot repo add owner/repo --path /path/to/checkout
+gitmoot org seat add <your-role> --pane <pane-id>
+gitmoot agent subscribe reviewer-1 --runtime omp --session fresh:reviewer-1 --role <reviewer-role> --repo owner/repo --capability review
 gitmoot daemon start
-gitmoot agent start reviewer --runtime omp --repo owner/repo --role reviewer --capability ask --capability review --start-daemon
-gitmoot agent doctor reviewer
+gitmoot doctor
 ```
 
-Local `agent review` and native engine review fan-out enforce an exact-head loop guard before a new review job is created. An
-homogeneous succeeded decision history for `(repo, PR, head_sha)` is refused and
-emits one `review_loop_detected` event on the matched succeeded job; the CLI
-hard-errors while the engine blocks the task. A new commit or mixed decisions at
-one head proceeds. The loop guard permits an empty engine event only before any
-succeeded history exists; local CLI preparation still requires a concrete head.
-The old verdict is evidence for escalation, never a cached response. An admitted
-local review then receives a per-job detached read-only worktree at the requested
-head. Allocation is fail-closed and requires a measurable 5 GiB free-space floor;
-the stable Task row remains lifecycle identity rather than a shared checkout.
-This exact decision-bearing key replaces no round counter: #1419's panel
-explicitly rejected that instrument. Direct PR-comment ingress is unchanged in
-this safe half and remains #1433 work.
+The reviewer needs the `review` capability and must not also have `implement`.
+An omp reviewer's `--session` is a UUID or `fresh:<suffix>`; omp starts a fresh
+session for every job. The daemon picks queued reviews up; `gitmoot daemon
+status` shows that it is running.
 
-## Review Agent From A PR Comment
+## A seat's pull request, from push to merge
 
-1. Register a reviewer agent for the target repo.
-2. Ensure the daemon watches the same repo.
-3. Comment on the PR.
-4. Inspect job status if no result appears.
+1. Write the change on your branch, push it, open the pull request.
+2. Record that you wrote it, then ask for a review of the exact head:
 
-```text
-/gitmoot reviewer review
-```
+   ```sh
+   gitmoot job record --agent <seat> --repo owner/repo --type implement --decision implemented --pr 42 --branch my-branch --summary "add retry to the fetcher"
+   gitmoot review request --repo owner/repo --pr 42 --head <40-hex-sha>
+   ```
 
-Gitmoot removes triple-backtick and tilde fenced code blocks plus closed inline
-backtick spans before considering comment commands. It then verifies through
-GitHub that the comment author currently has `write`, `maintain`, or `admin`
-permission on the repository before the remaining command text reaches the
-parser. Ordinary prose and code examples produce no Gitmoot reply; a malformed
-command from an authorized author produces a visible routing error. On a pull
-request, a line that is addressed by shape but names an unimplemented action —
-as source code does routinely, since `@Published private(set) var state =
-.uninitialized` matches the `@<agent> <action>` form — produces no reply at all
-and is logged instead, while a recognized action with a bad argument still
-replies. On an issue only `ask` is acted on, so any other action is dropped
-before dispatch with no reply and no log entry. An unclosed
-fenced code block treats the remainder of the comment as code, so any later
-command is ignored without a reply.
+   `gitmoot review level --repo owner/repo --pr 42` says whether the head needs
+   a review before merge; a `level2_background` head merges first and is
+   reviewed after, with `--post-merge`.
+
+3. Keep working. Gitmoot wakes your role when the verdict is saved. To look
+   sooner: `gitmoot review status --repo owner/repo --pr 42`.
+4. On `changes_requested`, read the findings
+   (`gitmoot findings --repo owner/repo --pr 42`), fix them, push, and request
+   a review of the new head. The implement record from step 2 covers every
+   head of the pull request, so it need not be repeated. The re-review closes
+   a finding only by citing its UID (`continues_uid`, see
+   [RESULT_CONTRACT.md](RESULT_CONTRACT.md#the-findings-ledger)).
+5. On `approved` at the current head with green CI, the gate merges (when
+   automatic merge is on) or a `/gitmoot merge` comment asks it to. If it
+   holds, the reason names the remedy.
+
+## A review with no model, on a throwaway home
+
+To check the flow without spending a model, register a `shell` reviewer whose
+command prints a verdict, and run the job in the foreground. It needs no
+GitHub login, no Herdr and no omp, and touches nothing outside `/tmp/gm-demo`.
+`--home $H` keeps all state in `$H/.gitmoot`; `HOME` is exported too because
+`git` and `gitmoot version` read it.
 
 ```sh
-gitmoot job list --repo owner/repo
-gitmoot job show <job-id>
-gitmoot job events <job-id>
+export HOME=/tmp/gm-demo
+H=/tmp/gm-demo/h
+mkdir -p $HOME && git init -q -b main $HOME/repo && cd $HOME/repo
+git remote add origin https://github.com/acme/widget.git
+git config user.name demo && git config user.email demo@example.com
+git commit -q --allow-empty -m base && git switch -q -c feat
+echo hi > a.txt && git add a.txt && git commit -q -m "add a.txt" && git rev-parse HEAD
+gitmoot init --home $H
 ```
 
-## Current-Chat Planner
+`repo add` reads the checkout's `origin` remote, so the repository needs one;
+it is never contacted. `org seat add` needs an acting role declared in the
+org registry: by default that is `owner`. `gitmoot org init` writes it but then
+fails without Herdr, so declare it directly. Append to `$H/.gitmoot/config.toml`
+(the `[disk_guard]` lines only matter on a nearly full disk, where the disk
+guard would otherwise refuse the request; use them in a throwaway home only):
 
-When the user wants a fast implementation plan and the current session (a Claude
-Code or Codex session with the Gitmoot plugin, or an omp session) already has
-the repo context, plan directly in the current chat. Inspect only the relevant
-files, use web search only for current external contracts or best-practice
-claims, and return the plan directly in chat. To track it, open a session job
-with `gitmoot job open --agent <agent> --repo owner/repo --type ask` and close
-it with `gitmoot job close <id>` when done.
+```toml
+[disk_guard]
+min_free_percent = 1
 
-```text
-Use the Gitmoot planner here. Write a task-by-task implementation plan for this feature.
+[org]
+enforce = "warn"
+
+[org.roles."owner"]
+scope = ["*"]
+merge_rule = "owner"
 ```
 
-## Plan-Gated Implement
-
-Gate implementation on an approved plan when the change is non-trivial. The
-gate composes existing primitives — an ask job, a workflow note, an org
-directive — so it works unchanged on any seat, and the
-approval survives restarts because every step is durable state rather than
-conversation.
+Then register the seat and a shell reviewer, and request a review of the head
+printed above:
 
 ```sh
-# 1. Plan, read-only. No file changes, no implement dispatches.
-gitmoot agent ask planner-agent --repo owner/repo --workflow feature-42 \
-  "Write a task-by-task implementation plan for <feature>."
-
-# 2. Record the plan. The printed entry id is the plan-id.
-gitmoot workflow note feature-42 "PLAN: <the complete plan text>"
-# The note must contain the complete plan — it is the text the approval
-# binds to and the fence the implementer is held inside.
-# -> noted workflow feature-42 as entry 1234
-
-# 3. Approve explicitly (org mode). Approval never comes from silence:
-#    the directive is tracked, TTL-nudged, and visible until completed.
-GITMOOT_ORG_ROLE=<approver-role> gitmoot message directive send \
-  --to implementer-role --workflow feature-42 \
-  "approved: implement plan 1234 as written; the plan is the scope fence"
-
-# 4. Implement in the implementer seat's OWN session, quoting the approved
-#    plan-id, then record the work. Gitmoot does not dispatch implementation
-#    (#2203), so the seat is the implementer and the job row is its receipt.
-gitmoot job record --agent builder --repo owner/repo --workflow feature-42 \
-  --type implement --decision implemented \
-  --title "Plan 1234" \
-  --summary "Implemented plan 1234 (workflow note in feature-42), inside its
-   fence; work outside the plan needs an amended plan and a fresh approval."
-
-# 5. Completion ends the directive; closing the workflow is a separate action.
-#    Message and receipt traffic does not reopen closed workflows.
-gitmoot message directive done <directive-id> --role implementer-role
-gitmoot workflow close feature-42 --reason "Plan 1234 implemented and merged."
+gitmoot repo add acme/widget --path $HOME/repo --home $H
+gitmoot org seat add me --home $H
+gitmoot agent subscribe shell-reviewer --runtime shell --session 'echo "{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"Read the whole diff: a.txt adds one line; nothing to run.\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"evidence\":\"static_only\"}}"' --role reviewer --repo acme/widget --capability review --home $H
+gitmoot job record --acting-role me --repo acme/widget --type implement --decision implemented --pr 1 --branch feat --summary "add a.txt" --home $H
+gitmoot review request --repo acme/widget --pr 1 --head <sha> --branch feat --reviewer shell-reviewer --role me --home $H
+gitmoot job run <job-id> --home $H
+gitmoot review status --repo acme/widget --pr 1 --home $H
+gitmoot job show <job-id> --home $H
 ```
 
-Outside org mode, step 3 is an explicit human approval message referencing the
-plan-id; the rest is unchanged. A coordinator may waive the gate for trivial
-mechanical fixes by writing "plan-waived" in the recorded summary — the waiver
-is deliberate and visible, never implied. Under this convention every
-implementation carries either a plan-id or the literal "plan-waived" in its
-recorded summary; one with neither is out of contract. Prefer this
-durable handshake over an
-interactive plan-approval prompt for any unattended seat: a session blocked on
-an in-pane approval modal reports idle, runs no job, and escalates nothing, so
-every fleet channel reads it as healthy while it waits.
+- `me` was created by `org seat add`, so it is an org role, not a registered
+  agent: record it with `--acting-role me`. `--agent me` fails with
+  `agent "me" not found`.
+- Name the shell reviewer with `--reviewer`. A reviewer the router picks
+  itself runs on omp, not on its shell command.
+- The shell session runs sandboxed in a read-only checkout of the head: it can
+  read the checkout (`cat a.txt` works) but not other paths (`cat
+  /tmp/verdict.json` fails `Permission denied` and the job ends `failed`).
+  Print the verdict inline with `echo`. Re-running `agent subscribe` with a
+  new `--session` replaces the command.
+- Pass both `--head` and `--branch` so the request does not need to read the
+  pull request from GitHub.
+- The request prints ``hold: daemon not running: the review stays queued
+  until `gitmoot daemon start` starts the daemon``; `job run` runs it anyway.
+- Read `job run` by its last line, `ran job <id>: <state>`: that is the job's
+  state. An approval may print a line before it such as `job <id> failed: workflow advance failed:
+  ...` is about what happens after the verdict is stored (posting it to the
+  pull request, binding an approval to the head GitHub reports), and needs
+  GitHub. Without it you see a `gh` login or `GH_TOKEN` error, or
+  `review approval held: no observed pull request row records a current head`
+  (no daemon has observed PR 1, so the gate will not count the approval).
+  Both are expected here; the verdict is stored, `review status` shows it,
+  and `job show` lists the error under `failure_diagnostics`.
+- The demo verdict's 40-character-plus `summary` is what passes the
+  `review-verdict-has-evidence` result check; `"summary":"ok"` would fail it.
+- To exercise a finding, commit a second change, swap in a `changes_requested`
+  verdict (with `"severity":"P2"` and a finding carrying `severity`, `file`,
+  `title`), request and run that head, then close the finding at a third head
+  with the `continues_uid` verdict in
+  [RESULT_CONTRACT.md](RESULT_CONTRACT.md#the-findings-ledger).
+- `gitmoot doctor --home $H` exits 1 here: `omp`, `gh auth`, `herdr` and
+  `repo remote` fail because none is available. That is expected for this
+  walkthrough.
+- Clean up with `rm -rf /tmp/gm-demo`.
 
-## Current-Chat Agent Work
-
-When the user says something like:
-
-```text
-Use frontend-reviewer here. Review this diff.
-```
-
-do the work directly in the current chat. This does not create a Gitmoot job,
-start a daemon, resume a runtime session, or post a PR comment. To track it,
-clock in with `gitmoot job open --agent frontend-reviewer --repo owner/repo
---type review` and clock out with `gitmoot job close <id>`. If the user wants
-tracked background execution, use `gitmoot agent ask <agent> --background`
-instead.
-
-## Background Planner Agent
-
-When the user wants a structured implementation plan to run as a tracked
-Gitmoot background agent job, ask a registered agent:
+## Hand off with messages
 
 ```sh
-gitmoot agent ask project-planner --repo owner/repo --background "Write a task-by-task implementation plan for this feature."
-gitmoot job watch <job-id>
+gitmoot message send <parent-role> "PR 42 approved at abc1234; ready to merge"
+gitmoot message inbox
+gitmoot message reply <id> "done"
 ```
 
-Or from a PR comment:
-
-```text
-/gitmoot project-planner ask Write a task-by-task implementation plan for this feature.
-```
-
-Background planner work goes through `gitmoot agent ask`; fast "here" planning
-stays in the current chat.
-
-## Execution Model
-
-Use `here` when the current chat should answer directly from the Gitmoot skill.
-Use `background` when Gitmoot should create a tracked job, store events, and run
-through a runtime adapter.
-
-Background jobs are scheduled against three distinct resources:
-
-- repo checkout mutexes for daemon ticks that use the same local checkout;
-- runtime session locks keyed as `runtime:<runtime>:<runtime_ref>` for
-  resumable-session delivery (omp runs a fresh session per job, so it takes none).
-
-Delivery is self-healing — a job whose events show one of these errors and then
-a success is working as designed, not flaky:
-
-- **Transient auth errors (#487/#509):** a transient 401 ("socket connection
-  closed unexpectedly") under concurrency is retried with backoff; the old
-  session is not abandoned.
-- **Malformed output (#495):** an agent reply missing the `gitmoot_result`
-  envelope records a `malformed_output` event and is re-asked with a repair
-  prompt a bounded number of times before failing terminally.
-
-**Dead implement recovery is gone, with its cause:** Gitmoot no longer
-dispatches implementation (#2203), so there is no Gitmoot-owned implement job
-that can die between editing a task worktree and opening the PR, and therefore
-no `task run`/`task recover` pair to restart or finalize one. A seat that dies
-mid-work left its own worktree dirty: finish or discard it with ordinary git in
-that worktree, then record the outcome with `gitmoot job record --type
-implement`.
-
-**Task dismissal and stale reconciliation:** `dismissed` is a terminal task
-state reached only through implicit workflow transitions; no command dismisses a
-task. The daemon preserves the branch and worktree and audits each transition as `task_dismissed_auto` (or
-`task_dismissed_planned_ttl`) in `gitmoot task events <id>`.
-
-Each repo poll reads a bounded oldest-first stale window and processes up to 20
-qualifying `implementing` tasks whose `updated_at` predates
-`[workflow].stale_task_ttl` (default `168h`; `"0"` disables the leg).
-`updated_at` is deliberately a conservative activity proxy, not proof of
-abandonment. A candidate is skipped for a live job, a same-repo open-PR branch,
-or an exact branch still present on `origin`; remote lookup uncertainty skips
-mutation. A branchless candidate needs no remote lookup. Retrying one of a
-dismissed task's jobs restores it and records its own recovery event. The
-server-side task board omits dismissed rows immediately.
-
-`blocked` and `awaiting_human_merge` use a separate evidence-based disposal
-ladder at that TTL: own PR merged -> `merged`; a later merged task/PR on the same
-referenced issue -> `superseded`; referenced issue/PR closed -> `superseded`;
-otherwise -> terminal `stranded`. Git ancestry is never evidence because a
-superseding branch need not be an ancestor of main. An open
-`awaiting_human_merge` PR stays protected and reaches `stranded` for human
-inspection. Every outcome records its tier and reason on the task; the stranded
-fallback writes at most one durable escalation, and an unavailable route is
-recorded without keeping the task alive. Query with `gitmoot task list --state
-stranded --json`.
-
-The periodic blocked-task alert is bounded independently: three
-interval-separated nudges, one terminal escalation, then no further alerts for
-that episode. Its persisted exhausted stamp does not dispose the task; disposal
-still requires the evidence ladder or its TTL fallback.
-
-Delegation worktrees use a separate default-on retention policy:
-`[workflow].delegation_worktree_ttl = "72h"` (`"0"` disables it). Only final
-owners (`succeeded`, `failed`, `cancelled`) older than the TTL are force-removed.
-Blocked, queued, and running owners remain pinned; `gitmoot doctor` reports the
-reclaimable/pinned/unproven counts and logical size.
-Candidate-local lookup, runner, and removal failures skip only that worktree;
-later candidates continue. The daemon logs three failures per path before
-suppressing repeats. A restart-safe cleanup obligation delays retries by one
-minute and becomes terminal `quarantined` after the third failure; doctor and
-`/api/health` report that count. Use `gitmoot job cleanup list --state
-quarantined` to inspect identities and paths, then `gitmoot job cleanup reopen
-<resource-id>` after repair. Candidate-query and store-wide lookup failures
-remain fatal.
-
-Never-started `planned` tasks use a separate opt-in policy:
-`[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
-zero, and invalid values all resolve to off because automatic dismissal can
-destroy human planning context that nothing else reconstructs.
-When enabled, it reuses the same live-job, same-repo open-PR, remote-branch,
-and remote-uncertainty skips and records `task_dismissed_planned_ttl`. Task
-worktree allocation claims `planned -> implementing` with a write-time CAS, so
-a concurrent TTL dismissal cannot be overwritten; a job retry restores it.
-
-A clean closed-unmerged PR moves `pr_open`, `reviewing`, or
-`changes_requested` to `blocked` with `pr_closed_unmerged`; ambiguous PR state
-does not advance or unblock anything. After advancement handling,
-a terminal top-level implement job with no PR and no live successor blocks an
-otherwise-stuck `implementing` task. Implemented success without a PR records
-`task_blocked_terminal_no_pr`; other terminal outcomes record
-`task_blocked_job_failed`. Tasks with queued retries, fixes, or pending
-advancement remain under their existing owner.
-
-**PR-bound fix pass:** there is no dispatch for one. A `changes_requested`
-verdict reports to the requester and stops there; the requester reopens its own
-checkout on the PR branch, pushes the fix, and records it
-with `gitmoot job record --type implement --pr <number> --head-sha <sha>`.
-Those rows are what the merge gate's implementer attribution and
-reviewer-independence check read, so recording is not bookkeeping — it is how
-the gate learns who implemented and that the reviewer was someone else. Request
-the re-review at the new head with `gitmoot review request --pr <number>`.
-
-While the forge reports a PR as draft, Gitmoot leaves the task in its current
-lifecycle state instead of parking it at `awaiting_human_merge`: a draft is an
-author hold, not a pending human merge decision. The `--draft`/`--ready`
-dispatch flags went with `agent implement`, so mark the PR ready on the forge
-when it should enter review and merge-gate processing.
-
-The daemon default is `--workers 1`. Users can raise it for independent jobs:
-distinct checkouts and distinct runtime sessions (omp jobs each run a fresh
-session, so they never contend). Same-checkout work remains serialized, and a
-job whose resumable runtime session is busy waits for the
-`runtime:<runtime>:<runtime_ref>` lock (`runtime_lock_wait`).
-
-## Multi-Repo Work
-
-Agents are global identities with explicit per-repo access. When working across
-multiple repos, always pass `--repo owner/repo` to status, daemon, job, and event
-commands so jobs are routed in the correct repository context.
-
-```sh
-gitmoot agent allow reviewer --repo owner/project-a
-gitmoot agent allow reviewer --repo owner/project-b
-gitmoot status --repo owner/project-a
-gitmoot status --repo owner/project-b
-```
-
-## Satisfying the workload-mode gate
-
-A pull request whose diff changes the `**Current mode:` marker in `AGENTS.md` is
-HELD until an exact-head reconciliation row exists. The gate is keyed on the
-repository OWNER, so every `gitmoot/*` repository is held, human-requested merges
-included.
-
-Two note streams decide it, both matched by an exact body PREFIX and compared
-case-insensitively on repository:
-
-- DECISION: `[operating-mode repo=<owner/repo> mode=<THROUGHPUT|STEADY|DRAIN>]`
-- RECONCILIATION: `[workload-mode-reconciliation repo=<owner/repo> pr=<number> head=<40-character reviewed head> mode=<mode> decision_note=<note id|none>]`
-
-Every field is `key=value`, whitespace separated, inside the leading bracket. A
-field with an empty key or value makes the whole body unparseable, so the
-`repo=` field inside the body is what identifies the repository:
-
-```
-gitmoot workflow note <label> "[operating-mode repo=owner/repo mode=STEADY]"
-```
-
-`<label>` must be a workflow that already has jobs - `workflow note` refuses an
-unknown label to guard against a typo - so file the row under the lane the PR is
-already being coordinated in rather than inventing a label.
-
-The note's repo COLUMN is a separate, optional thing. `gitmoot workflow note
---repo <owner/repo>` sets it and nothing else - it no longer opts the note into
-anything, because the memory surface it used to accompany is gone (#2202). A
-note whose column is empty still counts when its body names this repository,
-which is the ordinary case, so setting the column is optional; getting `repo=`
-right in the BODY is not. Prefer setting it anyway for an operating-mode or
-reconciliation note: the gate reads those through two bounded windows, one
-repo-scoped and one for the repo-less rows, and a scoped note cannot be crowded
-out of the window by other repositories' notes.
-
-PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
-it. `decision_note=none` means the PR itself is the decision, and the row's own
-`created_at` is `decided_at`; otherwise `decision_note` names the newest
-operating-mode note the exact head implements. A row that cites a note the PR
-contradicts cannot ratify it.
-
-WHEN A DECISION CANNOT BE READ. An unreadable newest decision - a malformed field
-list, a `mode` that is not a workload mode, or a note recorded for this
-repository whose body omits or contradicts `repo=` - SUPERSEDES like any other
-decision rather than reading as "no decision". It is a recency boundary, not a
-veto: a fresh exact-head row that agrees with the PR's own marker still merges,
-so correcting the note is optional. The gate refuses outright only when nothing
-readable remains - the note is unreadable AND the PR's marker patch is missing or
-ambiguous - and the hold then names both exits: append a readable operating-mode
-note, and file an exact-head row citing it.
-
-CLEARING A HOLD. The hold is a pending merge-gate decision, not a failure: the
-task stays `ready_to_merge`, the gate records the cause as its pending reason
-(also published on the PR's pending merge-gate commit status), and the daemon
-re-evaluates it on the next poll tick, so the PR merges once a valid row lands.
+Keep the message ids you still owe an answer in your handoff notes. A message
+you send to a busy role stays `queued` until it can take it; you get one notice
+if it waits more than 15 minutes.

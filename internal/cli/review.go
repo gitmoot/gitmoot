@@ -1323,7 +1323,7 @@ func reviewRequestHolds(paths config.Paths, home string) ([]string, bool) {
 	if err != nil {
 		holds = append(holds, "daemon state unknown: "+err.Error())
 	} else if !running {
-		holds = append(holds, "daemon not running: the review stays queued until `gitmoot daemon run` starts")
+		holds = append(holds, "daemon not running: the review stays queued until `gitmoot daemon start` starts the daemon")
 	}
 	if evaluation := evaluateConfiguredDiskGuard(paths); !evaluation.allowsDispatch() {
 		holds = append(holds, "disk guard paused dispatch: "+evaluation.detail())

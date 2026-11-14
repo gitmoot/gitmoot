@@ -2399,3 +2399,23 @@ func TestReviewRouterInstructionsAcceptVerifiedCIOnlyForChecksTheEnvironmentCann
 		t.Errorf("no-execution instruction changed: %s", static)
 	}
 }
+
+// The daemon-not-running hold must name the command a requester actually runs
+// to start the daemon: `daemon start`, not the inner `daemon run` worker the
+// skill never mentions (#2595).
+func TestReviewRequestHoldNamesDaemonStart(t *testing.T) {
+	home := t.TempDir()
+	holds, running := reviewRequestHolds(config.PathsForHome(home), home)
+	if running {
+		t.Fatalf("running = true on a fresh home")
+	}
+	for _, hold := range holds {
+		if strings.HasPrefix(hold, "daemon not running:") {
+			if !strings.Contains(hold, "`gitmoot daemon start`") || strings.Contains(hold, "daemon run") {
+				t.Fatalf("hold = %q, want it to name `gitmoot daemon start`", hold)
+			}
+			return
+		}
+	}
+	t.Fatalf("holds = %v, want a daemon-not-running hold", holds)
+}

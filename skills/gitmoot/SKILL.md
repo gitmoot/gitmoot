@@ -1,315 +1,299 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, custom prompt agents, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot to get an independent review of a seat's pull request at an exact head, read the verdict and findings, pass the merge gate, send and read durable messages between org roles, read the org chart and briefs, escalate questions, and unstick jobs with job show, job cancel, doctor and daemon drain. Use when the user mentions gitmoot, a review request or verdict, findings, the merge gate, org messages or escalations, design-notes issues, or the gitmoot dashboard.
 license: Apache-2.0
-compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and omp (the job runtime; shell runs no-LLM tests).
+compatibility: Requires the gitmoot CLI, git, an authenticated GitHub CLI (gh), network access to GitHub, and omp, the only runtime gitmoot runs reviews on.
 metadata:
-  gitmoot-version: "0.8.8"
-  source: "gitmoot/gitmoot"
+  source: gitmoot/gitmoot
 ---
 
 # Gitmoot Agent Skill
 
-Gitmoot is a local-first coordinator for AI agents working across repositories,
-reviews, PR comments, and runtime workflows. Use this skill when the
-user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, omp agent startup, the Claude Code, Codex or omp plugins, structured
-implementation plans, custom
-prompt agents, or job status.
+## What gitmoot is for
 
-For "use <agent> here" or "use Gitmoot agent <agent> here" requests, do the
-work directly in this current chat. "Use the Gitmoot planner here" means plan
-directly in this chat. Do not route a "here" request through a background
-`gitmoot agent ask` unless the user explicitly asks for background execution,
-PR-comment routing, or job tracking by the daemon.
+Gitmoot coordinates a fleet of agent seats that work on GitHub pull requests.
+Seats write the code themselves; gitmoot does five things around that work:
 
-By DEFAULT, the "here" flow tracks the work as a session job: clock in with
-`gitmoot job open --agent <agent> --repo owner/repo --type ask|review|implement`
-(use `--type ask` for advisory work such as planning or research), do the work,
-then — this is REQUIRED — clock out with
-`gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed|skipped> --summary "..."`
-so the work shows in `job list`, the dashboard, and the event stream just like
-an engine-run job (no runtime is spawned; gitmoot is only the record-keeper).
-You can also log already-finished work in one shot with `gitmoot job record`
-(see `references/CLI.md` → Session jobs).
+- **Reviews.** A seat asks for an independent review of its pull request at an
+  exact commit. Gitmoot picks a reviewer, runs it, stores the verdict and its
+  findings, and wakes the seat when the verdict is saved.
+- **Durable messages** between org roles: saved first, delivered when the
+  recipient can take them.
+- **The org chart:** roles, their parents, panes and briefs.
+- **The merge gate:** merges a pull request only with an approval bound to its
+  current head and green CI.
+- **The dashboard:** a read-only view of jobs, roles and messages.
 
-For an in-session PR review, clock in with `--type review --pr <n> --head-sha
-<sha> --workflow <label>` and journal progress with `gitmoot workflow note
-<label> "..."`. `job list` and `job show` expose the resulting liveness hint as
-`review_status`, alongside `review_status_grade: reported` and
-`review_status_authority: non_authoritative`. This is display-only,
-caller-reported activity: it does not satisfy, block, or otherwise feed the
-merge gate. Close the session job after posting the verdict. A
-`changes_requested` review close must pass `--severity P0|P1|P2|P3`.
+Gitmoot does not implement. It never writes code for you and never dispatches
+an implementation job.
 
-For a running engine-dispatched review with an isolated worktree, `job list`
-uses the verified daemon's descendant process tree instead: a runtime descendant
-owning that worktree is `in_progress`, while its conclusive sampled absence is
-`stalled`. That system observation is graded `observed` but remains explicitly
-`non_authoritative`; it triggers no cancellation or recovery policy.
+## omp is required
 
-For background work, keep Gitmoot's resource model explicit: repo checkout
-locks protect local checkouts, runtime session locks serialize delivery for the
-same resumable runtime session (omp runs a fresh session per job).
-The daemon default is `--workers 1`; raise it only for independent jobs
-(distinct checkouts and runtime sessions; omp jobs each run a fresh session).
-omp is the only job runtime (`shell` remains a subscribe-only runtime for no-LLM
-tests). Agents still registered on the removed `codex`, `claude`, or `kimi`
-runtimes are reported as unsupported by `gitmoot agent list` and `gitmoot
-doctor`, and their jobs are refused; re-register them with `--runtime omp`.
+Every review job runs on omp. `shell` is a runtime for tests that need no
+model: its "session" is a command whose output is the verdict. Like every
+review, it runs sandboxed in a read-only checkout of the reviewed head: it can
+read that checkout, not other host paths such as `/tmp`, so print the verdict
+inline (`echo '...'`). Agents still registered on a removed runtime are
+refused; register them again with `--runtime omp`.
 
-When a job is **blocked** and the user asks to "resume a blocked job", "clear a
-blocker", or "what does this job need" (#682), route to
-`gitmoot job gates <id>` to list the open resource gates — one per `needs[]` entry
-a blocked job recorded — then `gitmoot job gates clear <id> --need "<text>"` (or
-`--all`) to satisfy them. Clearing the **last** open gate auto-re-runs the blocked
-job via the same machinery as `gitmoot job retry` (resume on clear, no polling).
-See CLI.md § Resumable gates.
+`gitmoot plugin install omp` installs the omp add-on that delivers messages
+to omp sessions. The `codex` and `claude` plugins
+(`gitmoot plugin install codex`, `gitmoot plugin install claude`) give seats
+running in those apps this skill and a hook that collects their messages; they
+are not job runtimes.
 
-For Gitmoot health or status questions, first use the injected SessionStart
-snapshot when it is present and sufficient. If more detail is needed, run the
-relevant read-only Gitmoot CLI checks and answer directly from the results.
-Mention `gitmoot dashboard` (or `gitmoot dashboard --web` for a browser view of
-a running job tree) only after that answer, as a live monitoring
-follow-up. Do not start daemons, create agents, change subscriptions,
-or release locks unless the user asks for that action.
+Check the install before anything else: `gitmoot version`, then `gitmoot doctor`
+(exit 1 lists `failed required checks:`; on a throwaway home without GitHub,
+Herdr or omp, the `omp`, `gh auth`, `herdr` and `repo remote` failures are
+expected). The binary is the authority. If this skill disagrees with
+`gitmoot --help` or a command's own `--help`, trust the help.
+[references/CLI.md](references/CLI.md) is that help, generated from the binary.
 
-## Before Acting
+**Home and argument order.** `--home <dir>` keeps state in `<dir>/.gitmoot`
+instead of `$HOME/.gitmoot`. It is a flag of each subcommand, never of
+`gitmoot` itself: write `gitmoot doctor --home H`, because `--home` before the
+subcommand fails with `unknown command "--home"`. `version` has no `--home`.
+Put a positional name or id right after the
+subcommand words and flags after it (`gitmoot job show <job-id> --home H`,
+`gitmoot agent subscribe <name> --runtime ...`); the other order fails with
+"requires exactly one id/name". Two exceptions take their flags first:
+`message escalate --to <role> "question"` and
+`org await withdraw --reason "why" <await-id>`. Every example here uses the
+order that works. Role-aware commands read your role from `GITMOOT_ORG_ROLE`;
+pass `--role <role>` when it is unset.
 
-1. Check whether `gitmoot` is installed with `gitmoot version`.
-2. Confirm GitHub CLI access with `gh auth status` only before using PR
-   workflows or remote GitHub actions.
-3. Detect or ask for the target repo before starting daemons, subscribing agents,
-   or routing jobs.
-4. Do not start daemons, create agents, or change
-   subscriptions, or release locks unless the user asks or the current task
-   clearly requires it.
-5. Prefer the SessionStart snapshot and read-only status commands, then answer
-   directly before mutating Gitmoot state or pointing the user to live
-   monitoring.
-6. If the user names a Gitmoot concept or command that is version-sensitive or
-   missing from this skill, verify the live surface with `gitmoot --help` and
-   the relevant `gitmoot <command> --help` before answering or acting.
+## 1. Record your work and request a review
 
-## Common Commands
+Record the implementation first, so the merge gate knows who wrote the change
+and can check that the reviewer is someone else:
 
-Use the SessionStart "Current snapshot" for quick repo-local daemon/task/job/lock
-answers when available. Use `gitmoot status --repo owner/repo` for concise repo
-status, `gitmoot daemon status` for daemon state, `gitmoot agent list` and
-`gitmoot agent show <agent>` for registered agents. Use `gitmoot task list --repo owner/repo`
-or `gitmoot task list --repo owner/repo --json` for task state. Use
-`gitmoot job list --repo owner/repo` for jobs, and use
-`gitmoot dashboard --json` only when a structured full dashboard snapshot is
-needed. The read-only web dashboard's Overview and Org pages distinguish live
-Herdr session activity from engine jobs and label a missing session differently
-from an unavailable Herdr source. Do not use nonexistent commands such as
-`gitmoot status --json` or
-`gitmoot task show`. Use `gitmoot org events rule add|list|set-scope|rm` to manage opt-in
-organization event wakes; add validates the event kind, target org role, and
-`addressed` (default) or `observer` scope. Use
-`gitmoot agent ask <agent> --repo owner/repo "..."` only for
-analysis, planning, or questions. To get an independent review of a pull
-request, use `gitmoot review request --pr <number>` and let Gitmoot choose the
-reviewer, runtime and model, deduplicate on the exact head, and wake your role
-when the verdict is saved (CLI.md § Review Router). When a script needs the job
-id, add `--json`: `gitmoot review request --pr <number> --head <40-hex>
---json` prints `job_id`, `agent`, `awaited_fact_id` and the
-same keys `agent review --json` printed. Use `gitmoot agent review
-<reviewer> --repo owner/repo --pr <number> "..."` only for a deliberate manual
-dispatch. With `--org-role` it still goes through the router and keeps the
-reviewer you named. A review never routes a fix; `--no-fix-target` is accepted
-and ignored.
+```sh
+gitmoot job record --agent <seat> --repo owner/repo --type implement --decision implemented --pr <n> --branch <branch> --summary "what changed"
+```
 
-E2B reviews prepare their exact source and review base inside E2B, without a host
-checkout or bulk source staging. They require the configured mTLS credential
-gateway for a temporary, repository-scoped Git-read lease; the host token is
-never exported. When Janitor is enabled, remaining local control-state writes
-use fresh-space monitoring rather than the cleanup-target latch. Local reviews
-can opt in with `[janitor_capacity] review_admission = "fresh_space"`; see CLI.md
-for its best-effort limits and cancellation behavior. This changes neither
-ordinary non-review admission nor provider spending/concurrency limits.
+Use `--acting-role <role>` instead of `--agent` when the seat that wrote the
+change is an org role, not a registered agent (every seat created with
+`gitmoot org seat add` is a role; `--agent` with a role name fails `agent
+"<name>" not found`). The record then prints an empty
+`agent:` and keeps the role as the job's acting role, which is what the gate
+reads. The record binds to the repository and pull request (and `--task`), not
+to a head: one record covers every later head of that pull request, and
+`--head-sha` is display only. Add `--task <task-id>` when the pull request
+already has a review task (`gitmoot task list --repo owner/repo`). Never record
+an agent that did not write the change.
 
-**Gitmoot does not dispatch implementation (#2203).** `agent implement`,
-`--action implement`, `task run`, and `repo auto-fix`
-are all gone; a `/gitmoot <agent> implement`
-comment is refused. That is the product statement, not a gap: gitmoot reviews,
-seats implement. Do the file changes in THIS session, then record them so the
-merge gate can attribute them:
-`gitmoot job record --agent <seat> --repo owner/repo --type implement
---decision implemented [--pr <number> --head-sha <sha>] [--task <task-id>]
---summary "..."`. For a fix pass on an existing open PR, push the fix on its
-branch, record it that way, and ask for the next review with `gitmoot review
-request --pr <number>`.
+Then request the review at the exact head you pushed:
 
-Before local review dispatch or native engine review fan-out, Gitmoot refuses a
-homogeneous succeeded decision repeated at the exact same repo/PR/head, emits
-`review_loop_detected` on the matched succeeded job, and hard-errors (CLI) or
-blocks (engine). New heads and mixed same-head decisions proceed; the loop guard
-allows an empty engine event only before succeeded history exists, while local
-CLI preparation still requires a concrete head. Treat the old verdict only as
-escalation evidence—never return it as a cached review result. This exact key is
-used instead of a round counter because #1419's panel rejected round-based
-instruments. Direct PR-comment ingress remains separate #1433 work.
-Add `--background` only when the user wants a queued background job.
+```sh
+gitmoot review request --repo owner/repo --pr <n> --head <40-hex-sha> --role <your-role>
+```
 
-An agent (via `--model` on start/subscribe/type set) and an
-individual job (via `--model` on ask/review) can pin a runtime model, with the
-per-job value overriding the agent default. When neither pins one, a job falls back to the
-runtime's configured `[runtimes.<name>].default_model`, then the runtime CLI's own
-default. Agents and jobs can likewise
-set reasoning effort with `--effort` or the `effort` field. Job effort
-overrides agent effort, then `[runtimes.omp].default_effort`. omp receives
-effort as `--thinking <level>` when the value is one of
-`off|minimal|low|medium|high|xhigh|max|auto`, and no flag at all otherwise.
-The `omp` runtime is a multi-provider **routing
-harness**, so a few of its properties are worth
-saying out loud before routing work to it: it holds `review`/`implement`/`ask`,
-every job runs a fresh session (it never resumes), and
-read-only seats use Gitmoot's broker-backed sandbox. Runtime-family diversity
-uses the upstream provider proved by a successful OMP delivery, not the `omp`
-wrapper or requested model text. It is advisory: same-family comparisons emit
-`merge_gate_family_advisory` and unresolved comparisons emit
-`merge_gate_family_unresolved`; neither disqualifies a distinct reviewer with
-substantive evidence (see CLI.md § Agent Setup). Use `gitmoot runtime list` to inspect
-each built-in
-runtime's resolved metadata: capabilities, default model/effort,
-known models, and the token-usage source.
-Operators can override a built-in runtime's
-metadata without recompiling via a `[runtimes.<name>]` config section — `default_model`
-retargets delivery and `default_effort` selects omp's
-`--thinking` level, while
-`models`/`capabilities` stay advisory (see CLI.md
-§ Runtime Metadata Registry). Use
-`gitmoot plugin doctor` when checking whether Codex, Claude Code, or omp
-can discover Gitmoot through an installed plugin.
-Use `gitmoot workflow list`, `gitmoot
-workflow show`, `gitmoot workflow show-note`, `gitmoot workflow describe`,
-`gitmoot workflow note`, and `gitmoot workflow close` to
-inspect external-coordinator workflow groups, set their stable description, add
-verbatim journal entries, set a manual status escape hatch, optionally stage
-a note in persistent memory, and end a finished group. Workflow hygiene:
-`describe` a workflow at first use and `close` it (with `--reason`) when its
-work merges or completes — never-closed workflows accumulate and bury live
-work in the dashboard's active buckets and every workflow-picking surface. Linked PR lifecycle transitions also add deduped
-`daemon` journal notes and advance live status.
-Use `gitmoot message send <role> "<text>"` for ordinary fleet conversation,
-`message inbox` to read received mail, `message show <id>` for a full message,
-and `message reply <id> "<text>"` to reply in its thread. No workflow or job is
-required; attach an existing workflow with `--workflow <label>` when useful.
-Any configured role may talk to another, without acquiring authority over it.
-Sender defaults to the session role/current registered pane; `--role` is an
-operator attribution override, not authentication. Success means queued, not
-read. Ordinary messages have no acknowledgment, completion, TTL or nag duty.
-Plain journal notes do not send notifications, even if their body says `to=...`.
-Escalations and directives use the same inbox, thread IDs and optional workflow
-association. `gitmoot message escalate "QUESTION"` normally addresses your
-coordinator; `message resolve ID --answer "ANSWER"` resolves the tracked request
-and notifies its requester. Reading or discussing it does not resolve it.
-`gitmoot message directive send --to ROLE "ASSIGNMENT"` requires issuer authority.
-Confirmed transport receipt needs no manual acknowledgment; `message directive
-ack ID` remains available for explicit acceptance. `message directive done ID`
-records completion by the target subtree and ends its nudges; the issuer instead
-uses `message directive cancel ID` when the work is no longer required.
-All actions use session identity or `--role ROLE`, not an identity inferred from
-the target. Replies and prose cannot grant authority or certify completion.
-Exact-head review notices carry system provenance and remain separate from
-ordinary discussion of a review. A queued or uncertain notification is not proof
-of submission, reading, acceptance or completion. Jobs join a group through
-`--workflow <label>` on agent
-ask/review or `job open`. Use
-`[workflow] require_workflow = true` to enforce this discipline. `auto` mode
-files fresh unlabeled dispatches under `adhoc/<agent>-<yyyy-mm-dd>` and records
-`workflow_autolabeled`; `strict` instead requires `--workflow`. Per-repo
-overrides live in `[repos."owner/repo"]`, and `repo add --agents-md` scaffolds
-the discipline into a checkout's AGENTS.md.
+- Gitmoot picks a review-capable agent and model; use `--reviewer <agent>` only
+  to name one. `--purpose code|security|ui|architecture` (default `code`)
+  requests a different kind of review; each purpose is its own review.
+- One review per head and purpose. Asking again for the same head attaches to
+  a queued, running or blocked review (`state: attached`), or prints
+  `state: verdict_exists` with `verdict: <decision> (already saved; no new
+  review spent)`; neither starts a second reviewer. A review that ended
+  `failed` or `cancelled` has no verdict, so asking again starts a new review
+  of that head: that is how to retry one. To replace a saved verdict at the
+  same head, pass `--supersede <job-id> --reason "why"`.
+- The output names the job (`job:`), the reviewer, any `hold:` lines, and a
+  `watch:` command. Add `--json` for `job_id`, `reviewer`, `awaited_fact_id`
+  and `holds`. Every request, `verdict_exists` included, registers a wake-up
+  (`notify: ... awaited fact N`) and reports the daemon hold.
+- Your role is woken when the verdict is saved; you do not need to poll.
+- The review runs when the daemon claims it. Without a daemon the output says
+  ``hold: daemon not running: the review stays queued until `gitmoot daemon
+  start` starts the daemon``: start it (`gitmoot daemon start`) or run the job
+  once in the foreground with `gitmoot job run <job-id>`.
 
-The plugin is only the runtime discovery surface for this skill. Local agent
-invocation still goes through the `gitmoot` CLI and the same registered agent,
-repo access, runtime adapter, and job history model used by PR-comment jobs.
+`gitmoot agent review <agent> "instructions" --repo owner/repo --pr <n>` names
+a reviewer directly and goes through the same request path; prefer
+`review request`.
 
-For Gitmoot bug reports, preview by default and treat the preview as the
-confirmation surface. Generated reports include redacted job context, recent
-events, labels, and a fingerprint marker for duplicate detection. After
-creation, tell the user the printed issue URL; if Gitmoot reused an existing
-issue, report that URL as existing instead of new.
+**Review level.** `gitmoot review level --repo owner/repo --pr <n>` decides how
+much review the head needs, posts it as the `gitmoot/review-level` commit
+status, and prints `level:`, `head:` and `reason:`:
 
-For complete command examples, read [CLI.md](references/CLI.md).
-For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
+- `level1_no_review`: merge without review.
+- `level2_background`: merge, then request a review of the merged head with
+  `--post-merge`; the command prints that request for you.
+- `level3_required`: review before merge.
 
-## Plan-Gated Implementation
+Some paths always need review before merge (agent instructions such as
+`AGENTS.md`, `SKILL.md` files under `skills/`, CI workflows, deploy config,
+dependency manifests and locks, migrations), and so does every pull request on
+`gitmoot/gitmoot`.
 
-For non-trivial implementation work, default to a plan-gated flow: plan first,
-get the plan approved explicitly, then implement against the approved plan. The
-gate is a convention over existing primitives, so it works unchanged on any
-seat (omp jobs, or Claude Code and Codex sessions using the plugins).
+## 2. Read the verdict and re-review after a fix
 
-1. **Plan read-only.** Produce a decision-complete plan with `gitmoot agent
-   ask` (or the `planner` template, or a session job opened with `--type ask`).
-   No file changes.
-2. **Record the plan.** Post it with `gitmoot workflow note <label> "..."` and
-   keep the entry id the CLI prints — that id is the plan-id.
-3. **Stop.** Approval is an explicit act, never inferred from silence. In org
-   mode the approver sends `gitmoot message directive send --to <role> --workflow
-   <label> "approved: implement plan <plan-id> …"`; outside org mode an
-   explicit human approval message referencing the plan-id serves the same
-   role.
-4. **Implement in your own session, quoting the plan-id, then record it.** The
-   approved plan is the scope fence: work outside it needs an amended plan and
-   a fresh approval, not silent expansion. Gitmoot does not dispatch
-   implementation (#2203), so the seat is the implementer and `gitmoot job
-   record --type implement` is its receipt.
-5. **Close the loop.** The implementer marks the approval directive `done`
-   when the work lands, and the workflow is `close`d when the PR merges.
+```sh
+gitmoot review status --repo owner/repo --pr <n>
+gitmoot job show <job-id>
+gitmoot findings --repo owner/repo --pr <n>
+```
 
-A coordinator may waive the gate for trivial mechanical fixes by writing
-"plan-waived" in the recorded summary. Claude Code seats may additionally use
-the harness's own plan mode, but only when the approver is present at that
-session: an interactive plan-approval prompt blocks invisibly — the session
-appears idle, no job runs, and nothing escalates — so an unattended seat must
-use the durable convention above, which is the runtime-neutral form and always
-applies. Under this convention every implementation records either
-a plan-id or the literal "plan-waived" in its summary; one with neither is out
-of contract. See WORKFLOWS.md § Plan-Gated Implement for the full command
-sequence.
+- `review status` prints the gate state and one line per review job: state,
+  head, reviewer, `verdict=`, `evidence=` and the findings count. It and
+  `job show` are the source of truth for a review.
+- `job show` prints `decision:` and `summary:`, and the full result under
+  `payload.result`: `decision`, `severity`, `findings`, `tests_run`,
+  `evidence`. Failed result checks (a verdict that accounts for nothing) are
+  under `payload.result_checks` and in `gitmoot job events <job-id>` as
+  `result_checks_failed`. The result fields are in
+  [references/RESULT_CONTRACT.md](references/RESULT_CONTRACT.md).
+- `findings --repo --pr` lists each finding with its `STATE`; add
+  `--at-head <sha>` to list only what the merge gate still demands at that
+  head.
 
-## Agent Job Contract
+A verdict is `approved` or `changes_requested` (with a `severity` of `P0` to
+`P3`); `blocked` and `failed` mean the review did not finish (request the same
+head again to retry). To act on `changes_requested`: fix, push, and request a
+review of the **new** head. A new head is a new review; asking again for the
+same head only returns the verdict it already has. A finding closes only when
+a later review cites its UID as `continues_uid` with `"state": "answered"` and
+evidence (see
+[references/RESULT_CONTRACT.md](references/RESULT_CONTRACT.md#the-findings-ledger)); an
+approval that does not cite it leaves it open.
 
-Every Gitmoot job should return a concise and truthful `gitmoot_result` JSON
-object. Use `blocked` when work cannot continue without human input or external
-state, and `failed` when an attempted action errored.
+## 3. Merge rules
 
-For the required result shape and decision meanings, read
-[RESULT_CONTRACT.md](references/RESULT_CONTRACT.md).
+The gate merges a pull request only when all of these hold at its current head:
 
-## Safety Rules
-A read-only review seat is handed an immutable, daemon-owned copy of a Go
-installation selected from the daemon's `PATH` to satisfy the effective
-`go.work` and checkout-root `go.mod`. Run `go` normally: `GOROOT`, `PATH`,
-`GOTOOLCHAIN=local`, and `GOWORK` are already pinned to that selection. Do not
-invoke a toolchain path directly or download Go into the seat cache; that
-workaround is retired. `CGO_ENABLED=0` is still required and `-race` remains
-unavailable. Exit 126 means no candidate could be safely staged or satisfy the
-workspace. A real review job records `seat_toolchain_unavailable` and blocks;
-host-specific staging detail is also written on daemon stderr as
-`gitmoot: read-only seat toolchain:`. When no Go installation exists, the event
-is the only recorded reason.
-The seat's `TMPDIR` is a private `/tmp/gmr-<hex>` directory removed when the
-job ends, and offline Go builds read a per-repository module cache the daemon
-fills before the seat starts (`GOPROXY=off`). Python, Rust, Node and
-Flutter/Dart checks are not available in a local seat; report them with
-`evidence: static_only` and `checks_blocked`.
+- an approval bound to that exact head, from a reviewer who is not the
+  recorded implementer (an approval of an older head does not count);
+- no review at that head still running, and none that requested changes,
+  blocked or failed;
+- no open finding of severity P0, P1 or P2 at that head (P3 never blocks);
+- green CI, mergeable, not a draft, and a branch the base has not moved past
+  in a way that needs an update (the gate never updates a reviewed branch).
 
+When automatic merge is on, the daemon merges on its own once the gate passes.
+`review status` prints whether it is on. To ask for a merge explicitly, comment
+`/gitmoot merge` on the pull request. The comment runs the gate even when
+automatic merge is off and always replies with the outcome. Your role's
+`merge_rule` from the org chart applies to that comment: `self` may merge,
+`owner` refuses a role that is not the root, `none` refuses.
 
-Preserve existing behavior unless the job explicitly changes it. Keep work
-scoped to the target repo. Do not commit generated data, caches, logs, secrets,
-session archives, cloned helper repos, or large outputs unless explicitly
-requested.
+**When a merge is held**, the reason names the remedy. The common ones:
 
-For detailed safety and lock rules, read [SAFETY.md](references/SAFETY.md).
+- *No implement job recorded* (an attribution gap): run the `job record` from
+  section 1, then `/gitmoot merge` again.
+- *No approval bound to the current head*: request a review of that head.
+- *The repository requires GitHub's merge queue*: gitmoot cannot merge
+  through it. Add the pull request to the merge queue on GitHub.
+- *The branch is behind its base*: the gate never updates a reviewed branch
+  itself. Update it, push, and request a review of the new head.
+- *A draft*: held open on purpose until it is marked ready.
+- *Low-risk auto-merge left it open* (a repository with
+  `auto_merge = "low_risk"` merges by itself only level 1 or 2 heads, and
+  never one labelled `hold` or `do-not-merge`): a person merges it on GitHub.
 
-## When Unsure
+Never merge around a held gate on your own authority.
 
-Reread this `SKILL.md`, then inspect `/gitmoot help`, `gitmoot status`, and the
-relevant job events before acting. If this skill disagrees with the installed
-binary, trust the live `gitmoot --help` / subcommand help output and treat the
-skill as stale documentation that should be refreshed.
+## 4. Messages
+
+```sh
+gitmoot message send <role> "text"
+gitmoot message inbox
+gitmoot message show <id> --thread
+gitmoot message reply <id> "text"
+```
+
+Flags go after the positional arguments. A message is saved before it is
+delivered, so "sent" and "read" are separate facts. `send` and `show` print the
+notification state:
+
+- `queued`: saved, not yet delivered. The recipient may be busy or offline, or
+  its pane is unbound. The message stays in its inbox and is delivered when it
+  can take it.
+- `submitting`, then `submitted`: being delivered, then delivered to the
+  recipient's session.
+- `uncertain`: delivery may or may not have happened.
+- `stalled` or `failed`: delivery stopped trying; the message is still saved
+  in the recipient's inbox.
+
+So "delivered" is `submitted`, and "deferred" is a `queued` message whose
+reason ends in "notification deferred": delivery is waiting until the recipient
+can take it. If a message to a role stays undelivered for more than 15 minutes,
+gitmoot sends you, the sender, one notice saying how long it has waited and why.
+The message stays queued and is delivered when the recipient can take it. Do
+not type it into the recipient's pane yourself.
+
+Read your inbox when you start or resume, and keep message ids in handoffs.
+
+## 5. Org: chart, brief, escalate, awaits
+
+```sh
+gitmoot org chart
+gitmoot org brief --role <role>
+gitmoot message escalate --to <role> "question"
+gitmoot org await list
+```
+
+- `org chart` shows every role under its parent with its live session state
+  (it reads Herdr); `--json` for scripts. `org brief --role <role>` prints that
+  role's brief, including how to use messages.
+- `message escalate` asks a question of a role above or below you on the
+  chart: your parent by default, or the role given with `--to`. Questions to a
+  role on another branch are refused. The asker or the addressed role closes it
+  with `gitmoot message resolve <id> --answer "text"`.
+- Awaits are the wake-ups gitmoot owes you. `review request` creates one for
+  you. To wait for a review someone else requested, use
+  `gitmoot org await review --repo owner/repo --pr <n> --head <sha> --ttl 12h`.
+  End a wait you no longer need with
+  `gitmoot org await withdraw --reason "why" <await-id>`.
+
+## 6. When something is stuck
+
+```sh
+gitmoot job show <job-id>
+gitmoot job cancel <job-id>
+gitmoot doctor
+gitmoot daemon status
+gitmoot daemon drain --timeout 15m
+```
+
+- `job show` reports the state and, for a stuck job, `why_stuck` and a
+  suggested action. `gitmoot job events <job-id>` lists what happened.
+- `job cancel <job-id>` cancels one job.
+  `gitmoot job cancel --state blocked --older-than 7d` cancels old blocked jobs
+  in bulk.
+- A `blocked` job lists what it needs with `gitmoot job gates <job-id>`. Clear
+  one with `gitmoot job gates clear <job-id> --need "text"`; clearing the last
+  one runs the job again.
+- `doctor` checks the install, the daemon, stuck jobs and the runtimes;
+  `--json` for scripts.
+- `daemon drain` stops claiming new jobs and waits for the running ones (up to
+  `--timeout`), for example before a restart. `gitmoot daemon drain --clear`
+  resumes claiming.
+
+Do not start or stop daemons, cancel other roles' jobs, or release locks unless
+the user asks for it.
+
+## 7. Design-notes issues
+
+P3 findings never block a merge. When a pull request merges with P3 findings
+still open, the daemon files them on that repository's design-notes issue for
+the week: one issue per repository per ISO week, titled
+`[design-notes] owner/repo 2026-W46` and labelled `design-notes`, with one
+comment per merged pull request. When the daemon opens the issue, it sends the
+role that requested the review one message with the link ("Advisory; nothing
+blocks").
+
+The notes are advisory. Each may already be fixed on the default branch, so
+check the current code first. Pick up what is worth doing, and close the issue
+once every note is triaged.
+
+## More
+
+- [references/WORKFLOWS.md](references/WORKFLOWS.md): end-to-end walkthroughs,
+  including a no-model review on a throwaway home.
+- [references/RESULT_CONTRACT.md](references/RESULT_CONTRACT.md): the review
+  result a reviewer returns.
+- [references/SAFETY.md](references/SAFETY.md): locks, isolation and the gate's
+  guarantees.
+- [references/CLI.md](references/CLI.md): every command's `--help`.
+- The dashboard: `gitmoot dashboard` prints a snapshot,
+  `gitmoot dashboard --web --addr 127.0.0.1:8080` serves the read-only web view.
