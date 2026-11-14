@@ -69,7 +69,7 @@ func TestHandleCommentAuthorizedCommandStillDispatches(t *testing.T) {
 	if job.Agent != "helper" || job.Type != "ask" {
 		t.Fatalf("dispatched job = %+v", job)
 	}
-	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `ask` job") {
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `ask` run") {
 		t.Fatalf("posted acknowledgements = %+v, want one queued-job reply", client.posted)
 	}
 }
@@ -133,7 +133,7 @@ func TestHandleCommentMixedProseAndAddressedCommandPostsOnlyAck(t *testing.T) {
 	if err := daemon.handleComment(ctx, pull, comment); err != nil {
 		t.Fatalf("handleComment returned error: %v", err)
 	}
-	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `ask` job") {
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `ask` run") {
 		t.Fatalf("posted comments = %+v, want exactly one queued-job acknowledgement", client.posted)
 	}
 	wantID := jobID(repo, pull.Number, comment.ID, 0, "helper", "ask")
@@ -299,7 +299,7 @@ func TestHandleCommentInlineSpanCannotRedirectCommand(t *testing.T) {
 	if job.Agent != "helper" || job.Type != "ask" {
 		t.Fatalf("dispatched job = %+v, want ask/helper", job)
 	}
-	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `ask` job") {
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `ask` run") {
 		t.Fatalf("posted acknowledgements = %+v, want one queued-job reply", client.posted)
 	}
 }

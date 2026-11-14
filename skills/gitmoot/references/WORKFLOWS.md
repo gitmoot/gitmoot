@@ -37,7 +37,7 @@ status` shows that it is running.
 2. Record that you wrote it, then ask for a review of the exact head:
 
    ```sh
-   gitmoot job record --agent <seat> --repo owner/repo --type implement --decision implemented --pr 42 --branch my-branch --summary "add retry to the fetcher"
+   gitmoot run record --implementer <seat> --repo owner/repo --type implement --decision implemented --pr 42 --branch my-branch --summary "add retry to the fetcher"
    gitmoot review request --repo owner/repo --pr 42 --head <40-hex-sha>
    ```
 
@@ -103,11 +103,11 @@ printed above:
 gitmoot repo add acme/widget --path $HOME/repo --home $H
 gitmoot org seat add me --home $H
 gitmoot reviewer subscribe shell-reviewer --runtime shell --session 'echo "{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"Read the whole diff: a.txt adds one line; nothing to run.\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"evidence\":\"static_only\"}}"' --role reviewer --repo acme/widget --capability review --home $H
-gitmoot job record --acting-role me --repo acme/widget --type implement --decision implemented --pr 1 --branch feat --summary "add a.txt" --home $H
+gitmoot run record --acting-role me --repo acme/widget --type implement --decision implemented --pr 1 --branch feat --summary "add a.txt" --home $H
 gitmoot review request --repo acme/widget --pr 1 --head <sha> --branch feat --reviewer shell-reviewer --role me --home $H
-gitmoot job run <job-id> --home $H
+gitmoot run start <run-id> --home $H
 gitmoot review status --repo acme/widget --pr 1 --home $H
-gitmoot job show <job-id> --home $H
+gitmoot run show <run-id> --home $H
 ```
 
 - `me` was created by `org seat add`, so it is an org role, not a registered
@@ -123,8 +123,8 @@ gitmoot job show <job-id> --home $H
 - Pass both `--head` and `--branch` so the request does not need to read the
   pull request from GitHub.
 - The request prints ``hold: daemon not running: the review stays queued
-  until `gitmoot daemon start` starts the daemon``; `job run` runs it anyway.
-- Read `job run` by its last line, `ran job <id>: <state>`: that is the job's
+  until `gitmoot daemon start` starts the daemon``; `run start` runs it anyway.
+- Read `run start` by its last line, `started run <id>: <state>`: that is the job's
   state. An approval may print a line before it such as `job <id> failed: workflow advance failed:
   ...` is about what happens after the verdict is stored (posting it to the
   pull request, binding an approval to the head GitHub reports), and needs
@@ -132,7 +132,7 @@ gitmoot job show <job-id> --home $H
   `review approval held: no observed pull request row records a current head`
   (no daemon has observed PR 1, so the gate will not count the approval).
   Both are expected here; the verdict is stored, `review status` shows it,
-  and `job show` lists the error under `failure_diagnostics`.
+  and `run show` lists the error under `failure_diagnostics`.
 - The demo verdict's 40-character-plus `summary` is what passes the
   `review-verdict-has-evidence` result check; `"summary":"ok"` would fail it.
 - To exercise a finding, commit a second change, swap in a `changes_requested`

@@ -407,7 +407,7 @@ func TestShortTestTempRootReportsUnusableParents(t *testing.T) {
 func runSeatJobSummary(t *testing.T, store *db.Store, home, jobID string) (summary, stdout, stderr string) {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	if code := Run([]string{"job", "run", jobID, "--home", home}, &out, &errOut); code != 0 {
+	if code := Run([]string{"run", "start", jobID, "--home", home}, &out, &errOut); code != 0 {
 		t.Fatalf("job run exit code = %d\nstdout=%s\nstderr=%s", code, out.String(), errOut.String())
 	}
 	job, err := store.GetJob(context.Background(), jobID)

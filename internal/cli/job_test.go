@@ -40,7 +40,7 @@ func TestRunJobListShowEventsRetryCancel(t *testing.T) {
 	}, "queued")
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "list", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	code := Run([]string{"run", "list", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job list exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -50,7 +50,7 @@ func TestRunJobListShowEventsRetryCancel(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "show", "job-failed", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"run", "show", "job-failed", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job show exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -62,7 +62,7 @@ func TestRunJobListShowEventsRetryCancel(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "show", "job-failed", "--home", home, "--json"}, &stdout, &stderr)
+	code = Run([]string{"run", "show", "job-failed", "--home", home, "--json"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job show --json exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -76,7 +76,7 @@ func TestRunJobListShowEventsRetryCancel(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "show", "job-queued", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"run", "show", "job-queued", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("empty-model job show exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -86,7 +86,7 @@ func TestRunJobListShowEventsRetryCancel(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "events", "job-failed", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"run", "events", "job-failed", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job events exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -96,21 +96,21 @@ func TestRunJobListShowEventsRetryCancel(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "retry", "job-failed", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"run", "retry", "job-failed", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job retry exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "queued retry for job job-failed") {
+	if !strings.Contains(stdout.String(), "queued retry for run job-failed") {
 		t.Fatalf("job retry output = %q", stdout.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "cancel", "job-queued", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"run", "cancel", "job-queued", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job cancel exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "cancelled job job-queued") {
+	if !strings.Contains(stdout.String(), "cancelled run job-queued") {
 		t.Fatalf("job cancel output = %q", stdout.String())
 	}
 }
@@ -155,7 +155,7 @@ func TestRunJobListSurfacesDelegationPreflightFailure(t *testing.T) {
 	}, "queued")
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "list", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	code := Run([]string{"run", "list", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job list exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -199,7 +199,7 @@ func TestRunJobWatchPrintsEventsUntilTerminal(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "watch", "job-watch", "--home", home, "--poll", "1ms"}, &stdout, &stderr)
+	code := Run([]string{"run", "watch", "job-watch", "--home", home, "--poll", "1ms"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job watch exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -228,7 +228,7 @@ func TestPinRunJobWatchStopsOnBlocked(t *testing.T) {
 	}, "blocked")
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "watch", "job-watch-blocked", "--home", home, "--poll", "1ms"}, &stdout, &stderr)
+	code := Run([]string{"run", "watch", "job-watch-blocked", "--home", home, "--poll", "1ms"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job watch on blocked job exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -250,7 +250,7 @@ func TestRunJobWatchJSON(t *testing.T) {
 	}, "failed")
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "watch", "job-watch-json", "--home", home, "--json", "--poll", "1ms"}, &stdout, &stderr)
+	code := Run([]string{"run", "watch", "job-watch-json", "--home", home, "--json", "--poll", "1ms"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job watch --json exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -265,7 +265,7 @@ func TestRunJobWatchJSON(t *testing.T) {
 
 func TestRunJobWatchTranscriptRejectsJSON(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "watch", "job", "--transcript", "--json"}, &stdout, &stderr)
+	code := Run([]string{"run", "watch", "job", "--transcript", "--json"}, &stdout, &stderr)
 	if code != 2 || !strings.Contains(stderr.String(), "--transcript is incompatible with --json") {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
@@ -284,11 +284,11 @@ func TestRunJobWatchTranscriptFallsBackWhenDerivedLogMissing(t *testing.T) {
 	store.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "watch", "job-no-transcript", "--home", home, "--transcript", "--poll", "1ms"}, &stdout, &stderr)
+	code := Run([]string{"run", "watch", "job-no-transcript", "--home", home, "--transcript", "--poll", "1ms"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
-	for _, want := range []string{"transcript unavailable; showing job events", "succeeded\tsucceeded", "state: succeeded"} {
+	for _, want := range []string{"transcript unavailable; showing run events", "succeeded\tsucceeded", "state: succeeded"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("fallback output missing %q: %q", want, stdout.String())
 		}
@@ -312,7 +312,7 @@ func TestRunJobWatchTranscriptRendersExplicitShellLog(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "watch", "job-transcript", "--home", home, "--transcript", "--log-path", logPath, "--runtime", runtime.ShellRuntime, "--poll", "1ms"}, &stdout, &stderr)
+	code := Run([]string{"run", "watch", "job-transcript", "--home", home, "--transcript", "--log-path", logPath, "--runtime", runtime.ShellRuntime, "--poll", "1ms"}, &stdout, &stderr)
 	if code != 0 || stdout.String() != "\u25b6 ask \u00b7 audit \u00b7 shell\n\nworking\ndone without newline\n" {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
@@ -338,7 +338,7 @@ func TestRunJobTranscriptMarkdownExportStdoutAndFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	args := []string{"job", "transcript", "job-export", "--home", home, "--export", "md", "--log-path", logPath, "--runtime", runtime.OmpRuntime}
+	args := []string{"run", "transcript", "job-export", "--home", home, "--export", "md", "--log-path", logPath, "--runtime", runtime.OmpRuntime}
 	var stdout, stderr bytes.Buffer
 	if code := Run(args, &stdout, &stderr); code != 0 {
 		t.Fatalf("stdout export code=%d stderr=%q", code, stderr.String())
@@ -383,7 +383,7 @@ func TestRunJobTranscriptMarkdownExportStdoutAndFile(t *testing.T) {
 
 func TestRunJobTranscriptRequiresMarkdownAndRetainedLog(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "transcript", "job", "--export", "text"}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "--export md or --export jsonl is required") {
+	if code := Run([]string{"run", "transcript", "job", "--export", "text"}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "--export md or --export jsonl is required") {
 		t.Fatalf("format refusal code=%d stderr=%q", code, stderr.String())
 	}
 
@@ -393,7 +393,7 @@ func TestRunJobTranscriptRequiresMarkdownAndRetainedLog(t *testing.T) {
 	store.Close()
 	stdout.Reset()
 	stderr.Reset()
-	code := Run([]string{"job", "transcript", "job-no-log", "--home", home, "--export", "md", "--runtime", runtime.ShellRuntime}, &stdout, &stderr)
+	code := Run([]string{"run", "transcript", "job-no-log", "--home", home, "--export", "md", "--runtime", runtime.ShellRuntime}, &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), "transcript log unavailable") {
 		t.Fatalf("missing-log code=%d stderr=%q", code, stderr.String())
 	}
@@ -429,7 +429,7 @@ func TestRunJobTranscriptJSONLSingleBulkFiltersAndAtomicOutput(t *testing.T) {
 	store.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "transcript", "job-a", "--home", home, "--export", "jsonl"}, &stdout, &stderr)
+	code := Run([]string{"run", "transcript", "job-a", "--home", home, "--export", "jsonl"}, &stdout, &stderr)
 	if code != 0 || strings.Contains(stdout.String(), secret) || !strings.Contains(stdout.String(), `"attempt_count":2`) || !strings.Contains(stdout.String(), "[REDACTED]") {
 		t.Fatalf("single JSONL code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
@@ -440,15 +440,15 @@ func TestRunJobTranscriptJSONLSingleBulkFiltersAndAtomicOutput(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "transcript", "--home", home, "--export", "jsonl", "--state", "succeeded"}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "use --all") {
+	if code := Run([]string{"run", "transcript", "--home", home, "--export", "jsonl", "--state", "succeeded"}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "use --all") {
 		t.Fatalf("all guard code=%d stderr=%q", code, stderr.String())
 	}
 
 	output := filepath.Join(t.TempDir(), "trajectory.jsonl")
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "transcript", "--all", "--home", home, "--state", "succeeded,failed", "--since", "720h", "--export", "jsonl", "--output", output}, &stdout, &stderr)
-	if code != 0 || !strings.Contains(stderr.String(), "exported 1 jobs; skipped 1 missing logs") {
+	code = Run([]string{"run", "transcript", "--all", "--home", home, "--state", "succeeded,failed", "--since", "720h", "--export", "jsonl", "--output", output}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stderr.String(), "exported 1 runs; skipped 1 missing logs") {
 		t.Fatalf("bulk code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	written, err := os.ReadFile(output)
@@ -536,7 +536,7 @@ func TestJobWatchTranscriptShellNoLLME2E(t *testing.T) {
 	}()
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "watch", "job-shell-e2e", "--home", home, "--transcript", "--poll", "1ms"}, &stdout, &stderr)
+	code := Run([]string{"run", "watch", "job-shell-e2e", "--home", home, "--transcript", "--poll", "1ms"}, &stdout, &stderr)
 	if err := <-writerDone; err != nil {
 		t.Fatal(err)
 	}
@@ -595,11 +595,11 @@ func runJobRunLifecycleContract(t *testing.T, transcriptsDisabled bool) string {
 	}, "queued")
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "run", "job-run", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"run", "start", "job-run", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job run exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "ran job job-run: succeeded") {
+	if !strings.Contains(stdout.String(), "run job-run: succeeded") {
 		t.Fatalf("job run output = %q", stdout.String())
 	}
 	job, err := store.GetJob(context.Background(), "job-run")
@@ -637,7 +637,7 @@ func TestRunJobRunRefusesUnavailableRoleAndAllowsExpiredIncident(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "run", "job-run-unavailable", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"run", "start", "job-run-unavailable", "--home", home}, &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), `org role "review" is unavailable`) ||
 		!strings.Contains(stderr.String(), "dispatch refused") {
 		t.Fatalf("active unavailable job run: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
@@ -655,7 +655,7 @@ func TestRunJobRunRefusesUnavailableRoleAndAllowsExpiredIncident(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "run", "job-run-unavailable", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"run", "start", "job-run-unavailable", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("expired incident job run: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
@@ -720,7 +720,7 @@ func TestTranscriptRetentionForegroundAndDaemonShellE2E(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "run", queuedID, "--home", home}, &stdout, &stderr)
+	code = Run([]string{"run", "start", queuedID, "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("daemon-path run code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
@@ -793,12 +793,12 @@ func TestRunJobCancelBulkDryRunSelectsBlockedAndOlder(t *testing.T) {
 	seedJobCancelBulkFixtures(t, home)
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "cancel", "--home", home, "--state", "blocked", "--older-than", "7d"}, &stdout, &stderr)
+	code := Run([]string{"run", "cancel", "--home", home, "--state", "blocked", "--older-than", "7d"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("bulk dry-run exit code = %d, stderr=%s", code, stderr.String())
 	}
 	out := stdout.String()
-	for _, want := range []string{"blocked-old-a", "blocked-old-b", "blocked-old-c", "run again with --yes to cancel 3 jobs"} {
+	for _, want := range []string{"blocked-old-a", "blocked-old-b", "blocked-old-c", "run again with --yes to cancel 3 runs"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dry-run output missing %q:\n%s", want, out)
 		}
@@ -826,7 +826,7 @@ func TestRunJobCancelBulkYesCancelsSelection(t *testing.T) {
 	seedJobCancelBulkFixtures(t, home)
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "cancel", "--home", home, "--state", "blocked", "--older-than", "7d", "--yes"}, &stdout, &stderr)
+	code := Run([]string{"run", "cancel", "--home", home, "--state", "blocked", "--older-than", "7d", "--yes"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("bulk --yes exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -860,12 +860,12 @@ func TestRunJobCancelBulkFiltersCompose(t *testing.T) {
 	// --older-than in Go-duration form (168h == 7d) composed with repo + agent:
 	// only blocked-old-a is owner/repo + audit + old enough.
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "cancel", "--home", home, "--state", "blocked", "--older-than", "168h", "--repo", "owner/repo", "--agent", "audit"}, &stdout, &stderr)
+	code := Run([]string{"run", "cancel", "--home", home, "--state", "blocked", "--older-than", "168h", "--repo", "owner/repo", "--agent", "audit"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("bulk compose exit code = %d, stderr=%s", code, stderr.String())
 	}
 	out := stdout.String()
-	if !strings.Contains(out, "blocked-old-a") || !strings.Contains(out, "run again with --yes to cancel 1 jobs") {
+	if !strings.Contains(out, "blocked-old-a") || !strings.Contains(out, "run again with --yes to cancel 1 runs") {
 		t.Fatalf("compose selection = %q, want only blocked-old-a", out)
 	}
 	for _, absent := range []string{"blocked-old-b", "blocked-old-c", "blocked-recent"} {
@@ -878,7 +878,7 @@ func TestRunJobCancelBulkFiltersCompose(t *testing.T) {
 func TestRunJobCancelBulkStateValidation(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "cancel", "--home", home, "--state", "failed"}, &stdout, &stderr)
+	code := Run([]string{"run", "cancel", "--home", home, "--state", "failed"}, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("bulk --state failed exit code = %d, want 2; stderr=%s", code, stderr.String())
 	}
@@ -890,7 +890,7 @@ func TestRunJobCancelBulkStateValidation(t *testing.T) {
 func TestRunJobCancelIDStateMutuallyExclusive(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "cancel", "some-id", "--home", home, "--state", "blocked"}, &stdout, &stderr)
+	code := Run([]string{"run", "cancel", "some-id", "--home", home, "--state", "blocked"}, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("id + --state exit code = %d, want 2; stderr=%s", code, stderr.String())
 	}
@@ -902,7 +902,7 @@ func TestRunJobCancelIDStateMutuallyExclusive(t *testing.T) {
 func TestRunJobCancelBulkFiltersRequireState(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "cancel", "--home", home, "--older-than", "7d"}, &stdout, &stderr)
+	code := Run([]string{"run", "cancel", "--home", home, "--older-than", "7d"}, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("--older-than without --state exit code = %d, want 2; stderr=%s", code, stderr.String())
 	}

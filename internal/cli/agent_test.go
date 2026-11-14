@@ -410,7 +410,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "list", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	code = Run([]string{"run", "list", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job list exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -419,7 +419,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "show", jobs[0].ID, "--home", home}, &stdout, &stderr)
+	code = Run([]string{"run", "show", jobs[0].ID, "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job show exit code = %d, stderr=%s", code, stderr.String())
 	}

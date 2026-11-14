@@ -56,7 +56,7 @@ instead of `$HOME/.gitmoot`. It is a flag of each subcommand, never of
 subcommand fails with `unknown command "--home"`. `gitmoot version --home H`
 prints the `config:` and `database:` paths of that home. Put a positional name
 or id right after the subcommand words and flags after it
-(`gitmoot job show <job-id> --home H`,
+(`gitmoot run show <run-id> --home H`,
 `gitmoot reviewer subscribe <name> --runtime ...`); the other order fails with
 "requires exactly one id/name". Two exceptions take every flag, `--home`
 included, before the positional:
@@ -71,7 +71,7 @@ Record the implementation first, so the merge gate knows who wrote the change
 and can check that the reviewer is someone else:
 
 ```sh
-gitmoot job record --agent <seat> --repo owner/repo --type implement --decision implemented --pr <n> --branch <branch> --summary "what changed"
+gitmoot run record --implementer <seat> --repo owner/repo --type implement --decision implemented --pr <n> --branch <branch> --summary "what changed"
 ```
 
 Use `--acting-role <role>` instead of `--agent` when the seat that wrote the
@@ -100,7 +100,7 @@ gitmoot review request --repo owner/repo --pr <n> --head <40-hex-sha> --role <yo
   review spent)`; neither starts a second reviewer. A review that ended
   `failed` or `cancelled` has no verdict, so asking again starts a new review
   of that head: that is how to retry one. To replace a saved verdict at the
-  same head, pass `--supersede <job-id> --reason "why"`.
+  same head, pass `--supersede <run-id> --reason "why"`.
 - The output names the run (`run:`), the reviewer, any `hold:` lines, and a
   `watch:` command. Add `--json` for `run_id`, `reviewer`, `awaited_fact_id`
   and `holds`. Every request, `verdict_exists` included, registers a wake-up
@@ -109,7 +109,7 @@ gitmoot review request --repo owner/repo --pr <n> --head <40-hex-sha> --role <yo
 - The review runs when the daemon claims it. Without a daemon the output says
   ``hold: daemon not running: the review stays queued until `gitmoot daemon
   start` starts the daemon``: start it (`gitmoot daemon start`) or run the job
-  once in the foreground with `gitmoot job run <job-id>`.
+  once in the foreground with `gitmoot run start <run-id>`.
 
 Pass review instructions with `--message "instructions"`. Ask a reviewer a
 read-only question with `gitmoot ask <reviewer> "question" --repo owner/repo`.
@@ -132,17 +132,17 @@ dependency manifests and locks, migrations), and so does every pull request on
 
 ```sh
 gitmoot review status --repo owner/repo --pr <n>
-gitmoot job show <job-id>
+gitmoot run show <run-id>
 gitmoot findings --repo owner/repo --pr <n>
 ```
 
 - `review status` prints the gate state and one line per review job: state,
   head, reviewer, `verdict=`, `evidence=` and the findings count. It and
-  `job show` are the source of truth for a review.
-- `job show` prints `decision:` and `summary:`, and the full result under
+  `run show` are the source of truth for a review.
+- `run show` prints `decision:` and `summary:`, and the full result under
   `payload.result`: `decision`, `severity`, `findings`, `tests_run`,
   `evidence`. Failed result checks (a verdict that accounts for nothing) are
-  under `payload.result_checks` and in `gitmoot job events <job-id>` as
+  under `payload.result_checks` and in `gitmoot run events <run-id>` as
   `result_checks_failed`. The result fields are in
   [references/RESULT_CONTRACT.md](references/RESULT_CONTRACT.md).
 - `findings --repo --pr` lists each finding with its `STATE`; add
@@ -156,11 +156,11 @@ A verdict is `approved` or `changes_requested` (with a `severity` of `P0` to
   review of it.
 - **`blocked`:** requesting the same head again does not retry it. The blocked
   job keeps its claim on the head, so the request prints `state: attached`
-  and the same job with `(blocked)`. Read why with `gitmoot job show <job-id>`
-  (`why_stuck`) and what it needs with `gitmoot job gates <job-id>`. Then
-  either clear its gates (`gitmoot job gates clear <job-id> --need "text"`;
+  and the same run with `(blocked)`. Read why with `gitmoot run show <run-id>`
+  (`why_stuck`) and what it needs with `gitmoot run gates <run-id>`. Then
+  either clear its gates (`gitmoot run gates clear <run-id> --need "text"`;
   clearing the last one runs it again), re-queue the same job with
-  `gitmoot job retry <job-id>`, or cancel it with `gitmoot job cancel <job-id>`
+  `gitmoot run retry <run-id>`, or cancel it with `gitmoot run cancel <run-id>`
   and request the head again for a new review.
 
 To act on `changes_requested`: fix, push, and request a review of the **new**
@@ -191,7 +191,7 @@ automatic merge is off and always replies with the outcome. Your role's
 
 **When a merge is held**, the reason names the remedy. The common ones:
 
-- *No implement job recorded* (an attribution gap): run the `job record` from
+- *No implement job recorded* (an attribution gap): run the `run record` from
   section 1, then `/gitmoot merge` again.
 - *No approval bound to the current head*: request a review of that head.
 - *The repository requires GitHub's merge queue*: gitmoot cannot merge
@@ -261,21 +261,21 @@ gitmoot org await list
 ## 6. When something is stuck
 
 ```sh
-gitmoot job show <job-id>
-gitmoot job cancel <job-id>
+gitmoot run show <run-id>
+gitmoot run cancel <run-id>
 gitmoot doctor
 gitmoot daemon status
 gitmoot daemon drain --timeout 15m
 ```
 
-- `job show` reports the state and, for a stuck job, `why_stuck` and a
-  suggested action. `gitmoot job events <job-id>` lists what happened.
-- `job cancel <job-id>` cancels one job.
-  `gitmoot job cancel --state blocked --older-than 7d` only previews the old
+- `run show` reports the state and, for a stuck run, `why_stuck` and a
+  suggested action. `gitmoot run events <run-id>` lists what happened.
+- `run cancel <run-id>` cancels one run.
+  `gitmoot run cancel --state blocked --older-than 7d` only previews the old
   blocked jobs it would cancel and changes nothing; add `--yes` to cancel
-  them: `gitmoot job cancel --state blocked --older-than 7d --yes`.
-- A `blocked` job lists what it needs with `gitmoot job gates <job-id>`. Clear
-  one with `gitmoot job gates clear <job-id> --need "text"`; clearing the last
+  them: `gitmoot run cancel --state blocked --older-than 7d --yes`.
+- A `blocked` job lists what it needs with `gitmoot run gates <run-id>`. Clear
+  one with `gitmoot run gates clear <run-id> --need "text"`; clearing the last
   one runs the job again.
 - `doctor` checks the install, the daemon, stuck jobs and the runtimes;
   `--json` for scripts.
