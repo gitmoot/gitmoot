@@ -96,13 +96,13 @@ func TestFlagAliasSetsNewFlagWarnsOnceAndIsHidden(t *testing.T) {
 	aliases := []FlagAlias{{Old: "zz-workflow", New: "campaign"}}
 
 	args := []string{"--zz-workflow", "w1", "pos"}
-	if err := fs.Parse(rewriteFlagAliases(args, &stderr, aliases...)); err != nil {
+	if err := parseWithFlagAliases(fs, args, &stderr, aliases...); err != nil {
 		t.Fatal(err)
 	}
 	if *campaign != "w1" || fs.Arg(0) != "pos" || args[0] != "--zz-workflow" {
 		t.Fatalf("campaign=%q args=%v caller args=%v", *campaign, fs.Args(), args)
 	}
-	if err := fs.Parse(rewriteFlagAliases([]string{"-zz-workflow=w2"}, &stderr, aliases...)); err != nil {
+	if err := parseWithFlagAliases(fs, []string{"-zz-workflow=w2"}, &stderr, aliases...); err != nil {
 		t.Fatal(err)
 	}
 	if *campaign != "w2" {
@@ -112,9 +112,6 @@ func TestFlagAliasSetsNewFlagWarnsOnceAndIsHidden(t *testing.T) {
 	if stderr.String() != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
-	if got := rewriteFlagAliases([]string{"--", "--zz-workflow"}, &stderr, aliases...); got[1] != "--zz-workflow" {
-		t.Fatalf("rewrote past --: %v", got)
-	}
 
 	stderr.Reset()
 	if err := fs.Parse([]string{"--help"}); err != flag.ErrHelp {
@@ -122,5 +119,64 @@ func TestFlagAliasSetsNewFlagWarnsOnceAndIsHidden(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "zz-workflow") || !strings.Contains(stderr.String(), "-campaign") {
 		t.Fatalf("help output:\n%s", stderr.String())
+	}
+}
+
+func TestParseWithFlagAliasesFollowsFlagSetConsumption(t *testing.T) {
+	aliasWarned = sync.Map{}
+	t.Cleanup(func() { aliasWarned = sync.Map{} })
+	aliases := []FlagAlias{{Old: "zz-old", New: "new"}}
+
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantNew  string
+		wantBody string
+		wantRest []string
+	}{
+		{name: "positional stops scanning", args: []string{"position", "--zz-old"}, wantRest: []string{"position", "--zz-old"}},
+		{name: "-- as a value then alias", args: []string{"--body", "--", "--zz-old=v"}, wantBody: "--", wantNew: "v", wantRest: []string{}},
+		{name: "value equal to old name kept", args: []string{"--body", "--zz-old", "--zz-old", "x"}, wantBody: "--zz-old", wantNew: "x", wantRest: []string{}},
+		{name: "-body=v does not consume", args: []string{"-body=b", "--zz-old", "x"}, wantBody: "b", wantNew: "x", wantRest: []string{}},
+		{name: "bool flag does not consume", args: []string{"--quiet", "--zz-old", "x", "p"}, wantNew: "x", wantRest: []string{"p"}},
+		{name: "real -- ends flags", args: []string{"--quiet", "--", "--zz-old", "x"}, wantRest: []string{"--zz-old", "x"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			fs := flag.NewFlagSet("demo", flag.ContinueOnError)
+			fs.SetOutput(&stderr)
+			newValue := fs.String("new", "", "")
+			body := fs.String("body", "", "")
+			fs.Bool("quiet", false, "")
+			if err := parseWithFlagAliases(fs, tc.args, &stderr, aliases...); err != nil {
+				t.Fatalf("parse %v: %v (%s)", tc.args, err, stderr.String())
+			}
+			if *newValue != tc.wantNew || *body != tc.wantBody || strings.Join(fs.Args(), " ") != strings.Join(tc.wantRest, " ") {
+				t.Fatalf("new=%q body=%q rest=%v", *newValue, *body, fs.Args())
+			}
+		})
+	}
+}
+
+func TestRenameFlagToken(t *testing.T) {
+	aliasWarned = sync.Map{}
+	t.Cleanup(func() { aliasWarned = sync.Map{} })
+	aliases := []FlagAlias{{Old: "zz-old", New: "new"}}
+	var stderr bytes.Buffer
+	for token, want := range map[string]string{
+		"--zz-old":     "--new",
+		"-zz-old":      "-new",
+		"--zz-old=v=w": "--new=v=w",
+		"--zz-older":   "--zz-older",
+		"zz-old":       "zz-old",
+		"--":           "--",
+		"-":            "-",
+	} {
+		if got := renameFlagToken(token, &stderr, aliases...); got != want {
+			t.Errorf("renameFlagToken(%q) = %q, want %q", token, got, want)
+		}
+	}
+	if strings.Count(stderr.String(), "is now") != 1 {
+		t.Fatalf("stderr = %q", stderr.String())
 	}
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"strings"
@@ -79,51 +80,90 @@ type FlagAlias struct {
 	New string // new flag name without dashes, e.g. "campaign"
 }
 
-// rewriteFlagAliases rewrites hidden old flag names in args to their new
-// names before a flag set parses them, warning once per old name. Call it on
-// the args passed to fs.Parse:
+// parseWithFlagAliases parses args into fs like fs.Parse, accepting each
+// hidden old flag name as its new name (warning once per old name):
 //
-//	args = rewriteFlagAliases(args, stderr, FlagAlias{Old: "workflow", New: "campaign"})
+//	err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "workflow", New: "campaign"})
 //
 // Only the new flag is registered on the flag set, so both spellings set the
-// same value and the old one never shows up in PrintDefaults or --help.
-// Accepts -old, --old, -old=v and --old=v; stops at a bare "--".
-func rewriteFlagAliases(args []string, stderr io.Writer, aliases ...FlagAlias) []string {
+// same value and the old one never shows up in PrintDefaults or --help. The
+// args are walked exactly as flag.FlagSet consumes them: scanning stops at the
+// first non-flag token or a "--" in flag position, and the separate value of a
+// non-bool flag is never rewritten. It returns fs.Parse's error.
+func parseWithFlagAliases(fs *flag.FlagSet, args []string, stderr io.Writer, aliases ...FlagAlias) error {
 	if len(aliases) == 0 {
-		return args
+		return fs.Parse(args)
 	}
 	var out []string
-	for i, arg := range args {
-		if arg == "--" {
+	for i := 0; i < len(args); i++ {
+		token := args[i]
+		if len(token) < 2 || token[0] != '-' || token == "--" {
 			break
 		}
-		if !strings.HasPrefix(arg, "-") {
-			continue
-		}
-		dashes := "-"
-		name := arg[1:]
-		if strings.HasPrefix(name, "-") {
-			dashes = "--"
-			name = name[1:]
-		}
-		value := ""
-		if eq := strings.IndexByte(name, '='); eq >= 0 {
-			name, value = name[:eq], name[eq:]
-		}
-		for _, alias := range aliases {
-			if name != alias.Old {
-				continue
-			}
+		renamed := renameFlagToken(token, stderr, aliases...)
+		if renamed != token {
 			if out == nil {
 				out = append([]string(nil), args...)
 			}
-			out[i] = dashes + alias.New + value
-			warnRenamed(stderr, "--"+alias.Old, "--"+alias.New)
+			out[i] = renamed
+		}
+		name, hasValue := flagTokenName(renamed)
+		if name == "" {
 			break
+		}
+		f := fs.Lookup(name)
+		if f == nil {
+			break // fs.Parse reports the undefined flag (or -h/-help).
+		}
+		if !hasValue && !isBoolFlag(f) {
+			i++ // the next token is this flag's value
 		}
 	}
 	if out == nil {
-		return args
+		out = args
 	}
-	return out
+	return fs.Parse(out)
+}
+
+// renameFlagToken renames one token the caller already knows is a flag name
+// (-old, --old, -old=v or --old=v) to its new name, warning once per old
+// name; any other token is returned unchanged. For hand-parsed commands.
+func renameFlagToken(token string, stderr io.Writer, aliases ...FlagAlias) string {
+	name, _ := flagTokenName(token)
+	if name == "" {
+		return token
+	}
+	for _, alias := range aliases {
+		if name != alias.Old {
+			continue
+		}
+		dashes := token[:strings.Index(token, name)]
+		warnRenamed(stderr, "--"+alias.Old, "--"+alias.New)
+		return dashes + alias.New + token[len(dashes)+len(name):]
+	}
+	return token
+}
+
+// flagTokenName returns the flag name of a -name/--name[=value] token as
+// flag.FlagSet reads it, or "" when the token is not a well-formed flag.
+func flagTokenName(token string) (name string, hasValue bool) {
+	if len(token) < 2 || token[0] != '-' {
+		return "", false
+	}
+	name = token[1:]
+	if name[0] == '-' {
+		name = name[1:]
+	}
+	if name == "" || name[0] == '-' || name[0] == '=' {
+		return "", false
+	}
+	if eq := strings.IndexByte(name, '='); eq >= 0 {
+		return name[:eq], true
+	}
+	return name, false
+}
+
+func isBoolFlag(f *flag.Flag) bool {
+	b, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && b.IsBoolFlag()
 }
