@@ -335,7 +335,7 @@ func TestWebDataSourceGraph(t *testing.T) {
 	ds := &webDataSource{home: home}
 	ctx := context.Background()
 
-	g, err := ds.Graph(ctx, "")
+	g, err := ds.Graph(ctx, "", dashboard.GraphRange30d)
 	if err != nil {
 		t.Fatalf("Graph: %v", err)
 	}
@@ -418,7 +418,7 @@ func TestWebDataSourceGraph(t *testing.T) {
 	}
 
 	// Repo filter narrows the job nodes to the one repo but keeps the full Repos list.
-	filtered, err := ds.Graph(ctx, "jerryfane/noted")
+	filtered, err := ds.Graph(ctx, "jerryfane/noted", dashboard.GraphRange30d)
 	if err != nil {
 		t.Fatalf("Graph(filter): %v", err)
 	}
