@@ -45,7 +45,10 @@ func reviewDiskGuardRefusal(evaluation diskGuardEvaluation, sourceOnly bool) err
 // warning band and Janitor's low-space states) decide only whether NEW work
 // may start. Owner policy (#2466/#2479): do not terminate running work for low
 // space. While running, only failed, unknown, stale or mismatched evidence
-// (and, in the monitor, device or policy changes) stops a review.
+// (and, in the monitor, device or policy changes) stops a review. The one
+// exception is the monitor's fallback when Janitor does not answer at all
+// (janitorUnavailableLocalGuard, #2667): it stops a review only below the
+// local [disk_guard] floor, where it used to stop it unconditionally.
 func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Store, paths config.Paths, repo string, sourceOnly, admitting bool, checkouts ...string) (map[uint64]string, []reviewCapacityMeasurement, error) {
 	if a.cfgErr != nil {
 		return nil, nil, a.cfgErr
@@ -64,17 +67,7 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 	} else if evaluation.Policy.Enabled && evaluation.Err != nil {
 		return nil, nil, fmt.Errorf("disk guard measurement failed during review: %s", evaluation.detail())
 	}
-	// Remote source preparation writes control state and logs, not local Git.
-	hostPaths := []string{paths.Home}
-	var root config.WorktreeRoot
-	if !sourceOnly {
-		var err error
-		hostPaths, root, err = janitorHostPaths(ctx, store, paths, repo, checkouts...)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-	devices, err := janitorHostDevices(hostPaths, root)
+	devices, err := reviewHostDevices(ctx, store, paths, repo, sourceOnly, checkouts...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -134,9 +127,62 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 		}
 	}
 	if reason := a.expired(); reason != "" {
-		return nil, nil, fmt.Errorf("%s", reason)
+		return nil, nil, janitorSampleStaleError(reason)
 	}
 	return devices, measurements, nil
+}
+
+// reviewHostDevices resolves the devices a review writes to, keyed by st_dev.
+// Remote source preparation writes control state and logs, not local Git.
+func reviewHostDevices(ctx context.Context, store *db.Store, paths config.Paths, repo string, sourceOnly bool, checkouts ...string) (map[uint64]string, error) {
+	hostPaths := []string{paths.Home}
+	var root config.WorktreeRoot
+	if !sourceOnly {
+		var err error
+		hostPaths, root, err = janitorHostPaths(ctx, store, paths, repo, checkouts...)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return janitorHostDevices(hostPaths, root)
+}
+
+// janitorSampleStaleError is a Janitor sample that expired before the check
+// using it finished.
+type janitorSampleStaleError string
+
+func (e janitorSampleStaleError) Error() string { return string(e) }
+
+// janitorUnavailableLocalGuardPhase is logged for each running-review check
+// that Janitor did not answer and no fresh sample covered (#2667).
+const janitorUnavailableLocalGuardPhase = "janitor_unavailable_local_guard"
+
+// janitorUnavailableLocalGuard checks a RUNNING review when Janitor did not
+// answer and no fresh sample remains (#2667). A slow Janitor says nothing about
+// the disk, so it never stops a review on its own; gitmoot's own statfs of the
+// configured [disk_guard] floor on the gitmoot home does, when that floor is
+// crossed or cannot be measured. The backing devices are still resolved, so a
+// path or device change still stops the review. detail is the local
+// measurement for the capacity log.
+func janitorUnavailableLocalGuard(ctx context.Context, store *db.Store, paths config.Paths, repo string, sourceOnly bool, checkouts ...string) (map[uint64]string, []reviewCapacityMeasurement, string, error) {
+	devices, err := reviewHostDevices(ctx, store, paths, repo, sourceOnly, checkouts...)
+	if err != nil {
+		return nil, nil, "local disk guard not evaluated", err
+	}
+	evaluation := evaluateConfiguredDiskGuard(paths)
+	detail := "local disk guard: " + evaluation.detail()
+	var measurements []reviewCapacityMeasurement
+	if evaluation.Policy.Enabled && evaluation.Err == nil {
+		homeDevice, err := janitorDeviceOf(paths.Home)
+		if err != nil {
+			return nil, nil, detail, err
+		}
+		measurements = []reviewCapacityMeasurement{{homeDevice, evaluation.Path, evaluation.Usage.FreeBytes, evaluation.Policy.MinFreeBytes}}
+	}
+	if !evaluation.allowsDispatch() {
+		return nil, measurements, detail, fmt.Errorf("local disk guard stopped the review while janitor did not answer: %s", evaluation.detail())
+	}
+	return devices, measurements, detail, nil
 }
 
 // The audit exists before a job row does and survives an unsuccessful dispatch.
@@ -187,14 +233,24 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 		ownedGeneration = *generation
 	}
 	// lastGood is the newest Janitor sample that was read successfully. A
-	// status command that did not answer (a 5s timeout under host load)
-	// reuses it while it is still fresh; the measurements are still taken
-	// live and the sample's own validity still applies, so failed evidence
-	// fails closed once no fresh sample exists (owner decision, #2500: one
-	// timeout at 21:19Z cancelled five healthy reviews at once). An answer
-	// that arrived and was rejected (another policy, bad schema, stale
-	// producer) is evidence, never masked by the cached sample.
+	// status command that did not answer (a timeout under host load) reuses
+	// it while it is still fresh; the measurements are still taken live
+	// (#2500: one timeout at 21:19Z cancelled five healthy reviews at once).
+	// Once no fresh sample remains, a read that still does not answer falls
+	// back to the local [disk_guard] floor instead of stopping the review
+	// (#2667: Janitor stayed slow past its 2-minute sample and healthy reviews
+	// were cancelled). An answer that arrived and was rejected (another
+	// policy, bad schema, stale producer) is evidence, never masked by the
+	// cached sample or the local guard.
 	var lastGood *janitorAdmission
+	localGuard := func(unanswered error) (map[uint64]string, []reviewCapacityMeasurement, error) {
+		devices, measurements, detail, err := janitorUnavailableLocalGuard(ctx, store, paths, repo, sourceOnly, checkouts...)
+		_ = recordReviewCapacity(paths, jobID, repo, head, janitorUnavailableLocalGuardPhase, "janitor did not answer and no fresh sample remains ("+unanswered.Error()+"); "+detail, measurements)
+		if err != nil {
+			return nil, measurements, fmt.Errorf("%w (current janitor read failed: %v)", err, unanswered)
+		}
+		return devices, measurements, nil
+	}
 	check := func(admitting bool) (map[uint64]string, []reviewCapacityMeasurement, error) {
 		current, err := config.LoadJanitorCapacity(paths)
 		if err != nil {
@@ -204,19 +260,27 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 			return nil, nil, fmt.Errorf("review capacity policy changed during execution")
 		}
 		a := loadJanitorAdmission(ctx, paths)
+		// Admission never tolerates a read that did not answer.
+		unanswered := a.cfgErr == nil && !admitting && errors.As(a.readErr, new(janitorStatusExecError))
 		var reusedAfter error
-		if a.cfgErr == nil && a.readErr == nil {
+		switch {
+		case a.cfgErr == nil && a.readErr == nil:
 			good := a
 			lastGood = &good
-		} else if a.cfgErr == nil && !admitting && lastGood != nil && lastGood.expired() == "" && errors.As(a.readErr, new(janitorStatusExecError)) {
+		case unanswered && lastGood != nil && lastGood.expired() == "":
 			_ = recordReviewCapacity(paths, jobID, repo, head, "janitor_read_failed", "using the last good sample until it is stale: "+a.readErr.Error(), nil)
 			reusedAfter = a.readErr
 			a = *lastGood
+		case unanswered:
+			return localGuard(a.readErr)
 		}
 		devices, measurements, err := a.reviewMeasurements(ctx, store, paths, repo, sourceOnly, admitting, checkouts...)
 		if err != nil && reusedAfter != nil {
-			// The reused sample can expire during this check: name the read
-			// failure that made it the evidence, not only its staleness.
+			if errors.As(err, new(janitorSampleStaleError)) {
+				// The reused sample expired during this check.
+				return localGuard(reusedAfter)
+			}
+			// Name the read failure that made the cached sample the evidence.
 			err = fmt.Errorf("%w (current janitor read failed: %v)", err, reusedAfter)
 		}
 		return devices, measurements, err
@@ -322,8 +386,9 @@ func cancelMonitoredReview(store *db.Store, jobID string, generation int64, reas
 
 // reviewCapacityCancelledEventKind records why the capacity monitor cancelled
 // a running review (failed or unknown capacity evidence, device change, policy
-// change; never low space), so the job history never shows an unexplained
-// cancel.
+// change, or the local [disk_guard] floor crossed while Janitor does not
+// answer; never Janitor's low-space states), so the job history never shows an
+// unexplained cancel.
 const reviewCapacityCancelledEventKind = "review_capacity_cancelled"
 
 // janitorPressureStates are Janitor states that report KNOWN low space. They

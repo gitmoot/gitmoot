@@ -2,11 +2,13 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,21 +89,20 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// Low space no longer stops a running review (#2479); failed or
-			// unknown capacity evidence still does, and is what this test uses.
+			// Low space no longer stops a running review (#2479), nor does a
+			// Janitor that does not answer while the local floor holds (#2667);
+			// an answer that arrived and was rejected still does, and is what
+			// this test uses.
 			var broken atomic.Bool
 			previous := runJanitorStatus
 			runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
 				if broken.Load() {
-					return nil, errors.New("janitor status unavailable")
+					return []byte("janitor answered garbage"), nil
 				}
 				volumes := make([]string, 0, len(devices))
 				for device := range devices {
 					volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":%d,"reserve_bytes":1048576,"target_bytes":1048576,"reason":"cleanup target held"}`, device, device, uint64(2<<30)))
 				}
-				// A short validity: under #2500 a failed read reuses the last
-				// good sample until it is stale, so the fail-closed cancel this
-				// test needs arrives once that sample expires.
 				return []byte(janitorStatusJSON(time.Now(), 4*time.Second, janitorTestPolicyHash, volumes...)), nil
 			}
 			t.Cleanup(func() { runJanitorStatus = previous })
@@ -139,7 +140,7 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 			case <-time.After(reviewCapacityTestStopWait):
 				t.Fatal("review kept running after its capacity evidence failed")
 			}
-			if runErr == nil || !strings.Contains(runErr.Error(), "janitor status unavailable") {
+			if runErr == nil || !strings.Contains(runErr.Error(), "janitor status is not valid JSON") {
 				t.Fatalf("monitor outcome = %v, want fail-closed cancellation", runErr)
 			}
 			ended, err := store.GetJob(ctx, job.ID)
@@ -186,9 +187,17 @@ func TestLocalReviewMonitorNeverStopsRunningReviewForLowSpace(t *testing.T) {
 		{"statfs_failed", "statfs failed"},
 		{"janitor_measurement_unknown", "unknown or unsafe canonical capacity"},
 		// #2500: one Janitor read timing out must not stop a running review
-		// while the last good sample is fresh; reads that keep failing do,
-		// once it is stale.
-		{"janitor_read_failed", "janitor status unavailable"},
+		// while the last good sample is fresh. #2667: once it is stale, reads
+		// that keep failing fall back to the local [disk_guard] floor, which
+		// stops the review here because free space is below it.
+		{"janitor_read_failed", "local disk guard stopped the review while janitor did not answer"},
+		// #2667: Janitor timing out long past its cached sample's validity
+		// does not stop a review while the local floor holds; the fallback is
+		// logged with its measurement. A failing local measurement still stops it.
+		{"janitor_unavailable_above_floor", "statfs failed"},
+		// #2667: a rejected answer after the local fallback took over still
+		// fails closed, although the local floor holds.
+		{"janitor_other_policy_after_fallback", "is not the approved policy"},
 		// #2500: the cancel must commit even while destructive cleanup holds
 		// the lifecycle lock longer than the old 10s wait; before, the run was
 		// stopped with no cancel recorded and the job never ended cancelled.
@@ -301,10 +310,30 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 		broken.Store(true)
 	case "janitor_other_policy":
 		// Let a long-lived sample become the cached one, then answer for
-		// another policy: the stop must not wait for that sample to expire.
+		// another policy: the stop must not wait for that sample to expire,
+		// nor depend on the local floor (free space is above it).
+		free.Store(15_000_000_000)
+		state.Store("cleanup_needed")
 		validity.Store(int64(2 * time.Minute))
 		time.Sleep(2*reviewCapacityInterval + time.Second)
 		policy.Store(strings.Repeat("0", len(janitorTestPolicyHash)))
+	case "janitor_unavailable_above_floor", "janitor_other_policy_after_fallback":
+		free.Store(15_000_000_000)
+		state.Store("cleanup_needed")
+		janitorDown.Store(true)
+		select {
+		case <-finished:
+			events, _ := store.ListJobEvents(ctx, job.ID)
+			t.Fatalf("a Janitor that did not answer stopped the review above the local floor: %v events=%+v", runErr, events)
+		case <-time.After(time.Duration(validity.Load()) + 3*reviewCapacityInterval + time.Second):
+		}
+		requireLocalGuardLogged(t, paths, 15_000_000_000)
+		if trigger == "janitor_unavailable_above_floor" {
+			broken.Store(true)
+		} else {
+			policy.Store(strings.Repeat("0", len(janitorTestPolicyHash)))
+			janitorDown.Store(false)
+		}
 	case "statfs_failed_while_cleanup_locked":
 		// Destructive cleanup holds the lifecycle lock exclusively for longer
 		// than the old 10s cancel wait.
@@ -370,4 +399,30 @@ func (r *reviewCapacityBlockingRunner) RunEnv(ctx context.Context, dir string, _
 
 func (r *reviewCapacityBlockingRunner) LookPath(name string) (string, error) {
 	return exec.LookPath(name)
+}
+
+// requireLocalGuardLogged finds a janitor_unavailable_local_guard row in the
+// capacity log that names the failed read and carries the local measurement.
+func requireLocalGuardLogged(t *testing.T, paths config.Paths, wantFree uint64) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(paths.Home, "review-capacity.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var entry struct {
+			Phase        string                      `json:"phase"`
+			Detail       string                      `json:"detail"`
+			Measurements []reviewCapacityMeasurement `json:"measurements"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("capacity log line %q: %v", line, err)
+		}
+		if entry.Phase == "janitor_unavailable_local_guard" && strings.Contains(entry.Detail, "janitor status unavailable") &&
+			strings.Contains(entry.Detail, fmt.Sprintf("free_bytes=%d", wantFree)) &&
+			len(entry.Measurements) == 1 && entry.Measurements[0].Available == wantFree {
+			return
+		}
+	}
+	t.Fatalf("capacity log has no janitor_unavailable_local_guard row with free_bytes=%d:\n%s", wantFree, raw)
 }
