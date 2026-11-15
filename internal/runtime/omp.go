@@ -623,12 +623,14 @@ func ompWorkspaceArgs(agent Agent) []string {
 const ompNoExecutionTools = "read,grep,glob,todo"
 
 // ompNoExecutionVerifiedVersions are the omp builds whose no-execution
-// behaviour was measured: 18.10.4 in #2364, 18.18.6 in #2561 and 18.18.8 in
-// #2571 (tool allowlist, provider and MCP gating, --cwd, settings overlay
-// precedence; probe and record in /root/fleet-tools/state/gitmoot-2561 on the
-// fleet host). Another version may move a discovery path or a flag, so a
-// no-execution seat refuses it until it is measured and added here.
-var ompNoExecutionVerifiedVersions = map[string]bool{"omp/18.10.4": true, "omp/18.18.6": true, "omp/18.18.8": true}
+// behaviour was measured: 18.10.4 in #2364, 18.18.6 in #2561, 18.18.8 in
+// #2571 and 18.20.0 in #2663 (tool allowlist, provider and MCP gating, --cwd,
+// settings overlay precedence; probe and record in
+// /root/fleet-tools/state/gitmoot-2561 on the fleet host; 18.20.0 with
+// tools.xdev off: probe-omp-noexec-xdev.sh, runs-xdev-20261115/,
+// record-18.20.0.md). Another version may move a discovery path or a flag, so
+// a no-execution seat refuses it until it is measured and added here.
+var ompNoExecutionVerifiedVersions = map[string]bool{"omp/18.10.4": true, "omp/18.18.6": true, "omp/18.18.8": true, "omp/18.20.0": true}
 
 // OmpNoExecutionVersionError refuses a no-execution seat on an omp build
 // whose behaviour has not been verified. version is the runtime contract
@@ -650,8 +652,10 @@ func OmpNoExecutionVersionError(version string) error {
 }
 
 // ompDiscoveryProviders is every config-discovery provider omp ships (the ids
-// registered with its capability registry; the same set in 18.10.4, 18.18.6
-// and 18.18.8). A no-execution seat disables ALL of them, because each one can
+// registered with its capability registry: the same set in 18.10.4, 18.18.6
+// and 18.18.8; 18.20.0 adds ssh-config, OpenSSH config hosts, and an id a
+// build does not register is ignored). A no-execution seat disables ALL of
+// them, because each one can
 // contribute MCP servers, custom tools, hooks, extensions or rules from user or
 // project files. Measured on both versions (#2364, #2561): with --no-extensions
 // alone, project and user `tools/*.js` still load in-process and project and
@@ -661,7 +665,7 @@ var ompDiscoveryProviders = []string{
 	"agent-plugins", "agents", "agents-md", "builtin-defaults", "claude", "claude-md",
 	"claude-plugins", "cline", "codex", "cursor", "custom-context", "gemini", "github",
 	"mcp-json", "native", "omp-managed", "omp-plugins", "opencode", "skillshare",
-	"ssh-json", "vscode", "windsurf",
+	"ssh-config", "ssh-json", "vscode", "windsurf",
 }
 
 // OmpNoExecutionOverlay is the omp settings overlay a no-execution seat runs
@@ -669,9 +673,15 @@ var ompDiscoveryProviders = []string{
 // project and PI_CONFIG_FILES layer: a planted project config.yml or an
 // environment overlay that re-enables providers, MCP or extensions was
 // overridden in every measured case.
+//
+// tools.xdev is off (#2663). omp defaults it on, and with it on a session
+// whose --tools list grants read but omits write gets a device-only write
+// tool, surfaced as soon as any tool is mounted under xd://, plus xd:// state
+// the prompt advertises. A no-execution seat must offer exactly
+// ompNoExecutionTools, with no write transport in reserve.
 var OmpNoExecutionOverlay = func() string {
 	var b strings.Builder
-	b.WriteString("mcp:\n  enableProjectConfig: false\nextensions: []\nskills:\n  enabled: false\ndisabledProviders:\n")
+	b.WriteString("mcp:\n  enableProjectConfig: false\nextensions: []\nskills:\n  enabled: false\ntools:\n  xdev: false\ndisabledProviders:\n")
 	for _, provider := range ompDiscoveryProviders {
 		b.WriteString("  - " + provider + "\n")
 	}
