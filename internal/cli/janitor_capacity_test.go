@@ -437,3 +437,59 @@ func TestJanitorPressureRoutesReviewWithCapAndAlerts(t *testing.T) {
 		t.Fatalf("remote refusal did not notify requesting role: %+v", messages)
 	}
 }
+
+// #2667: gitmoot asks Janitor for the capacity decision only (`status
+// --capacity`, janitor v0.1.17+). An older janitor rejects the flag; that call
+// falls back to plain status, the binary is not probed again, and an upgrade
+// installed at the same path is probed again.
+func TestJanitorStatusUsesCapacityFlagAndFallsBackForOlderJanitor(t *testing.T) {
+	dir := t.TempDir()
+	argvLog := filepath.Join(dir, "argv.log")
+	envelope := janitorStatusJSON(time.Now(), time.Hour, janitorTestPolicyHash)
+	script := func(name, reject string) string {
+		path := filepath.Join(dir, name)
+		body := fmt.Sprintf("#!/bin/sh\necho \"$*\" >> %q\n%scat <<'EOF'\n%s\nEOF\n", argvLog, reject, envelope)
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	current := script("janitor-current", "")
+	// Go's flag package in janitor before v0.1.17, verbatim.
+	older := script("janitor-older", "case \" $* \" in *\" --capacity \"*) printf 'janitor: flag provided but not defined: -capacity\\n\\nUsage:\\n  janitor status [flags]\\n' >&2; exit 2;; esac\n")
+	executable := filepath.Join(dir, "janitor")
+	install := func(binary string) {
+		_ = os.Remove(executable)
+		if err := os.Link(binary, executable); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(want ...string) {
+		t.Helper()
+		if err := os.Remove(argvLog); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		out, err := runJanitorStatus(context.Background(), executable, 10*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := parseJanitorCapacity(out, janitorTestPolicyHash, time.Now()); err != nil {
+			t.Fatalf("status answer rejected: %v", err)
+		}
+		raw, err := os.ReadFile(argvLog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Split(strings.TrimSpace(string(raw)), "\n"); !slices.Equal(got, want) {
+			t.Fatalf("janitor argv = %q, want %q", got, want)
+		}
+	}
+	const capacityArgv, plainArgv = "--format json status --capacity", "--format json status"
+	install(current)
+	read(capacityArgv)
+	install(older)
+	read(capacityArgv, plainArgv)
+	read(plainArgv)
+	install(current)
+	read(capacityArgv)
+}

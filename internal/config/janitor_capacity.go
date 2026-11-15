@@ -17,7 +17,7 @@ import (
 //
 //	[janitor_capacity]
 //	enabled = true
-//	executable = "/root/.local/bin/janitor"   # absolute; run as: <executable> --format json status
+//	executable = "/root/.local/bin/janitor"   # absolute; run as: <executable> --format json status --capacity (plain status for janitor < v0.1.17)
 //	policy_hash = "<64 hex>"                  # the approved janitor policy; any other hash holds
 //	timeout_ms = 5000                         # optional, 100..60000
 //

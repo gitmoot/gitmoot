@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -37,21 +38,73 @@ const janitorPressureHeldEventKind = "janitor_pressure_held"
 // A sample further in the future is not trusted.
 const janitorCapacityClockSkew = 30 * time.Second
 
-// runJanitorStatus runs the fixed argv `<executable> --format json status`: no
-// shell, no interpolation. It is a variable so tests can supply producer output.
+// runJanitorStatus runs the fixed argv `<executable> --format json status
+// --capacity`: no shell, no interpolation. --capacity (janitor v0.1.17+) prints
+// the same status envelope with a byte-identical data.capacity and skips the
+// store summaries and inventory that made full status take seconds under host
+// load (#2667). A janitor that rejects the flag gets the plain `status` argv in
+// the same call, within the same deadline, and is remembered for this process
+// (until its binary changes) so later calls do not probe again. It is a
+// variable so tests can supply producer output.
 var runJanitorStatus = func(ctx context.Context, executable string, timeout time.Duration) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, executable, "--format", "json", "status")
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
+	run := func(extra ...string) ([]byte, string, error) {
+		cmd := exec.CommandContext(ctx, executable, append([]string{"--format", "json", "status"}, extra...)...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		return stdout.Bytes(), stderr.String(), err
+	}
+	binary := janitorBinaryIdentity(executable)
+	_, plain := janitorPlainStatusBinaries.Load(binary)
+	var out []byte
+	var stderr string
+	var err error
+	if !plain {
+		out, stderr, err = run("--capacity")
+		var exit *exec.ExitError
+		plain = errors.As(err, &exit) && ctx.Err() == nil && janitorRejectedCapacityFlag(stderr)
+		if plain && binary != "" {
+			janitorPlainStatusBinaries.Store(binary, struct{}{})
+		}
+	}
+	if plain {
+		out, stderr, err = run()
+	}
+	if err != nil {
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("janitor status timed out after %s", timeout)
 		}
-		return nil, fmt.Errorf("janitor status failed: %v: %s", err, firstLineTrimmed(stderr.String()))
+		return nil, fmt.Errorf("janitor status failed: %v: %s", err, firstLineTrimmed(stderr))
 	}
-	return stdout.Bytes(), nil
+	return out, nil
+}
+
+// janitorPlainStatusBinaries holds the identities of janitor binaries that
+// rejected --capacity. The identity includes size, mtime and inode, so an
+// upgraded janitor at the same path is probed again.
+var janitorPlainStatusBinaries sync.Map
+
+// janitorBinaryIdentity is "" when the executable cannot be stat'ed; that is
+// never remembered (the call fails on its own).
+func janitorBinaryIdentity(executable string) string {
+	info, err := os.Stat(executable)
+	if err != nil {
+		return ""
+	}
+	id := fmt.Sprintf("%s|%d|%d", executable, info.Size(), info.ModTime().UnixNano())
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		id += fmt.Sprintf("|%d|%d", st.Dev, st.Ino)
+	}
+	return id
+}
+
+// janitorRejectedCapacityFlag recognises an older janitor: its Go flag parser
+// exits 2 with "flag provided but not defined: -capacity". Any other failure
+// of the --capacity call is reported as that call's failure, never retried.
+func janitorRejectedCapacityFlag(stderr string) bool {
+	return strings.Contains(stderr, "flag provided but not defined: -capacity")
 }
 
 type janitorVolume struct {
@@ -86,7 +139,8 @@ func readJanitorCapacity(ctx context.Context, cfg config.JanitorCapacity) (janit
 
 // janitorStatusExecError marks a status command that did not answer (timed
 // out, could not start, exited non-zero). Only this kind of failure lets a
-// running review keep its last good sample (#2500); an answer that arrived
+// running review keep its last good sample (#2500) and, once none is fresh,
+// fall back to the local [disk_guard] floor (#2667); an answer that arrived
 // and was rejected (policy, schema, freshness) is evidence and fails closed.
 type janitorStatusExecError struct{ err error }
 
