@@ -15,7 +15,7 @@ import (
 )
 
 func TestClientUsesSharedSubprocessRunner(t *testing.T) {
-	runner := &fakeRunner{results: []subprocess.Result{{}, {Stdout: "task-1\n"}, {}, {Stdout: "/repo\n"}, {Stdout: "https://github.com/gitmoot/gitmoot.git\n"}, {}, {}, {}}}
+	runner := &fakeRunner{results: []subprocess.Result{{}, {Stdout: "task-1\n"}, {}, {Stdout: "/repo\n"}, {Stdout: "https://github.com/gitmoot/gitmoot.git\n"}, {}, {}, {Stdout: "main\n"}, {}, {}}}
 	client := NewClient("/repo", runner)
 
 	if err := client.CreateBranch(context.Background(), "task-1", "main"); err != nil {
@@ -63,8 +63,9 @@ func TestClientUsesSharedSubprocessRunner(t *testing.T) {
 	runner.wantArgs(t, 4, "git", "remote", "get-url", "origin")
 	runner.wantArgs(t, 5, "git", "status", "--porcelain")
 	runner.wantArgs(t, 6, "git", "fetch", "origin", "main")
-	runner.wantArgs(t, 7, "git", "switch", "main")
-	runner.wantArgs(t, 8, "git", "pull", "--ff-only", "origin", "main")
+	runner.wantArgs(t, 7, "git", "branch", "--show-current")
+	runner.wantArgs(t, 8, "git", "--no-optional-locks", "status", "--porcelain", "--untracked-files=no")
+	runner.wantArgs(t, 9, "git", "pull", "--ff-only", "origin", "main")
 }
 
 func TestClientRequiresSubprocessRunner(t *testing.T) {
@@ -1483,6 +1484,104 @@ func gitFixtureHead(t *testing.T, dir string) string {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
 	return sha
+}
+
+// TestUpdateBaseNeverSwitchesTheCheckoutBranch reproduces 2026-11-15: after
+// adstudio#45 merged, the merge gate's UpdateBase switched KeepHair's live
+// checkout from its own branch to main mid-build. A real repository with a real
+// origin: whatever the checkout is on, UpdateBase may fetch, but it must leave
+// the branch, HEAD and working tree as they were unless it can fast-forward the
+// base branch it is already on.
+func TestUpdateBaseNeverSwitchesTheCheckoutBranch(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (origin, checkout string) {
+		t.Helper()
+		root := t.TempDir()
+		origin = filepath.Join(root, "origin.git")
+		seed := filepath.Join(root, "seed")
+		checkout = filepath.Join(root, "checkout")
+		runGit(t, root, "init", "-q", "--bare", "-b", "main", origin)
+		runGit(t, root, "init", "-q", "-b", "main", seed)
+		runGit(t, seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base")
+		runGit(t, seed, "push", "-q", origin, "main")
+		runGit(t, root, "clone", "-q", origin, checkout)
+		// Origin moves on: the merge that triggers UpdateBase.
+		runGit(t, seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "merged pr")
+		runGit(t, seed, "push", "-q", origin, "main")
+		return origin, checkout
+	}
+	client := func(dir string) Client { return NewClient(dir, subprocess.ExecRunner{}) }
+	head := func(t *testing.T, dir string) string {
+		return strings.TrimSpace(runGitOutput(t, dir, "rev-parse", "HEAD"))
+	}
+	branch := func(t *testing.T, dir string) string {
+		return strings.TrimSpace(runGitOutput(t, dir, "branch", "--show-current"))
+	}
+	originMain := func(t *testing.T, origin string) string {
+		return strings.TrimSpace(runGitOutput(t, origin, "rev-parse", "main"))
+	}
+
+	t.Run("on another branch: fetch only, no switch", func(t *testing.T) {
+		origin, checkout := setup(t)
+		runGit(t, checkout, "switch", "-q", "-c", "local-imgstudio-sources")
+		before := head(t, checkout)
+		err := client(checkout).UpdateBase(ctx, "origin", "main")
+		if !errors.Is(err, ErrBaseUpdateSkipped) {
+			t.Fatalf("UpdateBase error = %v, want ErrBaseUpdateSkipped", err)
+		}
+		if got := branch(t, checkout); got != "local-imgstudio-sources" {
+			t.Fatalf("checkout switched to %q; it must stay on local-imgstudio-sources", got)
+		}
+		if got := head(t, checkout); got != before {
+			t.Fatalf("HEAD moved %s -> %s", before, got)
+		}
+		if got, want := strings.TrimSpace(runGitOutput(t, checkout, "rev-parse", "origin/main")), originMain(t, origin); got != want {
+			t.Fatalf("origin/main = %s, want the fetched %s", got, want)
+		}
+	})
+
+	t.Run("detached HEAD: no switch", func(t *testing.T) {
+		_, checkout := setup(t)
+		runGit(t, checkout, "switch", "-q", "--detach")
+		before := head(t, checkout)
+		if err := client(checkout).UpdateBase(ctx, "origin", "main"); !errors.Is(err, ErrBaseUpdateSkipped) {
+			t.Fatalf("UpdateBase error = %v, want ErrBaseUpdateSkipped", err)
+		}
+		if got := branch(t, checkout); got != "" {
+			t.Fatalf("detached checkout switched to %q", got)
+		}
+		if got := head(t, checkout); got != before {
+			t.Fatalf("HEAD moved %s -> %s", before, got)
+		}
+	})
+
+	t.Run("on base with tracked changes: no fast-forward", func(t *testing.T) {
+		_, checkout := setup(t)
+		if err := os.WriteFile(filepath.Join(checkout, "tracked.txt"), []byte("one\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, checkout, "add", "tracked.txt")
+		before := head(t, checkout)
+		if err := client(checkout).UpdateBase(ctx, "origin", "main"); !errors.Is(err, ErrBaseUpdateSkipped) {
+			t.Fatalf("UpdateBase error = %v, want ErrBaseUpdateSkipped", err)
+		}
+		if got := head(t, checkout); got != before {
+			t.Fatalf("HEAD moved %s -> %s with uncommitted changes", before, got)
+		}
+	})
+
+	t.Run("on base and clean: fast-forwards", func(t *testing.T) {
+		origin, checkout := setup(t)
+		if err := os.WriteFile(filepath.Join(checkout, "untracked.txt"), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := client(checkout).UpdateBase(ctx, "origin", "main"); err != nil {
+			t.Fatalf("UpdateBase error = %v, want a fast-forward", err)
+		}
+		if got, want := head(t, checkout), originMain(t, origin); got != want {
+			t.Fatalf("HEAD = %s, want fast-forwarded to %s", got, want)
+		}
+	})
 }
 
 func runGit(t *testing.T, dir string, args ...string) {

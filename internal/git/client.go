@@ -1099,6 +1099,22 @@ func (c Client) BehindCount(ctx context.Context, upstream string) (int, error) {
 	return count, nil
 }
 
+// ErrBaseUpdateSkipped reports that UpdateBase refreshed the remote-tracking
+// base but left the checkout's own branch alone. Callers treat it as a
+// warning, never a failure.
+var ErrBaseUpdateSkipped = errors.New("base update skipped")
+
+// UpdateBase refreshes a registered checkout after a merge into branch. It
+// NEVER switches the checkout's branch: a registered checkout can be another
+// service's live working directory on its own branch. On 2026-11-15 the merge
+// gate switched KeepHair's /root/adstudio from local-imgstudio-sources to main
+// in the middle of a video build, nine seconds after adstudio#45 merged.
+//
+// It always fetches, so remote/branch is current for everything that reads the
+// remote-tracking ref. It fast-forwards the local branch only when the checkout
+// is already on branch and has no tracked changes; otherwise it returns
+// ErrBaseUpdateSkipped naming why. Untracked files are left to git itself:
+// `pull --ff-only` refuses rather than overwrite one.
 func (c Client) UpdateBase(ctx context.Context, remote string, branch string) error {
 	if strings.TrimSpace(remote) == "" {
 		remote = "origin"
@@ -1109,10 +1125,27 @@ func (c Client) UpdateBase(ctx context.Context, remote string, branch string) er
 	if _, err := c.run(ctx, "fetch", remote, branch); err != nil {
 		return err
 	}
-	if _, err := c.run(ctx, "switch", branch); err != nil {
+	head, err := c.run(ctx, "branch", "--show-current")
+	if err != nil {
 		return err
 	}
-	_, err := c.run(ctx, "pull", "--ff-only", remote, branch)
+	current := strings.TrimSpace(head.Stdout)
+	if current != branch {
+		if current == "" {
+			current = "a detached HEAD"
+		} else {
+			current = "branch " + strconv.Quote(current)
+		}
+		return fmt.Errorf("%w: checkout is on %s, not %q; fetched %s/%s without switching", ErrBaseUpdateSkipped, current, branch, remote, branch)
+	}
+	status, err := c.run(ctx, "--no-optional-locks", "status", "--porcelain", "--untracked-files=no")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(status.Stdout) != "" {
+		return fmt.Errorf("%w: checkout has uncommitted changes on %q; fetched %s/%s without fast-forwarding", ErrBaseUpdateSkipped, branch, remote, branch)
+	}
+	_, err = c.run(ctx, "pull", "--ff-only", remote, branch)
 	return err
 }
 
