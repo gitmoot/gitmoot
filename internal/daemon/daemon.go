@@ -713,7 +713,7 @@ func taskEventIsBlocking(event db.TaskEvent) bool {
 		return true
 	}
 	switch event.Kind {
-	case "merge_gate_blocked", "review_auto_fix_blocked", "pr_closed_unmerged",
+	case "merge_gate_blocked", "review_auto_fix_blocked", workflow.TaskEventPullRequestClosedUnmerged,
 		"delegation_vote_unmet", "delegation_quorum_unmet", "delegation_child_failed",
 		"block_parent", "quorum_unmet":
 		return true
@@ -871,7 +871,7 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 						continue
 					}
 					if _, _, recoverErr := d.Store.RecoverClaimedTaskState(ctx, task.ID,
-						string(workflow.TaskBlocked), "pr_closed_unmerged",
+						string(workflow.TaskBlocked), workflow.TaskEventPullRequestClosedUnmerged,
 						fmt.Sprintf("pull request #%d closed without merging while holding a retained merge claim", group.number)); recoverErr != nil {
 						if firstErr == nil {
 							firstErr = recoverErr

@@ -304,3 +304,57 @@ func TestHandleReviewPullRequestClosedEmptyBranchDoesNotAdvanceCanonicalTask(t *
 		t.Fatalf("implement task changed = %+v, err=%v", implementTask, err)
 	}
 }
+
+// TestHandleReviewPullRequestClosedUnmergedRetiresReviewTask covers #2668: a
+// review task whose PR closed unmerged has nothing left to unblock, so it is
+// dismissed rather than parked blocked; a live job keeps the blocked parking,
+// and implementation tasks keep it too.
+func TestHandleReviewPullRequestClosedUnmergedRetiresReviewTask(t *testing.T) {
+	const reviewID = "review-pr-893-0a1b2c3d"
+	tests := []struct {
+		name    string
+		task    db.Task
+		liveJob bool
+		want    TaskState
+	}{
+		{name: "review task from pr_open", task: db.Task{ID: reviewID, GoalID: "local-review", State: string(TaskPullRequestOpen), Branch: "feature/893"}, want: TaskDismissed},
+		{name: "branchless review task from reviewing", task: db.Task{ID: reviewID, GoalID: "local-review", State: string(TaskReviewing)}, want: TaskDismissed},
+		{name: "branchless review task already blocked", task: db.Task{ID: reviewID, GoalID: "local-review", State: string(TaskBlocked)}, want: TaskDismissed},
+		{name: "review task with a live job", task: db.Task{ID: reviewID, GoalID: "local-review", State: string(TaskReviewing)}, liveJob: true, want: TaskBlocked},
+		{name: "branchless ready_to_merge implementation task", task: db.Task{ID: "task-893", GoalID: "goal-893", State: string(TaskReadyToMerge)}, want: TaskBlocked},
+		{name: "implementation task from reviewing", task: db.Task{ID: "task-893", GoalID: "goal-893", State: string(TaskReviewing), Branch: "feature/893"}, want: TaskBlocked},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			test.task.RepoFullName = "owner/repo"
+			if err := store.UpsertTask(ctx, test.task); err != nil {
+				t.Fatalf("UpsertTask: %v", err)
+			}
+			if test.liveJob {
+				if err := store.CreateJob(ctx, db.Job{ID: "review-job", Agent: "reviewer", Type: "review", State: string(JobRunning),
+					Payload: `{"repo":"owner/repo","task_id":"` + test.task.ID + `"}`}); err != nil {
+					t.Fatalf("CreateJob: %v", err)
+				}
+			}
+			engine := Engine{Store: store}
+			for i := 0; i < 2; i++ {
+				if err := engine.HandleReviewPullRequestClosed(ctx, PullRequestEvent{
+					Repo: "owner/repo", Branch: "feature/893", PullRequest: 893, TaskID: test.task.ID,
+					LeadAgent: "github", Sender: "github",
+				}, false); err != nil {
+					t.Fatalf("HandleReviewPullRequestClosed pass %d: %v", i+1, err)
+				}
+			}
+			task, err := store.GetTask(ctx, test.task.ID)
+			if err != nil || task.State != string(test.want) {
+				t.Fatalf("task = %+v, err=%v; want %s", task, err, test.want)
+			}
+			pr, err := store.GetPullRequest(ctx, "owner/repo", 893)
+			if err != nil || pr.State != "closed" {
+				t.Fatalf("pull request = %+v, err=%v; want closed", pr, err)
+			}
+		})
+	}
+}

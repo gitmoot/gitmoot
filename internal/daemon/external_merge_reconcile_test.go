@@ -411,11 +411,14 @@ func TestPollOnceReconcilesBranchlessQueuedMergeAsMerged(t *testing.T) {
 		workflow.TaskMerged, "merged", "pull_request_merged")
 }
 
+// A branchless review record holding a retained merge claim is parked blocked
+// when its PR closes unmerged (releasing the claim), then retired to dismissed:
+// a closed review has nothing left to unblock (#2668).
 func TestPollOnceReconcilesBranchlessQueuedMergeAsClosedUnmerged(t *testing.T) {
 	runBranchlessQueuedMergeTerminalPolls(t, github.PullRequest{
 		Number: 1732, Title: "Review PR #1732", State: "closed",
 		HeadRef: "task-1732", BaseRef: "main", HeadSHA: "queued-head",
-	}, workflow.TaskBlocked, "closed", "pr_closed_unmerged")
+	}, workflow.TaskDismissed, "closed", "pr_closed_unmerged")
 }
 
 func runBranchlessQueuedMergeTerminalPolls(t *testing.T, terminal github.PullRequest, wantTask workflow.TaskState, wantPRState, wantEvent string) {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -314,7 +315,10 @@ func eventRuleMatchesAddressee(rule db.EventRule, event events.Event) bool {
 // boundary before durable routing. Persisted job attribution
 // remains strongest only while that role belongs to the current live roster.
 // Archived or removed attribution falls back to the current live role selected
-// for the event repository.
+// for the event repository. A blocked-since task digest names a task, not a
+// job; its attribution is the task's own (blockedTaskAttributedRole), so a task
+// a parent seat requested reaches that seat rather than a narrower-scoped child
+// that merely owns the repo (#2668).
 func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Event) events.Event {
 	if event.Type != events.EventJobBlocked {
 		return event
@@ -322,9 +326,18 @@ func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Ev
 	targetRole := workflow.NormalizeActingOrgRole(event.WakeTargetRole)
 	persistedRole := ""
 	if s.store != nil && strings.TrimSpace(event.JobID) != "" {
-		if job, err := s.store.GetJob(ctx, event.JobID); err == nil {
+		job, err := s.store.GetJob(ctx, event.JobID)
+		if err == nil {
 			if payload, err := daemonJobPayload(job); err == nil {
 				persistedRole = workflow.NormalizeActingOrgRole(payload.ActingOrgRole)
+			}
+		} else if errors.Is(err, sql.ErrNoRows) && event.Cause == "blocked_since" {
+			if task, err := s.store.GetTask(ctx, event.JobID); err == nil && strings.EqualFold(task.RepoFullName, strings.TrimSpace(event.Repo)) {
+				if role, err := blockedTaskAttributedRole(ctx, s.store, task); err == nil {
+					persistedRole = role
+				} else {
+					slog.Warn("blocked task attribution failed", "task_id", task.ID, "error", err)
+				}
 			}
 		}
 	}

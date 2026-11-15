@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -183,9 +185,9 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 	if err != nil {
 		return err
 	}
-	blockedSubjects := make(map[string]struct{}, len(blockedTasks))
+	blockedSubjects := make(map[string]db.Task, len(blockedTasks))
 	for _, task := range blockedTasks {
-		blockedSubjects[taskEpisodeSubject(repo, task.ID)] = struct{}{}
+		blockedSubjects[taskEpisodeSubject(repo, task.ID)] = task
 	}
 	var candidates []db.StaleTaskCandidate
 	if len(blockedTasks) > 0 {
@@ -276,12 +278,65 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 	}
 	if len(digestItems) > 0 {
 		sortBlockedTaskDigestItems(digestItems)
-		events.EmitEvent(ctx, sink, buildBlockedTaskDigestEvent(repo, digestItems, now))
+		// One digest per attributed role (#2668): the sink addresses a digest by
+		// its oldest task's attribution, so a digest mixing tasks of different
+		// requesters would alert one of them about the others' work.
+		var order []string
+		groups := map[string][]blockedTaskDigestItem{}
+		for _, item := range digestItems {
+			role, err := blockedTaskAttributedRole(ctx, store, blockedSubjects[taskEpisodeSubject(repo, item.taskID)])
+			if err != nil {
+				writeLine(stdout, "blocked_since task %s attribution failed: %v", item.taskID, err)
+			}
+			if _, seen := groups[role]; !seen {
+				order = append(order, role)
+			}
+			groups[role] = append(groups[role], item)
+		}
+		for _, role := range order {
+			events.EmitEvent(ctx, sink, buildBlockedTaskDigestEvent(repo, groups[role], now))
+		}
 	}
 	for _, item := range exhaustedItems {
 		events.EmitEvent(ctx, sink, buildBlockedTaskAlertExhaustedEvent(repo, item, now))
 	}
 	return nil
+}
+
+// blockedTaskAttributedRole is the role a blocked task's alert belongs to before
+// any repo-owner fallback, mirroring addressUnownedVerdictEvent's evidence: the
+// review requester of the task's jobs, then the acting role of its newest
+// attributed job, then the owner of its pull request. A task with none of them is
+// "", nil.
+func blockedTaskAttributedRole(ctx context.Context, store *db.Store, task db.Task) (string, error) {
+	if store == nil || strings.TrimSpace(task.ID) == "" {
+		return "", nil
+	}
+	attribution, err := store.TaskJobAttribution(ctx, task.RepoFullName, task.ID)
+	if err != nil {
+		return "", err
+	}
+	if role := workflow.NormalizeActingOrgRole(firstNonEmpty(attribution.Requester, attribution.ActingRole)); role != "" {
+		return role, nil
+	}
+	pullRequest := attribution.PullRequest
+	if pullRequest <= 0 {
+		if number, ok := workflow.ReviewRecordPRNumber(task.ID); ok {
+			pullRequest = int(number)
+		}
+	}
+	if pullRequest <= 0 && strings.TrimSpace(task.Branch) != "" {
+		pr, err := store.GetPullRequestByRepoBranch(ctx, task.RepoFullName, task.Branch)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		pullRequest = int(pr.Number)
+	}
+	owner, err := store.ResolvePullRequestOwner(ctx, task.RepoFullName, pullRequest, task.ID)
+	if err != nil {
+		return "", err
+	}
+	return workflow.NormalizeActingOrgRole(owner), nil
 }
 
 // startBlockedRoleWakeLoop owns the single host-global Herdr blocked-role lane.
