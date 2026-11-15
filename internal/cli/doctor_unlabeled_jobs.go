@@ -63,9 +63,9 @@ func buildUnlabeledJobsCheck(jobs []db.Job, now time.Time, threshold int) doctor
 	}
 	sort.Strings(worst)
 	if len(worst) == 0 {
-		return doctor.Check{Name: "unlabeled jobs", OK: true, Required: false, Detail: fmt.Sprintf("%d unlabeled agent jobs scanned in the last 24h", scanned)}
+		return doctor.Check{Name: "unlabeled runs", OK: true, Required: false, Detail: fmt.Sprintf("%d unlabeled reviewer runs scanned in the last 24h", scanned)}
 	}
-	return doctor.Check{Name: "unlabeled jobs", Required: false, Detail: fmt.Sprintf("unlabeled agent-job drift in last 24h: %s — configure [workflow] require_workflow", strings.Join(worst, ", "))}
+	return doctor.Check{Name: "unlabeled runs", Required: false, Detail: fmt.Sprintf("unlabeled reviewer-run drift in last 24h: %s — configure [workflow] require_workflow", strings.Join(worst, ", "))}
 }
 
 func unlabeledJobCounts(jobs []db.Job, now time.Time, threshold int) map[string]int {
