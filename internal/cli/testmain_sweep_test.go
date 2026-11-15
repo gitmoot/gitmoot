@@ -14,14 +14,14 @@ import (
 
 // TestSweepLeakedTestTempRoots drives the #2644 sweep decision against a
 // throwaway parent: a root goes only when its marker proves the owner gone
-// (dead pid, recycled pid, other boot) or, marker-less, when it is older than
-// the grace period. Live, unknown and other-namespace owners, young marker-less
-// roots and anything not shaped like gt<8 hex> stay.
+// (dead or recycled pid in this pid namespace). Live, unknown and
+// other-namespace owners, roots without a usable marker whatever their age,
+// and anything not shaped like gt<8 hex> stay.
 func TestSweepLeakedTestTempRoots(t *testing.T) {
 	parent := t.TempDir()
 	outside := t.TempDir()
 	now := time.Now()
-	self := testTempRootOwner{PID: 100, StartTime: "1", BootID: "boot-now", PIDNamespace: "pid:[1]"}
+	self := testTempRootOwner{PID: 100, StartTime: "1", PIDNamespace: "pid:[1]"}
 	// pid -> current starttime; absent means no such pid, "unknown" means
 	// /proc could not tell.
 	processes := map[int]string{100: "1", 202: "999", 203: "3", 204: "4", 207: "unknown"}
@@ -37,11 +37,9 @@ func TestSweepLeakedTestTempRoots(t *testing.T) {
 			}
 			return current == startTime, true
 		},
-		now:   now,
-		grace: testTempRootMarkerlessGrace,
 	}
 	owner := func(pid int, start string) testTempRootOwner {
-		return testTempRootOwner{PID: pid, StartTime: start, BootID: self.BootID, PIDNamespace: self.PIDNamespace}
+		return testTempRootOwner{PID: pid, StartTime: start, PIDNamespace: self.PIDNamespace}
 	}
 	makeRoot := func(root string, marker *testTempRootOwner, age time.Duration) string {
 		t.Helper()
@@ -67,24 +65,26 @@ func TestSweepLeakedTestTempRoots(t *testing.T) {
 		return root
 	}
 	ptr := func(o testTempRootOwner) *testTempRootOwner { return &o }
-	otherBoot := owner(203, "3")
-	otherBoot.BootID = "boot-before"
 	otherNamespace := owner(299, "9")
 	otherNamespace.PIDNamespace = "pid:[2]"
+	// A dead pid in another namespace: its owner looks gone from here, but
+	// that namespace's pids cannot be probed from this one.
+	otherNamespaceDeadPID := owner(201, "1")
+	otherNamespaceDeadPID.PIDNamespace = "pid:[2]"
 	week := 7 * 24 * time.Hour
 
 	removed := map[string]string{
 		"dead pid":                makeRoot(filepath.Join(parent, "gt00000201"), ptr(owner(201, "1")), 0),
 		"recycled pid":            makeRoot(filepath.Join(parent, "gt00000202"), ptr(owner(202, "2")), 0),
-		"other boot, pid live":    makeRoot(filepath.Join(parent, "gt00000203"), &otherBoot, 0),
-		"marker-less past grace":  makeRoot(filepath.Join(parent, "gt0000000a"), nil, testTempRootMarkerlessGrace+time.Minute),
 		"dead pid, old (ages ok)": makeRoot(filepath.Join(parent, "gt00000206"), ptr(owner(206, "6")), week),
 	}
 	kept := map[string]string{
 		"live owner, old":             makeRoot(filepath.Join(parent, "gt00000204"), ptr(owner(204, "4")), week),
 		"liveness unknown":            makeRoot(filepath.Join(parent, "gt00000207"), ptr(owner(207, "7")), week),
 		"other pid namespace":         makeRoot(filepath.Join(parent, "gt00000299"), &otherNamespace, week),
-		"marker-less within grace":    makeRoot(filepath.Join(parent, "gt0000000b"), nil, testTempRootMarkerlessGrace-time.Minute),
+		"other namespace, dead pid":   makeRoot(filepath.Join(parent, "gt00000298"), &otherNamespaceDeadPID, week),
+		"marker-less, a week old":     makeRoot(filepath.Join(parent, "gt0000000a"), nil, week),
+		"marker-less, fresh":          makeRoot(filepath.Join(parent, "gt0000000b"), nil, 0),
 		"seven hex":                   makeRoot(filepath.Join(parent, "gt0000020"), ptr(owner(201, "1")), week),
 		"nine hex":                    makeRoot(filepath.Join(parent, "gt000002010"), ptr(owner(201, "1")), week),
 		"upper-case hex":              makeRoot(filepath.Join(parent, "gt0000020A"), ptr(owner(201, "1")), week),
@@ -126,7 +126,7 @@ func TestSweepLeakedTestTempRoots(t *testing.T) {
 func TestSweepLeakedTestTempRootsProbesRealProcesses(t *testing.T) {
 	self, ok := currentTestTempRootOwner()
 	if !ok {
-		t.Skip("needs /proc process identities and a boot id")
+		t.Skip("needs /proc process identities and a pid namespace")
 	}
 	child := exec.Command("true")
 	if err := child.Start(); err != nil {

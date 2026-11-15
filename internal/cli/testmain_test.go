@@ -16,9 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
-	"time"
 
-	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -178,44 +176,33 @@ var testTempRootName = regexp.MustCompile(`^gt[0-9a-f]{8}$`)
 // later run can tell a root leaked by a dead run from one a live run uses.
 const testTempRootOwnerFile = ".owner"
 
-// testTempRootMarkerlessGrace is how old a root without an owner marker must
-// be before the sweep removes it. Such a root is either legacy (made before
-// markers, leaked by #2644) or belongs to a run that made it a moment ago and
-// has not written its marker yet. Six hours is far past the 25m-1h timeouts
-// any test run here uses, and an active run keeps refreshing the root's mtime
-// as its t.TempDirs come and go, so only a long-dead root ever ages past it.
-const testTempRootMarkerlessGrace = 6 * time.Hour
-
-// testTempRootOwner identifies a process across pid reuse and reboots: the
-// /proc starttime changes when the kernel recycles the pid, and the boot id
-// changes on every boot. PIDNamespace scopes the pid: a run in another pid
-// namespace sharing this /tmp (a container) names pids this run cannot probe.
+// testTempRootOwner identifies a process across pid reuse: the /proc
+// starttime changes when the kernel recycles the pid, including after a
+// reboot. PIDNamespace scopes the pid: a run in another pid namespace sharing
+// this /tmp (a container) names pids this run cannot probe.
 type testTempRootOwner struct {
 	PID          int
 	StartTime    string
-	BootID       string
 	PIDNamespace string
 }
 
 // currentTestTempRootOwner reports this process as an owner. ok is false
-// without /proc (non-Linux): liveness cannot be proven there, so the run
-// neither marks its root nor sweeps, since the age rule alone would be a guess
-// about how long a live run lasts and every root there would be marker-less.
+// without /proc (non-Linux) or without a readable pid namespace: liveness
+// cannot be proven there, so the run neither marks its root nor sweeps.
 func currentTestTempRootOwner() (testTempRootOwner, bool) {
 	owner := testTempRootOwner{
 		PID:       os.Getpid(),
 		StartTime: workflow.RuntimeProcessIdentity(os.Getpid()),
-		BootID:    db.BootID(),
 	}
 	owner.PIDNamespace, _ = os.Readlink("/proc/self/ns/pid")
-	return owner, owner.StartTime != "" && owner.BootID != ""
+	return owner, owner.StartTime != "" && owner.PIDNamespace != ""
 }
 
 // writeTestTempRootOwner writes the marker through a rename, so a concurrent
-// sweep reads either no marker (a young root it keeps) or a whole one.
+// sweep reads either no marker (a root it keeps) or a whole one.
 func writeTestTempRootOwner(root string, owner testTempRootOwner) error {
 	marker := filepath.Join(root, testTempRootOwnerFile)
-	content := fmt.Sprintf("pid=%d\nstarttime=%s\nboot_id=%s\npidns=%s\n", owner.PID, owner.StartTime, owner.BootID, owner.PIDNamespace)
+	content := fmt.Sprintf("pid=%d\nstarttime=%s\npidns=%s\n", owner.PID, owner.StartTime, owner.PIDNamespace)
 	if err := os.WriteFile(marker+".tmp", []byte(content), 0o600); err != nil {
 		return err
 	}
@@ -236,10 +223,10 @@ func readTestTempRootOwner(root string) (testTempRootOwner, error) {
 		fields[key] = value
 	}
 	pid, err := strconv.Atoi(fields["pid"])
-	if err != nil || pid <= 0 || fields["starttime"] == "" || fields["boot_id"] == "" {
+	if err != nil || pid <= 0 || fields["starttime"] == "" || fields["pidns"] == "" {
 		return testTempRootOwner{}, fmt.Errorf("incomplete owner marker %q", data)
 	}
-	return testTempRootOwner{PID: pid, StartTime: fields["starttime"], BootID: fields["boot_id"], PIDNamespace: fields["pidns"]}, nil
+	return testTempRootOwner{PID: pid, StartTime: fields["starttime"], PIDNamespace: fields["pidns"]}, nil
 }
 
 // testTempRootSweep decides which sibling test temp roots are leaked. self
@@ -248,12 +235,10 @@ func readTestTempRootOwner(root string) (testTempRootOwner, error) {
 type testTempRootSweep struct {
 	self     testTempRootOwner
 	liveness func(pid int, startTime string) (live, known bool)
-	now      time.Time
-	grace    time.Duration
 }
 
 func newTestTempRootSweep(self testTempRootOwner) testTempRootSweep {
-	return testTempRootSweep{self: self, liveness: workflow.RuntimeProcessLiveness, now: time.Now(), grace: testTempRootMarkerlessGrace}
+	return testTempRootSweep{self: self, liveness: workflow.RuntimeProcessLiveness}
 }
 
 // sweepLeakedTestTempRoots removes the leaked gt<8 hex> roots directly under
@@ -282,7 +267,7 @@ func sweepLeakedTestTempRoots(parents []string, sweep testTempRootSweep) error {
 			if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Getuid() {
 				continue
 			}
-			if !sweep.leaked(root, info) {
+			if !sweep.leaked(root) {
 				continue
 			}
 			if err := removeTestTempRoot(root); err != nil {
@@ -293,19 +278,20 @@ func sweepLeakedTestTempRoots(parents []string, sweep testTempRootSweep) error {
 	return errors.Join(errs...)
 }
 
-// leaked keeps a root unless its owner is proven gone: a different boot, or
-// a pid in this namespace that no longer exists or now names another process.
-// An owner whose liveness is unknown, or that lives in another pid namespace,
-// is kept. A root without a readable marker falls back to the age rule.
-func (s testTempRootSweep) leaked(root string, info fs.FileInfo) bool {
+// leaked keeps a root unless its marker proves the owner gone. Only an owner
+// in this run's pid namespace is judged at all: a pid from another namespace
+// (a container sharing /tmp) cannot be probed from here. Within the namespace
+// the owner is gone when its pid no longer exists or names another process (a
+// different /proc start time, which also covers a pid reused after a reboot).
+// No boot id is compared: a container can virtualize it, so a different boot
+// id does not prove a different boot. A root without a readable, complete
+// marker is kept: its age says nothing about whether a run still uses it (a
+// `-timeout 0` or paused run outlives any grace period, and nested writes do
+// not refresh the root's mtime), so a legacy root from before markers is never
+// swept.
+func (s testTempRootSweep) leaked(root string) bool {
 	owner, err := readTestTempRootOwner(root)
-	if err != nil {
-		return s.now.Sub(info.ModTime()) > s.grace
-	}
-	if owner.BootID != s.self.BootID {
-		return true
-	}
-	if owner.PIDNamespace != s.self.PIDNamespace {
+	if err != nil || owner.PIDNamespace != s.self.PIDNamespace {
 		return false
 	}
 	live, known := s.liveness(owner.PID, owner.StartTime)
