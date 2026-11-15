@@ -1000,6 +1000,11 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	b.WriteString("finding, emit a finding object citing its uid as \"continues_uid\" - typing its old label is naming,\n")
 	b.WriteString("not reference, and mints a NEW finding instead. Set \"state\": \"answered\" only if you CHECKED it at\n")
 	b.WriteString("this head, and say what you ran; \"withdrawn\" requires \"withdraw_reason\" and is refused without one.\n")
+	// #2653: the reviewer was never told which answers clear a finding, so
+	// static approvals declared bare answers that the ledger keeps open.
+	b.WriteString("An answered, withdrawn or superseded finding CLEARS only with executed evidence (its checks in\n")
+	b.WriteString("\"tests_run\" and top-level \"evidence\": \"executed\") or, for a static answer, the finding's \"file\"\n")
+	b.WriteString("plus a \"rationale\" saying why it is resolved. Without either it is recorded but stays owed.\n")
 	b.WriteString("EVERY finding you emit needs an explicit \"severity\" of P0, P1, P2 or P3. A finding with none is\n")
 	b.WriteString("REFUSED rather than stored, because a row with no severity is an obligation no severity policy\n")
 	b.WriteString("can ever disposition, and it is not the same thing as P3 (#1928).\n")
@@ -1140,6 +1145,35 @@ func ledgerStateDowngrade(declared db.FindingState, obs db.ReviewFindingObservat
 	default:
 		return true, "recorded state differs from the declared one"
 	}
+}
+
+// undischargeableDeclaredAnswers names each finding in r whose declared
+// disposition this writer would record as QUOTED, and so reverse to OPEN
+// (#2653). It runs the writer's own observation builder rather than a second
+// copy of its evidence rules, so the result check that refuses such an approval
+// cannot disagree with what the ledger would have stored.
+func undischargeableDeclaredAnswers(r AgentResult) []string {
+	payload := JobPayload{Result: &r}
+	var named []string
+	for index, raw := range r.Findings {
+		wire, err := decodeReviewFinding(raw)
+		if err != nil {
+			continue
+		}
+		obs, declared, ok := Engine{}.ledgerObservationWithDeclaredState(db.Job{}, payload, wire, "", "")
+		if !ok || obs.EvidenceKind != db.EvidenceQuoted {
+			continue
+		}
+		if downgraded, _ := ledgerStateDowngrade(declared, obs); !downgraded {
+			continue
+		}
+		label := obs.RoundLabel
+		if label == "" {
+			label = fmt.Sprintf("findings[%d]", index)
+		}
+		named = append(named, fmt.Sprintf("%s %s", label, declared))
+	}
+	return named
 }
 
 // recordLedgerStateConflict makes a two-answer disagreement audible (#2069 f1).

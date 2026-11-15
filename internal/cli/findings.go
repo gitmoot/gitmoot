@@ -337,6 +337,25 @@ type findingsObligationsReport struct {
 	Advisory bool `json:"advisory"`
 }
 
+// ledgerObligationsAtHead is runFindingsObligations' question asked by another
+// command (#2653: `review request --supersede` of an approval). It builds the
+// scope through the same constructor and declaration so both commands list the
+// same obligations; a missing checkout only weakens the resolvers, as there.
+func ledgerObligationsAtHead(ctx context.Context, store *db.Store, home, repo string, pullRequest int, head string) ([]workflow.LedgerObligation, error) {
+	rows, err := store.ListReviewFindingObservations(ctx, repo, int64(pullRequest))
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	checkout, err := mergeGateCheckout(ctx, store, repo, "")
+	if err != nil {
+		checkout = ""
+	}
+	scope := daemonLedgerResolvers(github.NewClient(checkout), checkout, subprocess.ExecRunner{}).ScopeFor(repo, pullRequest, "")
+	scope.Repo = repo
+	scope.FindingsAdvisory = loadReviewConfig(home).For(repo).FindingsAreAdvisory()
+	return workflow.LedgerObligationsAtHead(ctx, rows, head, scope), nil
+}
+
 // runFindingsObligations answers "what would the merge gate still demand at this
 // head" for one pull request (#2097).
 //

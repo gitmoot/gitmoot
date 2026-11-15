@@ -133,7 +133,10 @@ gitmoot review request --repo owner/repo --pr <n> --head <40-hex-sha> --role <yo
   review spent)`; neither starts a second reviewer. A review that ended
   `failed` or `cancelled` has no verdict, so asking again starts a new review
   of that head: that is how to retry one. To replace a saved verdict at the
-  same head, pass `--supersede <run-id> --reason "why"`.
+  same head, pass `--supersede <run-id> --reason "why"`; the run must have
+  the same reviewer, and an approval qualifies only while
+  `gitmoot findings --repo OWNER/REPO --pr N --at-head SHA` still lists
+  obligations.
 - The output names the run (`run:`), the reviewer, any `hold:` lines, and a
   `watch:` command. Add `--json` for `run_id`, `reviewer`, `awaited_fact_id`
   and `holds`. Every request, `verdict_exists` included, registers a wake-up
