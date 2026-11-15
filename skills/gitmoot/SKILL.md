@@ -138,7 +138,12 @@ gitmoot review request --repo owner/repo --pr <n> --head <40-hex-sha> --role <yo
   `watch:` command. Add `--json` for `run_id`, `reviewer`, `awaited_fact_id`
   and `holds`. Every request, `verdict_exists` included, registers a wake-up
   (`notify: ... awaited fact N`) and reports the daemon hold.
-- Your role is woken when the verdict is saved; you do not need to poll.
+- Your role is woken when the verdict is saved. The wake is a `review_verdict`
+  message in your role's inbox, typed into your session when your role has a
+  registered Herdr pane. A seat with no pane (a subagent, a script) is not
+  woken: run the printed `watch:` command (`gitmoot run watch <run-id>`), which
+  prints the review's progress and returns when it ends, or read
+  `gitmoot message inbox` when you resume. Do not loop on `review status`.
 - The review runs when the daemon claims it. Without a daemon the output says
   ``hold: daemon not running: the review stays queued until `gitmoot daemon
    start` starts the daemon``: start it (`gitmoot daemon start`) or run it
@@ -222,13 +227,29 @@ automatic merge is off and always replies with the outcome. Your role's
 `merge_rule` from the org chart applies to that comment: `self` may merge,
 `owner` refuses a role that is not the root, `none` refuses.
 
+**Automatic merge off.** When `review status` says "native auto-merge disabled
+by operator kill switch", the daemon never merges by itself. If your role's
+`merge_rule` is `self`, comment `/gitmoot merge` once the head is approved and
+CI is green. Otherwise ask the role that may merge (your coordinator, or the
+owner).
+
+**The `gitmoot/merge-gate` status is Gitmoot's own, not CI.** It shows what
+the gate last decided at that head, and the daemon updates it on its next poll.
+Wait on your CI checks, not on it: `gh pr checks --watch` also waits on this
+status. Read the gate's actual answer with `review status` or `/gitmoot merge`.
+
 **When a merge is held**, the reason names the remedy. The common ones:
 
 - *No implement run recorded* (an attribution gap): run the `run record` from
   section 1, then `/gitmoot merge` again.
 - *No approval bound to the current head*: request a review of that head.
 - *The repository requires GitHub's merge queue*: gitmoot cannot merge
-  through it. Add the pull request to the merge queue on GitHub.
+  through it, so `/gitmoot merge` never succeeds there. Enqueue the approved
+  head yourself, if your `merge_rule` allows you to merge:
+  `gh pr merge <n> --repo owner/repo --squash --match-head-commit <40-hex-head>`.
+  GitHub refuses if the head moved. The queue picks the merge method and
+  re-runs CI before merging, which takes a while; `gh pr view <n> --json
+  state,mergeCommit` shows when it has merged.
 - *The branch is behind its base*: the gate never updates a reviewed branch
   itself. Update it, push, and request a review of the new head.
 - *A draft*: held open on purpose until it is marked ready.

@@ -3061,3 +3061,45 @@ func TestPollOnceFailedClearanceIsNotRecordedAsCleared(t *testing.T) {
 		t.Fatalf("status observation = %+v, want it NOT cleared: the pending status is still live, and recording cleared short-circuits every later pass", observation)
 	}
 }
+
+// TestMergeCommandPendingStatusIsResolvedAfterCIGoesGreen is the #2654 seat's
+// path on a kill-switched repository: a marker pass records the head `cleared`;
+// `/gitmoot merge` runs the real gate while a check is still in progress, and
+// the gate publishes a pending gitmoot/merge-gate status; CI then goes green.
+// The `cleared` record used to short-circuit every later pass, so that pending
+// status stayed forever and `gh pr checks --watch` never finished.
+func TestMergeCommandPendingStatusIsResolvedAfterCIGoesGreen(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t, workflow.TaskAwaitingHumanMerge)
+	gate.AutoMerge = false
+	daemon.AutoMergeEnabled = func(string) bool { return false }
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("first PollOnce returned error: %v", err)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil || observation.Kind != mergeGateStatusCleared {
+		t.Fatalf("status observation = %+v (err %v), want cleared before the merge request", observation, err)
+	}
+
+	if err := daemon.handleMergeCommand(ctx, client.pulls[0],
+		github.IssueComment{ID: 99, Body: "/gitmoot merge", Author: "operator"}); err != nil {
+		t.Fatalf("handleMergeCommand returned error: %v", err)
+	}
+	if len(client.statuses) == 0 || client.statuses[len(client.statuses)-1].State != "pending" {
+		t.Fatalf("statuses = %+v, want the gate's pending status while a check runs", client.statuses)
+	}
+
+	client.checks = []github.PullRequestCheck{{Name: "shard 4 / test", Bucket: "pass", State: "SUCCESS"}}
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce after CI went green returned error: %v", err)
+	}
+	last := client.statuses[len(client.statuses)-1]
+	if last.State != "success" || last.Description != mergeGateNotAppliedDescription {
+		t.Fatalf("latest gitmoot/merge-gate status = %+v, want the pending status resolved to not-applied success", last)
+	}
+	observation, err = store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil || observation.Kind != mergeGateStatusCleared {
+		t.Fatalf("status observation = %+v (err %v), want cleared once nothing of ours is pending", observation, err)
+	}
+}

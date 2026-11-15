@@ -3118,6 +3118,17 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		ActingOrgRole:           actingOrgRole,
 		HumanMergeRequested:     true,
 	})
+	// The gate just evaluated this head and may have published a
+	// gitmoot/merge-gate status on it (#2654). With auto-merge off the marker
+	// pass had recorded the head `cleared`, which skips it on every later poll,
+	// so a "pending CI" status written by this request would stay pending forever
+	// after CI went green. Recording `observed` makes the next marker pass read
+	// the head again: where the gate does not own the decision it resolves our
+	// pending status (#2148); where it does, `observed` is what the marker pass
+	// itself records for a head carrying a gate verdict.
+	if head := strings.TrimSpace(pull.HeadSHA); head != "" {
+		d.recordMergeGateStatusObservation(ctx, pull.Number, head, mergeGateStatusObserved)
+	}
 	if err != nil {
 		var blocked workflow.BlockedError
 		if errors.As(err, &blocked) {
