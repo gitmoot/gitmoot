@@ -2316,12 +2316,12 @@ func TestReviewExecutionModeRejectsConflictingFlags(t *testing.T) {
 
 func TestAgentHelpAdvertisesReviewForegroundModes(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	// `agent review` is the hidden transition path (#2599); its own usage
-	// still advertises both execution modes.
+	// `reviewer review` is hidden (`review request` is the documented path); its
+	// own usage still advertises both execution modes.
 	if code := runAgent([]string{"review", "--help"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("reviewer review help exit=%d stderr=%q", code, stderr.String())
 	}
-	for _, command := range []string{"agent review"} {
+	for _, command := range []string{"reviewer review"} {
 		line := ""
 		for _, candidate := range strings.Split(stdout.String(), "\n") {
 			if strings.Contains(candidate, "gitmoot "+command+" ") {

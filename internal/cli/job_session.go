@@ -63,7 +63,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "task", New: "pr-id"}, FlagAlias{Old: "agent", New: "implementer"}, FlagAlias{Old: "parent-job-id", New: "parent-run"}, FlagAlias{Old: "workflow", New: "campaign"}); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -261,7 +261,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "task", New: "pr-id"}, FlagAlias{Old: "agent", New: "implementer"}, FlagAlias{Old: "parent-job-id", New: "parent-run"}); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}

@@ -991,7 +991,7 @@ func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) 
 	// WRITER 1: the directive-send path commits the note and its pending wake
 	// obligation together. This is the row production actually starts from.
 	var out, errOut bytes.Buffer
-	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/revive", "do the thing"}, &out, &errOut); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--campaign", "release/revive", "do the thing"}, &out, &errOut); code != 0 {
 		t.Fatalf("send code=%d err=%q", code, errOut.String())
 	}
 	directiveID := strings.Fields(out.String())[2]

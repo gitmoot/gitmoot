@@ -68,7 +68,7 @@ func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
 		printOrgDirectiveUsage(stdout)
 		return 0
 	}
-	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "workflow", New: "campaign"}); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}

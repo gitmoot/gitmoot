@@ -71,7 +71,7 @@ func TestJobRecordAcceptsAnActingRole(t *testing.T) {
 		"--repo", "owner/repo",
 		"--type", "implement",
 		"--decision", "implemented",
-		"--task", "task-9",
+		"--pr-id", "task-9",
 		"--pr", "1916",
 		"--head-sha", "b34c928ea5c10dcc2d2a7575e6f290c4c5a3dfc9",
 		"--json",
@@ -125,13 +125,13 @@ func TestJobRecordActorFlagsAreExclusiveAndValidated(t *testing.T) {
 	}{
 		{
 			name:     "an org role is still refused as an agent",
-			args:     []string{"--agent", "gitmoot"},
+			args:     []string{"--implementer", "gitmoot"},
 			wantExit: 1,
 			wantErr:  `reviewer "gitmoot" not found`,
 		},
 		{
 			name:     "both actors at once",
-			args:     []string{"--agent", "lead", "--acting-role", "gitmoot"},
+			args:     []string{"--implementer", "lead", "--acting-role", "gitmoot"},
 			wantExit: 2,
 			wantErr:  "not both",
 		},

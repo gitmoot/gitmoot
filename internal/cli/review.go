@@ -249,7 +249,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "workflow", New: "campaign"}); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}

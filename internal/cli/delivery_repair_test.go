@@ -92,7 +92,7 @@ func TestRegisteredJoblessWorkflowMessagesAcrossAuthorizedRelationships(t *testi
 			if code := runWorkflowJournal([]string{"register", "delivery/fresh", "coordinate delivery repair", "--home", home}, &out, &diag); code != 0 {
 				t.Fatalf("register code=%d: %s", code, diag.String())
 			}
-			if code := Run([]string{"message", "send", roles[1], "please inspect the review", "--home", home, "--role", roles[0], "--workflow", "delivery/fresh"}, &out, &diag); code != 0 {
+			if code := Run([]string{"message", "send", roles[1], "please inspect the review", "--home", home, "--role", roles[0], "--campaign", "delivery/fresh"}, &out, &diag); code != 0 {
 				t.Fatalf("send code=%d: %s", code, diag.String())
 			}
 			store, err := dbtest.Open(t, config.PathsForHome(home).Database)

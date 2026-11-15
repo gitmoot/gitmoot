@@ -45,10 +45,9 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	case "start":
 		return runAgentStart(args[1:], stdout, stderr)
 	case "review":
-		// Hidden: reached only through the `agent review` transition alias
-		// (#2599). `review request --reviewer <name> --message <msg>` is the
-		// documented path; this keeps --foreground, --action and
-		// --skip-native-review-fanout working for one release.
+		// Hidden: `review request --reviewer <name> --message <msg>` is the
+		// documented path. This keeps --foreground, --action and
+		// --skip-native-review-fanout, which that path does not offer.
 		return runAgentReview(args[1:], stdout, stderr)
 	case "type":
 		return runAgentType(args[1:], stdout, stderr)
@@ -198,9 +197,6 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 	positionals := []string{}
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
-		if arg == "--workflow" || strings.HasPrefix(arg, "--workflow=") {
-			arg = renameFlagToken(arg, stderr, FlagAlias{Old: "workflow", New: "campaign"})
-		}
 		switch {
 		case arg == "--background":
 			options.background = true
@@ -797,7 +793,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.noExecution = true
 		case arg == "--allow-prompt-head-mismatch":
 			options.allowPromptHeadMismatch = true
-		case arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--part" || arg == "--related-pr":
+		case arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--campaign" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--part" || arg == "--related-pr":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -814,9 +810,9 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.model = strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
 		case strings.HasPrefix(arg, "--effort="):
 			options.effort = strings.TrimSpace(strings.TrimPrefix(arg, "--effort="))
-		case strings.HasPrefix(arg, "--workflow="):
+		case strings.HasPrefix(arg, "--campaign="):
 			options.workflowSet = true
-			options.workflowID = strings.TrimSpace(strings.TrimPrefix(arg, "--workflow="))
+			options.workflowID = strings.TrimSpace(strings.TrimPrefix(arg, "--campaign="))
 		case strings.HasPrefix(arg, "--org-role="):
 			options.orgRole = strings.TrimSpace(strings.TrimPrefix(arg, "--org-role="))
 		case strings.HasPrefix(arg, "--runtime="):
@@ -888,7 +884,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		return agentRunOptions{}, false
 	}
 	if options.workflowSet && options.workflowID == "" {
-		fmt.Fprintf(stderr, "%s: --workflow requires a non-blank value\n", label)
+		fmt.Fprintf(stderr, "%s: --campaign requires a non-blank value\n", label)
 		return agentRunOptions{}, false
 	}
 	if err := workflow.ValidateWorkflowID(options.workflowID); err != nil {
@@ -914,7 +910,7 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 		options.model = value
 	case "--effort":
 		options.effort = value
-	case "--workflow":
+	case "--campaign":
 		options.workflowSet = true
 		options.workflowID = value
 	case "--org-role":
@@ -994,7 +990,7 @@ func validateAgentRunActionOptions(command string, options agentRunOptions) erro
 
 func printAgentRunUsage(w io.Writer, command string) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot reviewer review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--action review] [--model model] [--effort effort] [--campaign label] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  Reviews attributed with --org-role queue for daemon ownership by default; --foreground keeps synchronous execution.")
 	printAgentRuntimeOverrideHelp(w)
 }
@@ -1267,7 +1263,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	name := strings.TrimSpace(args[0])
-	if err := parseWithFlagAliases(fs, args[1:], stderr, FlagAlias{Old: "job-timeout", New: "run-timeout"}); err != nil {
+	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}

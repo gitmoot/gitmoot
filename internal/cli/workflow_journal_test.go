@@ -73,8 +73,8 @@ func (s *workflowShowMidCallCreateStore) ListWorkflowNotes(ctx context.Context, 
 func TestWorkflowFlagParsesOnAllAgentVerbs(t *testing.T) {
 	for _, command := range []string{"run", "review", "implement", "orchestrate"} {
 		for _, args := range [][]string{
-			{"planner", "work", "--workflow", "release-42"},
-			{"planner", "work", "--workflow=release-42"},
+			{"planner", "work", "--campaign", "release-42"},
+			{"planner", "work", "--campaign=release-42"},
 		} {
 			var stderr bytes.Buffer
 			options, ok := parseAgentRunOptions(command, args, &stderr)
@@ -84,8 +84,8 @@ func TestWorkflowFlagParsesOnAllAgentVerbs(t *testing.T) {
 		}
 	}
 	for _, args := range [][]string{
-		{"planner", "question", "--workflow", "release-42"},
-		{"planner", "question", "--workflow=release-42"},
+		{"planner", "question", "--campaign", "release-42"},
+		{"planner", "question", "--campaign=release-42"},
 	} {
 		var stderr bytes.Buffer
 		options, ok := parseAgentAskOptions(args, &stderr)
@@ -95,11 +95,11 @@ func TestWorkflowFlagParsesOnAllAgentVerbs(t *testing.T) {
 	}
 	for _, parse := range []func(*bytes.Buffer) bool{
 		func(stderr *bytes.Buffer) bool {
-			_, ok := parseAgentAskOptions([]string{"planner", "q", "--workflow=Bad_ID"}, stderr)
+			_, ok := parseAgentAskOptions([]string{"planner", "q", "--campaign=Bad_ID"}, stderr)
 			return ok
 		},
 		func(stderr *bytes.Buffer) bool {
-			_, ok := parseAgentRunOptions("run", []string{"planner", "q", "--workflow=Bad_ID"}, stderr)
+			_, ok := parseAgentRunOptions("run", []string{"planner", "q", "--campaign=Bad_ID"}, stderr)
 			return ok
 		},
 	} {
@@ -110,19 +110,19 @@ func TestWorkflowFlagParsesOnAllAgentVerbs(t *testing.T) {
 	}
 	for _, parse := range []func(*bytes.Buffer) bool{
 		func(stderr *bytes.Buffer) bool {
-			_, ok := parseAgentAskOptions([]string{"planner", "q", "--workflow="}, stderr)
+			_, ok := parseAgentAskOptions([]string{"planner", "q", "--campaign="}, stderr)
 			return ok
 		},
 		func(stderr *bytes.Buffer) bool {
-			_, ok := parseAgentAskOptions([]string{"planner", "q", "--workflow", "   "}, stderr)
+			_, ok := parseAgentAskOptions([]string{"planner", "q", "--campaign", "   "}, stderr)
 			return ok
 		},
 		func(stderr *bytes.Buffer) bool {
-			_, ok := parseAgentRunOptions("run", []string{"planner", "q", "--workflow="}, stderr)
+			_, ok := parseAgentRunOptions("run", []string{"planner", "q", "--campaign="}, stderr)
 			return ok
 		},
 		func(stderr *bytes.Buffer) bool {
-			_, ok := parseAgentRunOptions("run", []string{"planner", "q", "--workflow", "   "}, stderr)
+			_, ok := parseAgentRunOptions("run", []string{"planner", "q", "--campaign", "   "}, stderr)
 			return ok
 		},
 	} {
@@ -1123,12 +1123,12 @@ func TestWorkflowShowTextSanitizesButJSONStaysVerbatim(t *testing.T) {
 
 func TestBlankWorkflowFlagsRejectedOutsideAgentParser(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := runJobList([]string{"--workflow="}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "non-blank") {
+	if code := runJobList([]string{"--campaign="}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "non-blank") {
 		t.Fatalf("job list blank exit=%d stderr=%q", code, stderr.String())
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := runJobOpen([]string{"--agent", "a", "--repo", "acme/widget", "--type", "ask", "--workflow=   "}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "non-blank") {
+	if code := runJobOpen([]string{"--implementer", "a", "--repo", "acme/widget", "--type", "ask", "--campaign=   "}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "non-blank") {
 		t.Fatalf("job open blank exit=%d stderr=%q", code, stderr.String())
 	}
 }

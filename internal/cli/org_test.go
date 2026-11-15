@@ -219,7 +219,7 @@ func TestOrgEscalateWritesTypedWorkflowNote(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	code := runMessage([]string{"escalate", "--home", home, "--role", "OPERATOR", "--to", "OWNER", "--workflow", "release/one", "--repo", "acme/widget", "--json", "Can we include ] and x=y?"}, &out, &errOut)
+	code := runMessage([]string{"escalate", "--home", home, "--role", "OPERATOR", "--to", "OWNER", "--campaign", "release/one", "--repo", "acme/widget", "--json", "Can we include ] and x=y?"}, &out, &errOut)
 	if code != 0 {
 		t.Fatalf("escalate code=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
@@ -256,7 +256,7 @@ func TestOrgEscalateDescendantWritesAddressedQuestion(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := runMessage([]string{"escalate", "--home", home, "--role", "owner", "--to", "operator",
-		"--workflow", "release/downward", "--repo", "acme/widget", "Can you verify the release?"}, &stdout, &stderr)
+		"--campaign", "release/downward", "--repo", "acme/widget", "Can you verify the release?"}, &stdout, &stderr)
 
 	store = openCLIJobStore(t, home)
 	defer store.Close()
@@ -302,7 +302,7 @@ func TestOrgEscalateAncestorBehaviorRemainsEscalation(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := runMessage([]string{"escalate", "--home", home, "--role", "operator", "--to", "owner",
-		"--workflow", "release/upward", "May we ship?"}, &stdout, &stderr)
+		"--campaign", "release/upward", "May we ship?"}, &stdout, &stderr)
 
 	store = openCLIJobStore(t, home)
 	defer store.Close()
@@ -510,12 +510,12 @@ func TestOrgEscalateValidation(t *testing.T) {
 		name string
 		args []string
 	}{
-		{name: "same role", args: []string{"--role", "operator", "--to", "operator", "--workflow", "release/one", "question"}},
-		{name: "unknown target", args: []string{"--role", "operator", "--to", "missing", "--workflow", "release/one", "question"}},
-		{name: "sibling", args: []string{"--role", "operator", "--to", "auditor", "--workflow", "release/one", "question"}},
-		{name: "unknown source", args: []string{"--role", "missing", "--to", "owner", "--workflow", "release/one", "question"}},
-		{name: "invalid workflow", args: []string{"--role", "operator", "--to", "owner", "--workflow", "Bad Label", "question"}},
-		{name: "missing question", args: []string{"--role", "operator", "--to", "owner", "--workflow", "release/one"}},
+		{name: "same role", args: []string{"--role", "operator", "--to", "operator", "--campaign", "release/one", "question"}},
+		{name: "unknown target", args: []string{"--role", "operator", "--to", "missing", "--campaign", "release/one", "question"}},
+		{name: "sibling", args: []string{"--role", "operator", "--to", "auditor", "--campaign", "release/one", "question"}},
+		{name: "unknown source", args: []string{"--role", "missing", "--to", "owner", "--campaign", "release/one", "question"}},
+		{name: "invalid workflow", args: []string{"--role", "operator", "--to", "owner", "--campaign", "Bad Label", "question"}},
+		{name: "missing question", args: []string{"--role", "operator", "--to", "owner", "--campaign", "release/one"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			home := writeOrgEscalateConfig(t)
@@ -532,7 +532,7 @@ func TestOrgEscalateValidation(t *testing.T) {
 func TestOrgEscalateRegistryAndRolePrecedence(t *testing.T) {
 	t.Run("registry required", func(t *testing.T) {
 		var out, errOut bytes.Buffer
-		if code := runMessage([]string{"escalate", "--home", t.TempDir(), "--role", "operator", "--to", "owner", "--workflow", "release/one", "question"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "requires an [org] registry") {
+		if code := runMessage([]string{"escalate", "--home", t.TempDir(), "--role", "operator", "--to", "owner", "--campaign", "release/one", "question"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "requires an [org] registry") {
 			t.Fatalf("code=%d out=%q err=%q", code, out.String(), errOut.String())
 		}
 	})
@@ -545,7 +545,7 @@ func TestOrgEscalateRegistryAndRolePrecedence(t *testing.T) {
 		}
 		t.Setenv("GITMOOT_ORG_ROLE", "auditor")
 		var out, errOut bytes.Buffer
-		if code := runMessage([]string{"escalate", "--home", home, "--role", "operator", "--to", "owner", "--workflow", "release/one", "question"}, &out, &errOut); code != 0 {
+		if code := runMessage([]string{"escalate", "--home", home, "--role", "operator", "--to", "owner", "--campaign", "release/one", "question"}, &out, &errOut); code != 0 {
 			t.Fatalf("code=%d out=%q err=%q", code, out.String(), errOut.String())
 		}
 		store = openCLIJobStore(t, home)
@@ -564,7 +564,7 @@ func TestOrgEscalateRegistryAndRolePrecedence(t *testing.T) {
 		}
 		t.Setenv("GITMOOT_ORG_ROLE", "operator")
 		var out, errOut bytes.Buffer
-		if code := runMessage([]string{"escalate", "--home", home, "--to", "owner", "--workflow", "release/one", "question"}, &out, &errOut); code != 0 {
+		if code := runMessage([]string{"escalate", "--home", home, "--to", "owner", "--campaign", "release/one", "question"}, &out, &errOut); code != 0 {
 			t.Fatalf("code=%d out=%q err=%q", code, out.String(), errOut.String())
 		}
 	})
@@ -576,7 +576,7 @@ func TestOrgEscalateRegistryAndRolePrecedence(t *testing.T) {
 			t.Fatal(err)
 		}
 		var out, errOut bytes.Buffer
-		if code := runMessage([]string{"escalate", "--home", home, "--role", "operator", "--to", "owner", "--workflow", "release/one", "-1 day left"}, &out, &errOut); code != 0 {
+		if code := runMessage([]string{"escalate", "--home", home, "--role", "operator", "--to", "owner", "--campaign", "release/one", "-1 day left"}, &out, &errOut); code != 0 {
 			t.Fatalf("code=%d out=%q err=%q", code, out.String(), errOut.String())
 		}
 	})
