@@ -45,8 +45,12 @@ status` shows that it is running.
    a review before merge; a `level2_background` head merges first and is
    reviewed after, with `--post-merge`.
 
-3. Keep working. Gitmoot wakes your role when the verdict is saved. To look
-   sooner: `gitmoot review status --repo owner/repo --pr 42`.
+3. Keep working. Gitmoot wakes your role when the verdict is saved: a
+   `review_verdict` message arrives in your role's inbox, typed into your
+   session if your role has a Herdr pane. Without a pane, run the `watch:`
+   command `review request` printed (`gitmoot run watch <run-id>`); it returns
+   when the review ends. To look sooner:
+   `gitmoot review status --repo owner/repo --pr 42`.
 4. On `changes_requested`, read the findings
    (`gitmoot findings --repo owner/repo --pr 42`), fix them, push, and request
    a review of the new head. The implement record from step 2 covers every
@@ -54,8 +58,13 @@ status` shows that it is running.
    a finding only by citing its UID (`continues_uid`, see
    [RESULT_CONTRACT.md](RESULT_CONTRACT.md#the-findings-ledger)).
 5. On `approved` at the current head with green CI, the gate merges (when
-   automatic merge is on) or a `/gitmoot merge` comment asks it to. If it
-   holds, the reason names the remedy.
+   automatic merge is on) or a `/gitmoot merge` comment asks it to (when it is
+   off, and your role's `merge_rule` is `self`). If it holds, the reason names
+   the remedy. A repository that requires GitHub's merge queue never merges
+   through Gitmoot: enqueue the head with
+   `gh pr merge 42 --repo owner/repo --squash --match-head-commit <40-hex-sha>`.
+   Wait on CI checks, not on the `gitmoot/merge-gate` status, which is
+   Gitmoot's own.
 
 ## A review with no model, on a throwaway home
 
