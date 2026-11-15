@@ -207,6 +207,9 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 					"the review returned terminal decision %q (evidence %q) with no findings, no substantive tests_run or changes_made entry, and a summary too short to be a rationale, so it accounts for nothing the reviewer did",
 					strings.TrimSpace(r.Decision), strings.TrimSpace(r.Evidence))),
 			})
+			if r.Decision == "approved" {
+				checks = append(checks, approvalAnswersDischargeCheck(r))
+			}
 		}
 	case "ask":
 		pass := isActionableAnswer(r)
@@ -324,6 +327,27 @@ func NoExecutionReviewResultChecks(r AgentResult) []ResultCheck {
 		})
 	}
 	return failed
+}
+
+// approvalAnswersDischargeCheck asks whether an APPROVING review declares a
+// finding answered, withdrawn or superseded which the findings ledger would
+// record QUOTED (#2653). A QUOTED row never discharges, so such an approval
+// settles the review while the ledger keeps the finding owed at that head.
+// It is an audit check and obeys the result_checks mode: the state it flags is
+// recoverable (`review request --supersede` re-reviews such an approval), so
+// failing every such review outright would cost a paid re-dispatch for it.
+func approvalAnswersDischargeCheck(r AgentResult) ResultCheck {
+	quoted := undischargeableDeclaredAnswers(r)
+	pass := len(quoted) == 0
+	return ResultCheck{
+		ID:       "review-approval-answers-discharge",
+		Action:   "review",
+		Question: "Does every finding an approving review declares answered carry evidence that can discharge it?",
+		Pass:     pass,
+		Explanation: explain(pass, fmt.Sprintf(
+			"the review approves but declares %s with evidence %q, %d tests_run entries and no file plus rationale, so the ledger records each as QUOTED, which never discharges, and the finding stays owed at this head; for each one either list the checks you ran in tests_run with evidence %q, or give its \"file\" and a \"rationale\" saying why it is answered",
+			strings.Join(quoted, ", "), strings.TrimSpace(r.Evidence), len(r.TestsRun), EvidenceExecuted)),
+	}
 }
 
 // hasActionableEntries reports whether a string slice contains at least one

@@ -168,6 +168,7 @@ func TestReviewRequestSupersedeRefusesOutsideItsContract(t *testing.T) {
 	}
 	settlePartReview(t, store, approved.JobID, string(workflow.JobSucceeded), "approved")
 	refused(append(part("clean"), "--supersede", approved.JobID, "--reason", "r"), "nothing to supersede")
+	refused(append(part("clean"), "--supersede", approved.JobID, "--reason", "r"), "gitmoot findings --repo owner/repo --pr 12 --at-head "+head)
 
 	blocked, failure := runReviewRequestJSON(t, part("blocked")...)
 	if failure != "" {
@@ -187,6 +188,55 @@ func TestReviewRequestSupersedeRefusesOutsideItsContract(t *testing.T) {
 		if err != nil || claim.JobID != job {
 			t.Fatalf("claim for part %s = %+v (%v), want it unchanged on %s", name, claim, err, job)
 		}
+	}
+}
+
+// #2653 (jerryfane/herdr#409): an approval that declared answers the ledger
+// recorded QUOTED leaves obligations at its head, a plain request attaches to
+// that approval, and a new part never approves the head. --supersede is the
+// exit, on the same reviewer and with a recorded reason, exactly while the
+// ledger still owes something there.
+func TestReviewRequestSupersedeReReviewsAnApprovalTheLedgerStillOwes(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--home", home, "--json", "--role", "joltra"}
+
+	first, failure := runReviewRequestJSON(t, base...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	settlePartReview(t, store, first.JobID, string(workflow.JobSucceeded), "approved")
+	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "owner/repo", PullRequest: 12, HeadSHA: head, ObserverJob: first.JobID, SourceJob: first.JobID,
+		State: db.FindingOpen, DeclaredState: db.FindingAnswered, Severity: "P2", RoundLabel: "f1",
+		Title: "retry loop leaks", EvidenceKind: db.EvidenceQuoted,
+	}); err != nil {
+		t.Fatalf("RecordReviewFindingObservation: %v", err)
+	}
+
+	reason := "approval answered f1 without evidence; the ledger still owes it"
+	second, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--supersede", first.JobID, "--reason", reason)...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if second.State != reviewRequestDispatched || second.JobID == first.JobID || second.Supersedes != first.JobID {
+		t.Fatalf("supersede request = %+v, want a new dispatched job superseding %s", second, first.JobID)
+	}
+	claim, err := store.GetReviewRequest(ctx, partSubjectKey(t, head, ""))
+	if err != nil || claim.JobID != second.JobID {
+		t.Fatalf("claim after supersede = %+v (%v), want it on %s", claim, err, second.JobID)
+	}
+	newJob := mustGetJob(t, store, second.JobID)
+	if oldJob := mustGetJob(t, store, first.JobID); newJob.Agent != oldJob.Agent {
+		t.Fatalf("re-review agent %q, want the superseded reviewer %q", newJob.Agent, oldJob.Agent)
+	}
+	newPayload, err := workflow.ParseJobPayload(newJob.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newPayload.ReviewSupersedes != first.JobID || newPayload.ReviewSupersedeReason != reason {
+		t.Fatalf("re-review payload linkage = supersedes %q reason %q", newPayload.ReviewSupersedes, newPayload.ReviewSupersedeReason)
 	}
 }
 

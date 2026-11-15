@@ -39,9 +39,9 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		execRunners: 1,
 		reason:      "operator-side ledger scan; it reads each registered host checkout to resolve obligations at merged heads and dispatches no job, so there is no resolved backend runner to inherit",
 	},
-	"internal/cli/findings.go:runFindingsObligations": {
+	"internal/cli/findings.go:findingsLedgerScope": {
 		execRunners: 1,
-		reason:      "operator-side ledger query; it reads the registered host checkout to resolve obligations and dispatches no job, so there is no resolved backend runner to inherit",
+		reason:      "operator-side ledger query shared by `findings --at-head` and `review request --supersede` (#2653); it reads the registered host checkout to resolve obligations and dispatches no job, so there is no resolved backend runner to inherit",
 	},
 	"internal/cli/daemon_lifecycle.go:preflightDaemonRepoCheckout": {
 		execRunners: 1,

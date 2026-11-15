@@ -1217,7 +1217,7 @@ Usage of review request:
   -session string
     	runtime session the review reuses
   -supersede string
-    	re-review at the same head: the settled blocking review (of this --part, or the whole-head review without --part) whose verdict this request replaces once it lands; requires --reason
+    	re-review at the same head: the settled review (of this --part, or the whole-head review without --part) whose verdict this request replaces once it lands; it must be blocking, or an approval while the findings ledger still lists obligations at that head (see gitmoot findings --at-head); same reviewer only; requires --reason
   -ttl duration
     	how long the requester waits before the wait expires to its parent (default 12h0m0s)
 ```

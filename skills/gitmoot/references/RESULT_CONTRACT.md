@@ -128,7 +128,8 @@ A later review closes or continues a finding with these finding keys:
 
 An `answered` finding counts only with evidence: `"evidence": "executed"` and
 the checks listed in `tests_run`, or, for a static-only review, a `file` plus
-`rationale`. Otherwise the gate keeps it open. Example, at the fix head:
+`rationale`. Otherwise the gate keeps it open, and the result checks flag an
+`approved` result that declares such an answer. Example, at the fix head:
 
 ```json
 {"gitmoot_result":{"decision":"approved","summary":"check.sh now reads b.txt; ran it at this head and it passed.","findings":[{"continues_uid":"acme/widget#1-f1","state":"answered","severity":"P2","file":"b.txt","title":"b.txt untested","detail":"check.sh now checks b.txt"}],"changes_made":[],"tests_run":["sh check.sh -> exit 0"],"needs":[],"evidence":"executed"}}
