@@ -88,9 +88,12 @@ unknown value is rejected.
 
 A check the environment cannot run (its platform toolchain is missing, for
 example Xcode on Linux) may be satisfied by a green CI run at the exact
-reviewed head that the reviewer verifies itself: the CI run's head SHA equals
-the reviewed head, its GitHub Actions job succeeded, and it builds or tests the
-changed paths.
+reviewed head: the CI run's head SHA equals the reviewed head, its GitHub
+Actions job succeeded, and it builds or tests the changed paths. The gitmoot
+host fetches the exact-head check runs with its own GitHub credentials and
+appends them to every review prompt, so a read-only seat, which has no GitHub
+credential, can cite a private repository's CI from that block; otherwise the
+reviewer verifies the run itself.
 Record it as its own `tests_run` entry,
 `CI-verified: <check> -> success; run <run id> job <job id>`, and name the
 reason in `checks_blocked`. A `CI-verified:` entry is not a check the review

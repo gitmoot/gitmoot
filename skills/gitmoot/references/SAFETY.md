@@ -36,6 +36,9 @@ What gitmoot enforces today, and what a seat must not work around.
   sandbox that allows writes only to the run's scratch space and caches, and a
   separate runtime profile. A review requested with `--no-execution` may run no
   program but the runtime itself.
+- A review seat gets no GitHub credential. The host fetches the exact-head CI
+  check runs (and failing job log tails) with its own credentials and appends
+  them to the review prompt.
 - The disk guard refuses new dispatches when the gitmoot home's filesystem is
   below its free-space floor (`[disk_guard]`, default 2 GiB and 5%).
 

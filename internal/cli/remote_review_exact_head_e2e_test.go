@@ -22,8 +22,8 @@ import (
 )
 
 // remoteReviewWorkspaceProbe is the review runtime. It reports what an
-// exact-head reviewer can establish inside the instance with ordinary git and
-// the GITMOOT_PRIOR_VERDICTS file, and nothing else.
+// exact-head reviewer can establish inside the instance with ordinary git, the
+// GITMOOT_PRIOR_VERDICTS file and its prompt ($1), and nothing else.
 const remoteReviewWorkspaceProbe = `head=$(git rev-parse HEAD)
 base=$(git rev-parse "@{upstream}")
 files=$(git diff --name-only "@{upstream}" HEAD | tr '\n' ',')
@@ -31,13 +31,20 @@ prior=absent
 if [ -n "${GITMOOT_PRIOR_VERDICTS:-}" ] && grep -q PRIOR-TITLE-2281 "$GITMOOT_PRIOR_VERDICTS" && grep -q PRIOR-DETAIL-2281 "$GITMOOT_PRIOR_VERDICTS"; then
   prior=present
 fi
-printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"head=%s base=%s files=%s prior=%s","findings":[],"changes_made":[],"tests_run":["git rev-parse HEAD"],"needs":[]}}' "$head" "$base" "$files" "$prior"`
+ci=absent
+case "$1" in
+  *"HOST-FETCHED EXACT-HEAD CI EVIDENCE"*"- ci / test: success (https://github.com/owner/repo/actions/runs/2664/job/26640)"*) ci=present ;;
+esac
+printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"head=%s base=%s files=%s prior=%s ci=%s","findings":[],"changes_made":[],"tests_run":["git rev-parse HEAD"],"needs":[]}}' "$head" "$base" "$files" "$prior" "$ci"`
 
 // #2281: a policy-routed remote review ended blocked because the instance
 // had neither the exact head commit nor the prior findings ("commit <head> is
 // absent locally, GitHub access returned 401, prior review findings
 // unavailable"). This drives a review job through jobWorker.run onto the real
 // remote backend and checks what the runtime itself can see there.
+//
+// #2664: the sandbox has no GitHub credential either, so the host appends the
+// exact-head CI it fetched with its own credentials to the remote prompt too.
 func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 	ctx := context.Background()
 	const secret = "ghs_GITMOOT2281hostCREDENTIAL"
@@ -131,6 +138,11 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 		}
 	}
 	worker.CommenterFactory = func(string) github.Client { return &cliPollFakeGitHub{} }
+	worker.StaticReviewCIGitHubFactory = func(string) staticReviewCIGitHub {
+		return hostCIStub{head: head, checks: []github.PullRequestCheck{{
+			Name: "ci / test", State: "success", Link: "https://github.com/owner/repo/actions/runs/2664/job/26640",
+		}}}
+	}
 	if pending := pendingIDs(t, ctx, worker); strings.Join(pending, ",") != job.ID {
 		t.Fatalf("warning-band dispatch = %v, want only %s", pending, job.ID)
 	}
@@ -161,7 +173,7 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 		events, _ := store.ListJobEvents(ctx, job.ID)
 		t.Fatalf("review job %s produced no result; events: %+v", finished.State, events)
 	}
-	want := "head=" + head + " base=" + base + " files=under-review.txt, prior=present"
+	want := "head=" + head + " base=" + base + " files=under-review.txt, prior=present ci=present"
 	if payload.Result.Summary != want {
 		t.Fatalf("what the remote reviewer saw = %q\nwant %q", payload.Result.Summary, want)
 	}
