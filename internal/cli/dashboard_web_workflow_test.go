@@ -179,7 +179,7 @@ func TestWebDataSourceGraphWorkflowHubsRespectVisibleJobs(t *testing.T) {
 	store.Close()
 
 	ds := &webDataSource{home: home}
-	all, err := ds.Graph(ctx, "")
+	all, err := ds.Graph(ctx, "", dashboard.GraphRange30d)
 	if err != nil {
 		t.Fatalf("Graph(all): %v", err)
 	}
@@ -196,7 +196,7 @@ func TestWebDataSourceGraphWorkflowHubsRespectVisibleJobs(t *testing.T) {
 		}
 	}
 
-	filtered, err := ds.Graph(ctx, "acme/a")
+	filtered, err := ds.Graph(ctx, "acme/a", dashboard.GraphRange30d)
 	if err != nil {
 		t.Fatalf("Graph(acme/a): %v", err)
 	}
@@ -224,7 +224,7 @@ func TestWebDataSourceGraphUnlabelledLegacyJSONUnchanged(t *testing.T) {
 	mustCreateJob(t, store, db.Job{ID: "legacy", Type: "ask", State: "running", Payload: `{"task_title":"legacy","workflow_id":""}`}, "", "")
 	store.Close()
 
-	got, err := (&webDataSource{home: home}).Graph(context.Background(), "")
+	got, err := (&webDataSource{home: home}).Graph(context.Background(), "", dashboard.GraphRange30d)
 	if err != nil {
 		t.Fatalf("Graph: %v", err)
 	}

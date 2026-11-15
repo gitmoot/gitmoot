@@ -980,25 +980,48 @@ func resolveJobRuntime(job db.Job, payload workflow.JobPayload, runtimeByAgent m
 	return rt
 }
 
-// dashboardGalaxyWindow bounds the galaxy graph to jobs created in the trailing
-// 30 days. The full history (29.7k jobs on the live store in #2639) made the
-// response 21 MB and the request 11-15 s; the window keeps both proportional to
-// recent activity instead of to the store's age.
+// dashboardGalaxyWindow bounds the default (?range=30d) galaxy graph to jobs
+// created in the trailing 30 days. The full history (29.7k jobs on the live
+// store in #2639) made the response 21 MB and the request 11-15 s; the window
+// keeps the default proportional to recent activity instead of to the store's
+// age. 90d and all are opt-in (#2655).
 const dashboardGalaxyWindow = 30 * 24 * time.Hour
 
-// Graph returns the "galaxy" graph: a union of every job created within
-// dashboardGalaxyWindow across every run, plus synthetic repo/agent hub nodes
-// that cluster the jobs. Links are delegation parentage, a per-parent-group
-// sibling mesh (the density lever, capped so one huge fan-out can't dominate),
-// and job->repo / job->agent spokes. A non-empty repo scopes the visible jobs
-// (and their hubs) to that repository; Repos always lists every repo in the
-// window so the UI filter dropdown stays complete. Jobs are read without their
-// payload: repo is the denormalized column and the title fields are projected
-// in SQL. Read-only; output is sorted for determinism.
-func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph, error) {
+// dashboardGalaxyRunCap bounds the runs a 90d/all galaxy draws (#2655). Measured
+// in a browser on the live store, each frame of the force graph cost ~15x the
+// 30-day default at 90d (22.8k runs) and the all-time load (30k runs) blocked
+// the tab for over 30 s. 8,000 is just above today's 30-day default (6.8k) and
+// above the largest single repo's all-time history (7.5k), so picking a repo
+// shows its whole history uncapped; only the all-repos wide view is trimmed to
+// its newest runs, and Graph.Truncated says so.
+const dashboardGalaxyRunCap = 8000
+
+// dashboardGalaxySince is the created_at lower bound for a graph range. All of
+// history is "", which every stored timestamp compares at or above.
+func dashboardGalaxySince(rng dashboard.GraphRange, now time.Time) string {
+	switch rng {
+	case dashboard.GraphRangeAll:
+		return ""
+	case dashboard.GraphRange90d:
+		return dashboardSQLiteTime(now.Add(-90 * 24 * time.Hour))
+	default:
+		return dashboardSQLiteTime(now.Add(-dashboardGalaxyWindow))
+	}
+}
+
+// Graph returns the "galaxy" graph: a union of every job created within rng
+// across every run, plus synthetic repo/agent hub nodes that cluster the jobs.
+// Links are delegation parentage, a per-parent-group sibling mesh (the density
+// lever, capped so one huge fan-out can't dominate), and job->repo / job->agent
+// spokes. A non-empty repo scopes the visible jobs (and their hubs) to that
+// repository; Repos always lists every repo in the range so the UI filter
+// dropdown stays complete. Jobs are read without their payload: repo is the
+// denormalized column and the title fields are projected in SQL. Read-only;
+// output is sorted for determinism.
+func (d *webDataSource) Graph(ctx context.Context, repo string, rng dashboard.GraphRange) (dashboard.Graph, error) {
 	out := dashboard.Graph{Nodes: []dashboard.GraphNode{}, Links: []dashboard.GraphLink{}, Repos: []string{}}
 	filter := strings.TrimSpace(repo)
-	since := dashboardSQLiteTime(time.Now().Add(-dashboardGalaxyWindow))
+	since := dashboardGalaxySince(rng, time.Now())
 	err := withStore(d.home, func(store *db.Store) error {
 		rows, err := store.ListDashboardGraphJobs(ctx, since)
 		if err != nil {
@@ -1030,11 +1053,18 @@ func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph
 		}
 
 		// The visible job set: everything, or only jobs in the filtered repo.
-		visible := func(id string) bool {
-			if filter == "" {
-				return true
+		inFilter := func(id string) bool {
+			return filter == "" || repoByID[id] == filter
+		}
+		visible := inFilter
+		// #2655: a wide range keeps only the newest dashboardGalaxyRunCap visible
+		// runs, so 90d/all cannot freeze the tab. The 30-day default is never
+		// capped, keeping its response unchanged.
+		if rng != dashboard.GraphRange30d {
+			if kept, total := galaxyNewestRuns(jobs, inFilter, dashboardGalaxyRunCap); kept != nil {
+				visible = func(id string) bool { return kept[id] }
+				out.Truncated = &dashboard.GraphTruncation{Shown: len(kept), Total: total}
 			}
-			return repoByID[id] == filter
 		}
 
 		// Job nodes + collect the hubs referenced by visible jobs. Workflow
@@ -1054,11 +1084,12 @@ func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph
 			r := repoByID[j.ID]
 			agent := strings.TrimSpace(j.Agent)
 			// Run points at the job's root. That root may be older than the
-			// galaxy window, or under an active repo filter belong to a different
-			// repo, and thus be absent from Nodes; fall back to self-root so no
-			// node attribute references a missing node.
+			// galaxy window, under an active repo filter belong to a different
+			// repo, or fall outside a wide range's cap, and thus be absent from
+			// Nodes; fall back to self-root so no node attribute references a
+			// missing node.
 			run := jobRootID(jobByID, j.ID)
-			if _, inWindow := jobByID[run]; !inWindow || (filter != "" && !visible(run)) {
+			if _, inWindow := jobByID[run]; !inWindow || !visible(run) {
 				run = j.ID
 			}
 			out.Nodes = append(out.Nodes, dashboard.GraphNode{
@@ -1180,6 +1211,28 @@ func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph
 		return nil
 	})
 	return out, err
+}
+
+// galaxyNewestRuns counts the jobs include accepts and, when there are more than
+// limit, returns the newest limit of them (jobs are in created_at order, oldest
+// first). It returns nil when nothing needs trimming.
+func galaxyNewestRuns(jobs []db.Job, include func(string) bool, limit int) (map[string]bool, int) {
+	total := 0
+	for _, j := range jobs {
+		if include(j.ID) {
+			total++
+		}
+	}
+	if total <= limit {
+		return nil, total
+	}
+	kept := make(map[string]bool, limit)
+	for i := len(jobs) - 1; i >= 0 && len(kept) < limit; i-- {
+		if include(jobs[i].ID) {
+			kept[jobs[i].ID] = true
+		}
+	}
+	return kept, total
 }
 
 // siblingMeshCap bounds the number of members of a single (root, parent) group

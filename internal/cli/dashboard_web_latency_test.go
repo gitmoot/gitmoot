@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,7 +165,7 @@ func TestWebDataSourceGraphWindowExcludesOlderJobs(t *testing.T) {
 	}
 	store.Close()
 
-	g, err := (&webDataSource{home: home}).Graph(ctx, "")
+	g, err := (&webDataSource{home: home}).Graph(ctx, "", dashboard.GraphRange30d)
 	if err != nil {
 		t.Fatalf("Graph: %v", err)
 	}
@@ -226,5 +228,108 @@ func TestDashboardGraphShadowMatchesModuleAndCaches(t *testing.T) {
 		if outcome := get(shadow, "/api/graph?repo=nobody/nothing").Header().Get(dashboardCacheHeader); outcome != "miss" {
 			t.Fatalf("unknown repo filter cache = %q, want miss every time", outcome)
 		}
+	}
+}
+
+// ?range= on /api/graph (#2655): 30d (the default, also for missing or unknown
+// values) keeps the trailing-30-day window, 90d widens it, all drops the bound.
+// Each range is its own cache entry, and the default request is byte-identical
+// to an explicit range=30d, so clients that never send ?range= are unchanged.
+func TestDashboardGraphRangeWidensWindowAndKeysCache(t *testing.T) {
+	home := dashboardTestHome(t)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	for _, item := range []struct {
+		id, repo string
+		age      time.Duration
+	}{
+		{"recent", "acme/recent", 2 * 24 * time.Hour},
+		{"two-months", "acme/two-months", 60 * 24 * time.Hour},
+		{"ancient", "acme/ancient", 400 * 24 * time.Hour},
+	} {
+		job := db.Job{ID: item.id, Agent: "rev", Type: "review", State: "succeeded",
+			Payload: mustJSON(t, workflow.JobPayload{Repo: item.repo, TaskTitle: item.id})}
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", item.id, err)
+		}
+		stamp := dashboardSQLiteTime(time.Now().Add(-item.age))
+		if err := store.ExecForTest(ctx, `UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`, stamp, stamp, item.id); err != nil {
+			t.Fatalf("backdate %s: %v", item.id, err)
+		}
+	}
+	store.Close()
+
+	handler := newDashboardWebHandler(&webDataSource{home: home})
+	get := func(target string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d: %s", target, rec.Code, rec.Body.String())
+		}
+		return rec
+	}
+	repos := func(rec *httptest.ResponseRecorder) []string {
+		t.Helper()
+		var g dashboard.Graph
+		if err := json.Unmarshal(rec.Body.Bytes(), &g); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return g.Repos
+	}
+	for target, want := range map[string][]string{
+		"/api/graph?range=30d":   {"acme/recent"},
+		"/api/graph?range=90d":   {"acme/recent", "acme/two-months"},
+		"/api/graph?range=all":   {"acme/ancient", "acme/recent", "acme/two-months"},
+		"/api/graph?range=bogus": {"acme/recent"},
+	} {
+		if got := repos(get(target)); !reflect.DeepEqual(got, want) {
+			t.Fatalf("GET %s repos = %v, want %v", target, got, want)
+		}
+	}
+	// Distinct cache entries per range: a repeat of each is a hit and returns
+	// that range's body, not another range's.
+	for _, target := range []string{"/api/graph?range=90d", "/api/graph?range=all"} {
+		rec := get(target)
+		if outcome := rec.Header().Get(dashboardCacheHeader); outcome != "hit" {
+			t.Fatalf("repeat GET %s cache = %q, want hit", target, outcome)
+		}
+	}
+	if got := repos(get("/api/graph?range=all")); len(got) != 3 {
+		t.Fatalf("cached all-time repos = %v, want all three", got)
+	}
+	// The default is the 30d entry, byte for byte, and never carries the
+	// wide-range truncation field.
+	def, explicit := get("/api/graph").Body.String(), get("/api/graph?range=30d").Body.String()
+	if def != explicit {
+		t.Fatalf("default /api/graph differs from range=30d\ndefault  %s\nexplicit %s", def, explicit)
+	}
+	if strings.Contains(def, `"truncated"`) {
+		t.Fatalf("default /api/graph carries truncated: %s", def)
+	}
+	// The repo filter works inside a wider range.
+	if got := repos(get("/api/graph?range=all&repo=acme/ancient")); len(got) != 3 {
+		t.Fatalf("all-time repo-filtered Repos = %v, want the full all-time list", got)
+	}
+}
+
+// The wide-range cap keeps the newest runs the filter accepts, counts the total
+// it trimmed from, and leaves an under-cap set untouched (#2655).
+func TestGalaxyNewestRunsKeepsNewestFilteredRuns(t *testing.T) {
+	jobs := []db.Job{{ID: "a1"}, {ID: "b1"}, {ID: "a2"}, {ID: "a3"}, {ID: "b2"}, {ID: "a4"}} // oldest first
+	inA := func(id string) bool { return id[0] == 'a' }
+	kept, total := galaxyNewestRuns(jobs, inA, 2)
+	if total != 4 || !reflect.DeepEqual(kept, map[string]bool{"a3": true, "a4": true}) {
+		t.Fatalf("capped repo a = %v of %d, want the newest two (a3, a4) of 4", kept, total)
+	}
+	if kept, total := galaxyNewestRuns(jobs, inA, 4); kept != nil || total != 4 {
+		t.Fatalf("at the cap: kept %v total %d, want nil (nothing trimmed) and 4", kept, total)
+	}
+	all := func(string) bool { return true }
+	if kept, total := galaxyNewestRuns(jobs, all, 5); total != 6 || len(kept) != 5 || kept["a1"] {
+		t.Fatalf("all-repos cap 5 = %v of %d, want the five newest without a1", kept, total)
 	}
 }

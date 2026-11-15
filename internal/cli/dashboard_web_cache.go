@@ -50,7 +50,12 @@ var dashboardCachePolicies = []dashboardCachePolicy{
 	{endpoint: "org-role", keyKind: "full-cursor+role", retain: true, minRecompute: time.Second, maxAge: 15 * time.Second},
 	// #2639: the galaxy graph, per repo filter. maxAge also bounds how long the
 	// trailing window can lag when no job event moves the cursor.
-	{endpoint: "graph", keyKind: "job-event-id+repo", retain: true, minRecompute: 5 * time.Second, maxAge: 60 * time.Second},
+	{endpoint: "graph", keyKind: "job-event-id+range+repo", retain: true, minRecompute: 5 * time.Second, maxAge: 60 * time.Second},
+	// #2655: the 90-day and all-time galaxy. The job-event cursor moves every few
+	// seconds, so the 30d policy would rebuild a large graph per tab every 5 s;
+	// these rebuild at most every 2 minutes (the UI says "updated every few
+	// minutes").
+	{endpoint: "graph-long", keyKind: "job-event-id+range+repo", retain: true, minRecompute: 2 * time.Minute, maxAge: 10 * time.Minute},
 }
 
 var (
@@ -65,6 +70,7 @@ var (
 	dashboardOrgCachePolicy       = dashboardCachePolicies[8]
 	dashboardOrgRoleCachePolicy   = dashboardCachePolicies[9]
 	dashboardGraphCachePolicy     = dashboardCachePolicies[10]
+	dashboardGraphLongCachePolicy = dashboardCachePolicies[11]
 )
 
 type dashboardCacheEntry struct {
@@ -353,11 +359,13 @@ func (d *webDataSource) handleCharts(w http.ResponseWriter, r *http.Request) {
 
 // handleGraph shadows the module's /api/graph with the same body (the module
 // marshals the DataSource Graph identically) cached on the job-event cursor,
-// like /api/runs (#2639). Keys are per repo filter; a filter naming no job's
-// repo is computed through the single-flight but never retained, so arbitrary
-// ?repo= values cannot grow the cache.
+// like /api/runs (#2639). Keys are per canonical range and repo filter; 90d and
+// all use the longer graph-long policy (#2655). A filter naming no job's repo is
+// computed through the single-flight but never retained, so arbitrary ?repo=
+// values cannot grow the cache.
 func (d *webDataSource) handleGraph(w http.ResponseWriter, r *http.Request) {
 	repo := strings.TrimSpace(r.URL.Query().Get("repo"))
+	rng := dashboard.CanonicalGraphRange(r.URL.Query().Get("range"))
 	cursor, err := d.jobEventCursor(r.Context())
 	if err != nil {
 		w.Header().Set(dashboardCacheHeader, "miss")
@@ -365,6 +373,9 @@ func (d *webDataSource) handleGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	policy := dashboardGraphCachePolicy
+	if rng != dashboard.GraphRange30d {
+		policy = dashboardGraphLongCachePolicy
+	}
 	if repo != "" {
 		var known bool
 		err := withStore(d.home, func(store *db.Store) error {
@@ -379,8 +390,8 @@ func (d *webDataSource) handleGraph(w http.ResponseWriter, r *http.Request) {
 		}
 		policy.retain = known
 	}
-	body, outcome, err := d.cacheForDashboard().get(r.Context(), "graph:"+repo, cursor, policy, func(ctx context.Context) ([]byte, error) {
-		graph, err := d.Graph(ctx, repo)
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), "graph:"+string(rng)+":"+repo, cursor, policy, func(ctx context.Context) ([]byte, error) {
+		graph, err := d.Graph(ctx, repo, rng)
 		if err != nil {
 			return nil, err
 		}
