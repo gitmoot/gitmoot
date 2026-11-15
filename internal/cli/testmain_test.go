@@ -9,12 +9,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/sandbox"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // TestMain MUST stay in the default build (#1760 step 3). It is the package's
@@ -53,12 +57,30 @@ func TestMain(m *testing.M) {
 	// suite keeps that TMPDIR: the seat's job-end cleanup removes whatever the
 	// tests leave there. Nested seats then use that TMPDIR as their parent when
 	// it is short (/tmp/gmr-<8 hex>), else <cache root>/tmp.
-	tempRoot, err := makeShortTestTempRoot(slices.Compact([]string{os.TempDir(), "/tmp"}))
+	//
+	// A run that dies before m.Run returns (timeout panic, signal, killed
+	// seat) never reaches the removal below, so each run first sweeps the
+	// roots such runs leaked (#2644) and marks its own with its owner.
+	parents := slices.Compact([]string{os.TempDir(), "/tmp"})
+	owner, ownerKnown := currentTestTempRootOwner()
+	if ownerKnown {
+		if err := sweepLeakedTestTempRoots(parents, newTestTempRootSweep(owner)); err != nil {
+			fmt.Fprintf(os.Stderr, "sweep leaked test temp roots: %v\n", err)
+		}
+	}
+	tempRoot, err := makeShortTestTempRoot(parents)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "no short test temp root, keeping TMPDIR=%s: %v\n", os.TempDir(), err)
-	} else if err := os.Setenv("TMPDIR", tempRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "set TMPDIR: %v\n", err)
-		os.Exit(1)
+	} else {
+		if ownerKnown {
+			if err := writeTestTempRootOwner(tempRoot, owner); err != nil {
+				fmt.Fprintf(os.Stderr, "mark test temp root owner: %v\n", err)
+			}
+		}
+		if err := os.Setenv("TMPDIR", tempRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "set TMPDIR: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	// The disk floor applies to every direct dispatch, so tests must not depend
 	// on how full the machine running them is. Default to a healthy reading of
@@ -144,6 +166,136 @@ func removeTestTempRoot(dir string) error {
 		return nil
 	})
 	return os.RemoveAll(dir)
+}
+
+// testTempRootName is exactly the name makeTestTempRootUnder produces; the
+// sweep never looks at anything else in the parent.
+var testTempRootName = regexp.MustCompile(`^gt[0-9a-f]{8}$`)
+
+// testTempRootOwnerFile records which process owns a test temp root, so a
+// later run can tell a root leaked by a dead run from one a live run uses.
+const testTempRootOwnerFile = ".owner"
+
+// testTempRootOwner identifies a process across pid reuse: the /proc
+// starttime changes when the kernel recycles the pid, including after a
+// reboot. PIDNamespace scopes the pid: a run in another pid namespace sharing
+// this /tmp (a container) names pids this run cannot probe.
+type testTempRootOwner struct {
+	PID          int
+	StartTime    string
+	PIDNamespace string
+}
+
+// currentTestTempRootOwner reports this process as an owner. ok is false
+// without /proc (non-Linux) or without a readable pid namespace: liveness
+// cannot be proven there, so the run neither marks its root nor sweeps.
+func currentTestTempRootOwner() (testTempRootOwner, bool) {
+	owner := testTempRootOwner{
+		PID:       os.Getpid(),
+		StartTime: workflow.RuntimeProcessIdentity(os.Getpid()),
+	}
+	owner.PIDNamespace, _ = os.Readlink("/proc/self/ns/pid")
+	return owner, owner.StartTime != "" && owner.PIDNamespace != ""
+}
+
+// writeTestTempRootOwner writes the marker through a rename, so a concurrent
+// sweep reads either no marker (a root it keeps) or a whole one.
+func writeTestTempRootOwner(root string, owner testTempRootOwner) error {
+	marker := filepath.Join(root, testTempRootOwnerFile)
+	content := fmt.Sprintf("pid=%d\nstarttime=%s\npidns=%s\n", owner.PID, owner.StartTime, owner.PIDNamespace)
+	if err := os.WriteFile(marker+".tmp", []byte(content), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(marker+".tmp", marker)
+}
+
+func readTestTempRootOwner(root string) (testTempRootOwner, error) {
+	data, err := os.ReadFile(filepath.Join(root, testTempRootOwnerFile))
+	if err != nil {
+		return testTempRootOwner{}, err
+	}
+	fields := map[string]string{}
+	for line := range strings.Lines(string(data)) {
+		key, value, ok := strings.Cut(strings.TrimSuffix(line, "\n"), "=")
+		if !ok {
+			return testTempRootOwner{}, fmt.Errorf("malformed owner marker line %q", line)
+		}
+		fields[key] = value
+	}
+	pid, err := strconv.Atoi(fields["pid"])
+	if err != nil || pid <= 0 || fields["starttime"] == "" || fields["pidns"] == "" {
+		return testTempRootOwner{}, fmt.Errorf("incomplete owner marker %q", data)
+	}
+	return testTempRootOwner{PID: pid, StartTime: fields["starttime"], PIDNamespace: fields["pidns"]}, nil
+}
+
+// testTempRootSweep decides which sibling test temp roots are leaked. self
+// supplies this host's boot id and pid namespace; liveness probes an owner
+// (workflow.RuntimeProcessLiveness outside tests).
+type testTempRootSweep struct {
+	self     testTempRootOwner
+	liveness func(pid int, startTime string) (live, known bool)
+}
+
+func newTestTempRootSweep(self testTempRootOwner) testTempRootSweep {
+	return testTempRootSweep{self: self, liveness: workflow.RuntimeProcessLiveness}
+}
+
+// sweepLeakedTestTempRoots removes the leaked gt<8 hex> roots directly under
+// each parent. It is best-effort: a parent it cannot list (a read-only seat's
+// denied /tmp) is skipped, and removal failures come back joined for one
+// stderr line; nothing here may fail the run.
+func sweepLeakedTestTempRoots(parents []string, sweep testTempRootSweep) error {
+	var errs []error
+	for _, parent := range parents {
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			// DirEntry types come from lstat, so a symlink is never a dir here.
+			if !entry.IsDir() || !testTempRootName.MatchString(entry.Name()) {
+				continue
+			}
+			root := filepath.Join(parent, entry.Name())
+			info, err := os.Lstat(root)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+			// Another user's root is not ours to judge, and /tmp's sticky bit
+			// would refuse its removal anyway.
+			if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Getuid() {
+				continue
+			}
+			if !sweep.leaked(root) {
+				continue
+			}
+			if err := removeTestTempRoot(root); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// leaked keeps a root unless its marker proves the owner gone. Only an owner
+// in this run's pid namespace is judged at all: a pid from another namespace
+// (a container sharing /tmp) cannot be probed from here. Within the namespace
+// the owner is gone when its pid no longer exists or names another process (a
+// different /proc start time, which also covers a pid reused after a reboot).
+// No boot id is compared: a container can virtualize it, so a different boot
+// id does not prove a different boot. A root without a readable, complete
+// marker is kept: its age says nothing about whether a run still uses it (a
+// `-timeout 0` or paused run outlives any grace period, and nested writes do
+// not refresh the root's mtime), so a legacy root from before markers is never
+// swept.
+func (s testTempRootSweep) leaked(root string) bool {
+	owner, err := readTestTempRootOwner(root)
+	if err != nil || owner.PIDNamespace != s.self.PIDNamespace {
+		return false
+	}
+	live, known := s.liveness(owner.PID, owner.StartTime)
+	return known && !live
 }
 
 var readOnlySeatLaunch struct {
