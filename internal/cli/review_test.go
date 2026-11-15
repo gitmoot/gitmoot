@@ -2380,7 +2380,7 @@ func TestReviewRouterInstructionsAcceptVerifiedCIOnlyForChecksTheEnvironmentCann
 	for _, want := range []string{
 		// First half: unrunnable checks, verified exact-head CI, never a block alone.
 		"A check this environment cannot run",
-		"satisfied by a green CI run at the exact reviewed head that you verify yourself",
+		"satisfied by a green exact-head CI job listed in the host-fetched CI evidence block below, or one you verify yourself",
 		"the run's head SHA equals the head above, the job's conclusion is success, and the job actually builds or tests the changed paths",
 		"never block or request changes for that reason alone",
 		// The entry format the evidence ceiling recognizes (#2522 review).

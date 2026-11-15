@@ -997,25 +997,12 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	if noExecution {
 		// #2364: the seat must be the no-execution read-only wrapper; anything
 		// else would run the runtime without the exec supervisor.
-		stateAdapter, ok := adapter.(readOnlyRuntimeAdapter)
-		var briefErr error
-		if !ok {
-			briefErr = fmt.Errorf("no-execution review requires the local read-only seat, got %T", adapter)
-		} else {
-			var client staticReviewCIGitHub
-			client, briefErr = w.staticReviewCIClient(checkout, jobRunner)
-			if briefErr == nil {
-				evidenceCtx, cancelEvidence := context.WithTimeout(ctx, 60*time.Second)
-				stateAdapter.staticReviewBrief = staticReviewBrief(staticReviewEvidence(evidenceCtx, client, payload.Repo, payload.HeadSHA))
-				cancelEvidence()
-				adapter = stateAdapter
-			}
-		}
-		if briefErr != nil {
-			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, briefErr); finishErr != nil {
+		if _, ok := adapter.(readOnlyRuntimeAdapter); !ok {
+			seatErr := fmt.Errorf("no-execution review requires the local read-only seat, got %T", adapter)
+			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, seatErr); finishErr != nil {
 				return finishErr
 			}
-			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, briefErr)
+			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, seatErr)
 			return nil
 		}
 	}
@@ -1104,6 +1091,20 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	if execBackend == execbackend.Remote {
 		adapter = w.guardRemoteReviewEvidence(adapter, lifecycle, instance, job.ID, payload)
 		adapter = w.guardRemoteReviewRelatedPRs(adapter, lifecycle, instance, job.ID, payload)
+	}
+	if job.Type == "review" || noExecution {
+		// #2364, #2664: every review, local or remote, executed or not, gets
+		// the exact-head CI evidence the host fetched with its OWN GitHub
+		// credentials. A read-only seat has none, by design, so on a private
+		// repository this is the only CI it can see; the seat still gets no
+		// token. Fetched last, after every pre-delivery refusal, and never a
+		// reason to fail the review.
+		evidence := w.reviewCIEvidence(ctx, checkout, jobRunner, payload.Repo, payload.HeadSHA)
+		brief := hostCIEvidenceBrief(evidence)
+		if noExecution {
+			brief = staticReviewBrief(evidence)
+		}
+		adapter = reviewCIBriefAdapter{inner: adapter, brief: brief}
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
 	// Wire the PRE-TERMINAL operational-blocker deferrer (#532 slice E) on the LIVE
@@ -1344,10 +1345,6 @@ type readOnlyRuntimeAdapter struct {
 	// the daemon-only run dir for this job and removed with it.
 	cleanupLaunch string
 	ompSession    *readOnlyOmpBrokerSession
-	// staticReviewBrief is appended to the prompt of a no-execution review
-	// (#2364): the statement that this seat cannot run anything, and the
-	// exact-head CI evidence the host fetched for it.
-	staticReviewBrief string
 }
 
 func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
@@ -1369,9 +1366,6 @@ func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent
 		if _, err := a.ompSession.prepare(model); err != nil {
 			return runtime.Result{}, err
 		}
-	}
-	if a.staticReviewBrief != "" {
-		job.Prompt = strings.TrimRight(job.Prompt, "\n") + "\n\n" + a.staticReviewBrief
 	}
 	// Mailbox repair turns reuse this adapter. Keep its isolated credentials and
 	// session state until RunJob returns; the worker owns job-boundary cleanup.

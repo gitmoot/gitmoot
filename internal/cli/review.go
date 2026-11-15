@@ -1554,8 +1554,14 @@ func reviewRouterInstructions(purpose, repo string, pullRequest int, head string
 	// by green exact-head CI the reviewer verifies itself, never a block on its
 	// own; real execution stays required for everything the environment can
 	// run and wherever CI did not run the changed code.
+	//
+	// A READ-ONLY SEAT CANNOT VERIFY PRIVATE CI ITSELF (#2664): it has no
+	// GitHub credential, by design, so a private repository's Actions runs are
+	// 404 to it. The worker appends the exact-head CI evidence the host fetched
+	// with its own credentials to every review, and a green job listed there
+	// counts as verified.
 	evidence := "Independently execute substantive focused checks that exercise the changed production code (build, vet, and the tests covering the changed paths) wherever this review environment can run them; do not approve on static reading alone. " +
-		"A check this environment cannot run (its platform toolchain or runtime is absent, for example Xcode or a Windows host) is satisfied by a green CI run at the exact reviewed head that you verify yourself: the run's head SHA equals the head above, the job's conclusion is success, and the job actually builds or tests the changed paths. " +
+		"A check this environment cannot run (its platform toolchain or runtime is absent, for example Xcode or a Windows host) is satisfied by a green exact-head CI job listed in the host-fetched CI evidence block below, or one you verify yourself: the run's head SHA equals the head above, the job's conclusion is success, and the job actually builds or tests the changed paths. " +
 		"Record each such check as its own tests_run entry in the form \"CI-verified: <check> -> success; run <run id> job <job id>\" and nothing else in that entry; put why it cannot run here in checks_blocked and the summary, list the checks you ran yourself as separate tests_run entries, and never block or request changes for that reason alone. " +
 		"Real execution is still required for every check this environment can run, and a changed path that no green exact-head CI job exercised is not CI-verified. " +
 		"Return evidence=executed with a nonempty tests_run naming the exact commands and outcomes, and an evidence locator for every finding."
