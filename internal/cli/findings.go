@@ -337,22 +337,37 @@ type findingsObligationsReport struct {
 	Advisory bool `json:"advisory"`
 }
 
-// ledgerObligationsAtHead is runFindingsObligations' question asked by another
-// command (#2653: `review request --supersede` of an approval). It builds the
-// scope through the same constructor and declaration so both commands list the
-// same obligations; a missing checkout only weakens the resolvers, as there.
+// findingsLedgerScope is the one place this binary builds the merge gate's
+// ledger question for a pull request outside the daemon: its stored
+// observations, the gate's own resolvers (daemonLedgerResolvers over the
+// registered host checkout), and the repository's findings_consumption
+// declaration. `gitmoot findings --at-head` and `review request --supersede` of
+// an approval (#2653) both ask through it, so they cannot answer differently.
+// checkoutErr reports a missing registered checkout: a degradation that only
+// weakens the resolvers, never a failure.
+func findingsLedgerScope(ctx context.Context, store *db.Store, home, repo string, pullRequest int) (rows []db.ReviewFindingObservation, resolvers workflow.LedgerResolvers, scope workflow.LedgerScope, checkoutErr error, err error) {
+	rows, err = store.ListReviewFindingObservations(ctx, repo, int64(pullRequest))
+	if err != nil {
+		return nil, workflow.LedgerResolvers{}, workflow.LedgerScope{}, nil, err
+	}
+	checkout, checkoutErr := mergeGateCheckout(ctx, store, repo, "")
+	if checkoutErr != nil {
+		checkout = ""
+	}
+	resolvers = daemonLedgerResolvers(github.NewClient(checkout), checkout, subprocess.ExecRunner{})
+	scope = resolvers.ScopeFor(repo, pullRequest, "")
+	scope.Repo = repo
+	scope.FindingsAdvisory = loadReviewConfig(home).For(repo).FindingsAreAdvisory()
+	return rows, resolvers, scope, checkoutErr, nil
+}
+
+// ledgerObligationsAtHead is runFindingsObligations' question asked by `review
+// request --supersede` of an approval (#2653).
 func ledgerObligationsAtHead(ctx context.Context, store *db.Store, home, repo string, pullRequest int, head string) ([]workflow.LedgerObligation, error) {
-	rows, err := store.ListReviewFindingObservations(ctx, repo, int64(pullRequest))
+	rows, _, scope, _, err := findingsLedgerScope(ctx, store, home, repo, pullRequest)
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
-	checkout, err := mergeGateCheckout(ctx, store, repo, "")
-	if err != nil {
-		checkout = ""
-	}
-	scope := daemonLedgerResolvers(github.NewClient(checkout), checkout, subprocess.ExecRunner{}).ScopeFor(repo, pullRequest, "")
-	scope.Repo = repo
-	scope.FindingsAdvisory = loadReviewConfig(home).For(repo).FindingsAreAdvisory()
 	return workflow.LedgerObligationsAtHead(ctx, rows, head, scope), nil
 }
 
@@ -371,10 +386,11 @@ func runFindingsObligations(repo string, pullRequest int, head string, home stri
 	report := findingsObligationsReport{Repo: repo, PullRequest: pullRequest, Head: head, Obligations: []findingsObligation{}}
 
 	var rows []db.ReviewFindingObservation
-	var checkout string
+	var resolvers workflow.LedgerResolvers
+	var scope workflow.LedgerScope
 	if err := withStoreAndPaths(home, func(_ config.Paths, store *db.Store) error {
-		var err error
-		rows, err = store.ListReviewFindingObservations(ctx, repo, int64(pullRequest))
+		var checkoutErr, err error
+		rows, resolvers, scope, checkoutErr, err = findingsLedgerScope(ctx, store, home, repo, pullRequest)
 		if err != nil {
 			return err
 		}
@@ -390,11 +406,9 @@ func runFindingsObligations(repo string, pullRequest int, head string, home stri
 		//
 		// So this reports only what it knows: the checkout is missing. What that
 		// costs is derived below, from the resolvers that actually exist.
-		checkout, err = mergeGateCheckout(ctx, store, repo, "")
-		if err != nil {
+		if checkoutErr != nil {
 			report.Degradations = append(report.Degradations,
-				fmt.Sprintf("no registered checkout for %s: %v", repo, err))
-			checkout = ""
+				fmt.Sprintf("no registered checkout for %s: %v", repo, checkoutErr))
 		}
 		return nil
 	}); err != nil {
@@ -402,8 +416,6 @@ func runFindingsObligations(repo string, pullRequest int, head string, home stri
 		return 1
 	}
 
-	resolvers := daemonLedgerResolvers(github.NewClient(checkout), checkout, subprocess.ExecRunner{})
-	scope := resolvers.ScopeFor(repo, pullRequest, "")
 	// #2099 f1: CARRY THE REPOSITORY'S DECLARATION, BECAUSE THE GATE DOES.
 	//
 	// The production path resolves findings_consumption into
@@ -431,10 +443,9 @@ func runFindingsObligations(repo string, pullRequest int, head string, home stri
 		report.Degradations = append(report.Degradations,
 			"no locator resolver, so a STATIC answer citing a deleted path still counts as an answer")
 	}
-	advisory := loadReviewConfig(home).For(repo).FindingsAreAdvisory()
-	report.Advisory = advisory
-	scope.FindingsAdvisory = advisory
-	scope.Repo = repo
+	// findingsLedgerScope already copied the declaration onto the scope; the
+	// report carries it too.
+	report.Advisory = scope.FindingsAdvisory
 	scope.Degraded = func(note string) {
 		report.Degradations = append(report.Degradations, note)
 	}
@@ -459,7 +470,7 @@ func runFindingsObligations(repo string, pullRequest int, head string, home stri
 
 	if len(report.Obligations) == 0 {
 		fmt.Fprintf(stdout, "no obligations for %s#%d at %s\n", repo, pullRequest, shortFindingsHead(head))
-	} else if advisory {
+	} else if report.Advisory {
 		fmt.Fprintf(stdout, "%s declares findings_consumption = advisory: the merge gate WAIVES these and does not hold the merge.\n", repo)
 		fmt.Fprintln(stdout, "They are listed because advisory means recorded, not invisible.")
 	}
