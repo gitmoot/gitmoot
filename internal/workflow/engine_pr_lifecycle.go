@@ -493,9 +493,10 @@ func (e Engine) HandlePullRequestReadyToMergeDecision(ctx context.Context, event
 // clean closed-unmerged detection resolves pr_open/reviewing/changes_requested/
 // awaiting_human_merge, plus branchless ready_to_merge tasks, to blocked; a
 // review task with no live job is retired to dismissed instead (#2668). An
-// already-blocked branchless task is accepted to repair its stale PR mirror
-// (and, for a review task, to retire it). The daemon's closed-PR reconcile pass
-// owns that transition.
+// already-blocked branchless task is accepted to repair its stale PR mirror;
+// an already-blocked review task, with or without a branch, is accepted to
+// retire it once no job is live. The daemon's closed-PR reconcile passes own
+// those transitions.
 // Existing PR row fields (url/base/merge SHA) are preserved.
 func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullRequestEvent, merged bool) error {
 	if err := e.validate(); err != nil {
@@ -533,7 +534,7 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 				return nil
 			}
 		case TaskBlocked:
-			if strings.TrimSpace(task.Branch) != "" {
+			if strings.TrimSpace(task.Branch) != "" && !IsReviewRecordTask(task) {
 				return nil
 			}
 			alreadyBlocked = true

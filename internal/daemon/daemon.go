@@ -726,9 +726,10 @@ func taskEventIsBlocking(event db.TaskEvent) bool {
 // tasks, whose PR was merged outside Gitmoot. It uses targeted single-PR reads
 // rather than a closed list, so old wedged tasks are not hidden by GitHub
 // pagination. Empty-branch local review tasks are keyed by their durable
-// review-pr-<number>-<hash> id. Closed-unmerged responses are deliberately
-// ignored here; the existing reviewing/ready-to-merge paths retain their current
-// semantics.
+// review-pr-<number>-<hash> id. A closed-unmerged response resolves only what
+// no other pass reaches: a branchless ready task's retained merge claim, and a
+// blocked or branchless review record, which is retired (#2668). Branch-bearing
+// implementation tasks keep the reviewing/ready-to-merge paths' semantics.
 func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumbers map[int64]struct{}) error {
 	if d.Workflow == nil {
 		return nil
@@ -847,10 +848,13 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 		group.tasks = matched
 		if !pullRequestListedAsMerged(pull) {
 			// The PR left the open set without merging. Closed branch-bearing
-			// lifecycle tasks remain owned by their dedicated reconciliation
-			// passes. A branchless ready task has no path through those branch
-			// indexes, so resolve its retained merge claim here before applying
-			// the terminal non-merge transition.
+			// lifecycle implementation tasks remain owned by their dedicated
+			// reconciliation passes. A branchless ready task has no path through
+			// those branch indexes, so resolve its retained merge claim here
+			// before applying the terminal non-merge transition. A review record
+			// that is blocked or branchless has no other pass either, so it is
+			// handed to the close handler here, which retires it once no job is
+			// live (#2668); a later poll retires one whose job was still live.
 			if strings.EqualFold(strings.TrimSpace(pull.State), "closed") {
 				if _, err := workflow.RecordPullRequestWorkflowTransition(ctx, d.Store, workflow.PullRequestEvent{
 					Repo:        d.Repo.FullName(),
@@ -860,7 +864,11 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 					d.logf("workflow journal PR-closed breadcrumb failed for %s#%d: %v", d.Repo.FullName(), group.number, err)
 				}
 				for _, task := range group.tasks {
-					if task.State != string(workflow.TaskReadyToMerge) || strings.TrimSpace(task.Branch) != "" {
+					branchless := strings.TrimSpace(task.Branch) == ""
+					retainedClaim := task.State == string(workflow.TaskReadyToMerge) && branchless
+					closedReview := workflow.IsReviewRecordTask(task) &&
+						(task.State == string(workflow.TaskBlocked) || (branchless && task.State != string(workflow.TaskReadyToMerge)))
+					if !retainedClaim && !closedReview {
 						continue
 					}
 					event, eventErr := d.reconciledPullRequestEvent(ctx, pull, task, group.number)
@@ -870,13 +878,15 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 						}
 						continue
 					}
-					if _, _, recoverErr := d.Store.RecoverClaimedTaskState(ctx, task.ID,
-						string(workflow.TaskBlocked), workflow.TaskEventPullRequestClosedUnmerged,
-						fmt.Sprintf("pull request #%d closed without merging while holding a retained merge claim", group.number)); recoverErr != nil {
-						if firstErr == nil {
-							firstErr = recoverErr
+					if retainedClaim {
+						if _, _, recoverErr := d.Store.RecoverClaimedTaskState(ctx, task.ID,
+							string(workflow.TaskBlocked), workflow.TaskEventPullRequestClosedUnmerged,
+							fmt.Sprintf("pull request #%d closed without merging while holding a retained merge claim", group.number)); recoverErr != nil {
+							if firstErr == nil {
+								firstErr = recoverErr
+							}
+							continue
 						}
-						continue
 					}
 					if closeErr := d.Workflow.HandleReviewPullRequestClosed(ctx, event, false); closeErr != nil && firstErr == nil {
 						firstErr = closeErr

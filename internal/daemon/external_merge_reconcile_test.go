@@ -790,3 +790,66 @@ func assertExternalMergeState(t *testing.T, store *db.Store, repo, taskID string
 		t.Fatalf("PR #%d = %+v, err=%v; want state %s", number, pr, err, prState)
 	}
 }
+
+// TestPollOnceRetiresClosedUnmergedReviewRecords covers #2668 at the poll: a
+// review record whose PR closed unmerged is retired to dismissed whether it is
+// already blocked with a branch, or branchless; one whose review job is still
+// live is parked blocked and retires on a later poll once the job settles.
+func TestPollOnceRetiresClosedUnmergedReviewRecords(t *testing.T) {
+	tests := []struct {
+		name    string
+		state   workflow.TaskState
+		branch  string
+		liveJob bool
+	}{
+		{name: "blocked with a branch", state: workflow.TaskBlocked, branch: "feature/seven"},
+		{name: "branchless reviewing", state: workflow.TaskReviewing},
+		{name: "reviewing while its job is live", state: workflow.TaskReviewing, branch: "feature/seven", liveJob: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := github.Repository{Owner: "owner", Name: "repo"}
+			store := testStore(t)
+			const taskID = "review-pr-7-0a1b2c3d"
+			if err := store.UpsertTask(ctx, db.Task{ID: taskID, RepoFullName: repo.FullName(), GoalID: "local-review",
+				Title: "Review PR #7", State: string(test.state), Branch: test.branch}); err != nil {
+				t.Fatal(err)
+			}
+			if test.branch != "" {
+				if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: repo.FullName(), Number: 7,
+					HeadBranch: test.branch, BaseBranch: "main", HeadSHA: "head-7", State: "open"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.liveJob {
+				if err := store.CreateJob(ctx, db.Job{ID: "review-job-7", Agent: "reviewer", Type: "review", State: string(workflow.JobRunning),
+					Payload: `{"repo":"owner/repo","pull_request":7,"task_id":"` + taskID + `"}`}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			closed := github.PullRequest{Number: 7, State: "closed", HeadRef: "feature/seven", BaseRef: "main", HeadSHA: "head-7"}
+			client := &fakeGitHub{
+				pullsByState:  map[string][]github.PullRequest{"open": nil, "closed": {closed}},
+				pullsByNumber: map[int64]github.PullRequest{7: closed},
+				comments:      map[int64][]github.IssueComment{},
+			}
+			engine := workflow.Engine{Store: store}
+			daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+			if err := daemon.PollOnce(ctx); err != nil {
+				t.Fatalf("PollOnce: %v", err)
+			}
+			if test.liveJob {
+				assertExternalMergeState(t, store, repo.FullName(), taskID, 7, workflow.TaskBlocked, "closed")
+				if err := store.UpdateJobState(ctx, "review-job-7", string(workflow.JobSucceeded)); err != nil {
+					t.Fatal(err)
+				}
+				if err := daemon.PollOnce(ctx); err != nil {
+					t.Fatalf("PollOnce after the job settled: %v", err)
+				}
+			}
+			assertExternalMergeState(t, store, repo.FullName(), taskID, 7, workflow.TaskDismissed, "closed")
+		})
+	}
+}

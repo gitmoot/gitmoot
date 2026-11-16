@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,42 +41,8 @@ func TestBlockedTaskAlertGoesToTheTasksOwnRole(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			home := t.TempDir()
-			paths := config.PathsForHome(home)
-			if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			const orgConfig = `
-[org.roles."owner"]
-scope=["gitmoot/*", "oversight/*"]
-pane="w1:p1"
-[org.roles."lane"]
-parent="owner"
-scope=["gitmoot/gitmoot"]
-pane="w1:p2"
-[org.roles."jarvis"]
-parent="owner"
-scope=["oversight/*"]
-pane="w1:p4"
-`
-			if err := os.WriteFile(paths.ConfigFile, []byte(orgConfig), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			store, err := dbtest.Open(t, paths.Database)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer store.Close()
+			home, store := blockedTaskRoutingFixture(t)
 			ctx := context.Background()
-			for _, rule := range []db.EventRule{
-				{ID: "addressed-lane", OnKind: "blocked", WakeRole: "lane", Scope: db.EventRuleScopeAddressed, Enabled: true},
-				{ID: "addressed-owner", OnKind: "blocked", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
-				{ID: "observer-jarvis", OnKind: "blocked", WakeRole: "jarvis", Scope: db.EventRuleScopeObserver, Enabled: true},
-			} {
-				if err := store.AddEventRule(ctx, rule); err != nil {
-					t.Fatal(err)
-				}
-			}
 
 			taskID := "review-pr-7-0a1b2c3d"
 			if err := store.UpsertTask(ctx, db.Task{ID: taskID, RepoFullName: repo, GoalID: "local-review", State: string(workflow.TaskBlocked)}); err != nil {
@@ -112,6 +81,50 @@ pane="w1:p4"
 			}
 		})
 	}
+}
+
+// blockedTaskRoutingFixture is an org where "lane" (child of "owner", scoped to
+// exactly gitmoot/gitmoot) is that repo's most specific owner, "jarvis"
+// observes, and "retired" has an addressed rule but no seat.
+func blockedTaskRoutingFixture(t *testing.T) (string, *db.Store) {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const orgConfig = `
+[org.roles."owner"]
+scope=["gitmoot/*", "oversight/*"]
+pane="w1:p1"
+[org.roles."lane"]
+parent="owner"
+scope=["gitmoot/gitmoot"]
+pane="w1:p2"
+[org.roles."jarvis"]
+parent="owner"
+scope=["oversight/*"]
+pane="w1:p4"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(orgConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	for _, rule := range []db.EventRule{
+		{ID: "addressed-lane", OnKind: "blocked", WakeRole: "lane", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "addressed-owner", OnKind: "blocked", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "addressed-retired", OnKind: "blocked", WakeRole: "retired", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "observer-jarvis", OnKind: "blocked", WakeRole: "jarvis", Scope: db.EventRuleScopeObserver, Enabled: true},
+	} {
+		if err := store.AddEventRule(context.Background(), rule); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return home, store
 }
 
 // TestClosedUnmergedReviewTaskIsRetiredAndRebindsOnReopen covers #2668: the
@@ -153,5 +166,49 @@ func TestClosedUnmergedReviewTaskIsRetiredAndRebindsOnReopen(t *testing.T) {
 	if err != nil || request.TaskID == taskID || db.TaskSuccessorRoot(request.TaskID) != taskID ||
 		successor.State != string(workflow.TaskReviewing) || successor.Branch != "feature/review" {
 		t.Fatalf("review after reopen bound to %+v, err=%v", successor, err)
+	}
+}
+
+// TestBlockedTaskAlertRoleIsValidatedNotRederived covers #2668's routing
+// contract: the sink honours a blocked-since digest's producer-resolved role
+// only while it is on the live roster, otherwise the repo owner gets it.
+func TestBlockedTaskAlertRoleIsValidatedNotRederived(t *testing.T) {
+	home, store := blockedTaskRoutingFixture(t)
+	ctx := context.Background()
+	sink := &eventRuleSink{store: store, home: home}
+	sink.Emit(ctx, events.Event{Type: events.EventJobBlocked, Cause: "blocked_since", JobID: "task-1",
+		Repo: "gitmoot/gitmoot", WakeTargetRole: "retired"})
+	if got, want := pendingWakeTargetRoles(t, store), []string{"jarvis", "lane"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("blocked task wake targets = %v, want %v", got, want)
+	}
+}
+
+// TestBlockedTaskAlertAttributionErrorGoesToRepoOwner is a guard: a task whose
+// attribution cannot be read is reported and alerted to the repo owner, never
+// dropped.
+func TestBlockedTaskAlertAttributionErrorGoesToRepoOwner(t *testing.T) {
+	home, store := blockedTaskRoutingFixture(t)
+	ctx := context.Background()
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "gitmoot/gitmoot", State: string(workflow.TaskBlocked)}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, `ALTER TABLE review_requests RENAME TO review_requests_unreadable`); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	sink := &eventRuleSink{store: store, home: home}
+	if err := evaluateBlockedTaskEpisodes(ctx, store, sink, "gitmoot/gitmoot", time.Hour, &stdout, time.Now().UTC().Add(2*time.Hour)); err != nil {
+		t.Fatalf("evaluateBlockedTaskEpisodes: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "task-1") {
+		t.Fatalf("attribution failure not reported: %q", stdout.String())
+	}
+	if got, want := pendingWakeTargetRoles(t, store), []string{"jarvis", "lane"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("blocked task wake targets = %v, want %v", got, want)
 	}
 }

@@ -278,15 +278,19 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 	}
 	if len(digestItems) > 0 {
 		sortBlockedTaskDigestItems(digestItems)
-		// One digest per attributed role (#2668): the sink addresses a digest by
-		// its oldest task's attribution, so a digest mixing tasks of different
-		// requesters would alert one of them about the others' work.
+		// One digest per attributed role (#2668), addressed to that role: a
+		// digest mixing tasks of different requesters would alert one of them
+		// about the others' work. The sink only validates the role against the
+		// live roster; it never re-derives it.
 		var order []string
 		groups := map[string][]blockedTaskDigestItem{}
 		for _, item := range digestItems {
 			role, err := blockedTaskAttributedRole(ctx, store, blockedSubjects[taskEpisodeSubject(repo, item.taskID)])
 			if err != nil {
-				writeLine(stdout, "blocked_since task %s attribution failed: %v", item.taskID, err)
+				// Attribution unknown is not "no attribution": say so, then route
+				// the task to the repo owner exactly as an unattributed task.
+				writeLine(stdout, "blocked_since task %s attribution lookup failed, alerting the repo owner: %v", item.taskID, err)
+				role = ""
 			}
 			if _, seen := groups[role]; !seen {
 				order = append(order, role)
@@ -294,7 +298,9 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 			groups[role] = append(groups[role], item)
 		}
 		for _, role := range order {
-			events.EmitEvent(ctx, sink, buildBlockedTaskDigestEvent(repo, groups[role], now))
+			ev := buildBlockedTaskDigestEvent(repo, groups[role], now)
+			ev.WakeTargetRole = role
+			events.EmitEvent(ctx, sink, ev)
 		}
 	}
 	for _, item := range exhaustedItems {
