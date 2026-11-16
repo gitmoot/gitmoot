@@ -271,10 +271,10 @@ const legacyUnlabelledGraphGolden = `{
 }
 `
 
-// TestDashboardWorkflowsTransitionAlias pins the one-release #2596 alias: the
-// fleet-tools probes still curl /api/workflows, so it answers with the
-// /api/campaigns body while every other pre-#2603 route is gone.
-func TestDashboardWorkflowsTransitionAlias(t *testing.T) {
+// TestDashboardPreRenameRoutesAreGone: /api/campaigns serves campaigns, and
+// every pre-rename route, including the one-release /api/workflows alias
+// (#2596, removed in #2643), answers 404.
+func TestDashboardPreRenameRoutesAreGone(t *testing.T) {
 	home := dashboardTestHome(t)
 	handler := newDashboardWebHandler(&webDataSource{home: home})
 	get := func(path string) *httptest.ResponseRecorder {
@@ -282,11 +282,10 @@ func TestDashboardWorkflowsTransitionAlias(t *testing.T) {
 		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
 		return rr
 	}
-	campaigns, alias := get("/api/campaigns"), get("/api/workflows")
-	if campaigns.Code != http.StatusOK || alias.Code != http.StatusOK || campaigns.Body.String() != alias.Body.String() {
-		t.Fatalf("/api/workflows alias = %d %q, want /api/campaigns %d %q", alias.Code, alias.Body.String(), campaigns.Code, campaigns.Body.String())
+	if rr := get("/api/campaigns"); rr.Code != http.StatusOK {
+		t.Fatalf("GET /api/campaigns status = %d, want 200", rr.Code)
 	}
-	for _, path := range []string{"/api/jobs", "/api/job/x", "/api/job/x/checks", "/api/agents", "/api/agent/x", "/api/tasks", "/api/workflow/x"} {
+	for _, path := range []string{"/api/workflows", "/api/jobs", "/api/job/x", "/api/job/x/checks", "/api/agents", "/api/agent/x", "/api/tasks", "/api/workflow/x"} {
 		if rr := get(path); rr.Code != http.StatusNotFound {
 			t.Fatalf("GET %s status = %d, want 404", path, rr.Code)
 		}

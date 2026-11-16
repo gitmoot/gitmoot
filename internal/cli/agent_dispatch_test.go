@@ -1044,7 +1044,7 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	if code := runAgentReview([]string{
 		"dual-reviewer", message, "--repo", "owner/repo", "--pr", "12",
 		"--head-sha", head, "--branch", "feature/review",
-		"--org-role", "joltra", "--model", "openai-codex/gpt-5.6-sol", "--workflow", "release/queue",
+		"--org-role", "joltra", "--model", "openai-codex/gpt-5.6-sol", "--campaign", "release/queue",
 		"--effort", "high", "--home", home,
 		"--exec-backend", "remote",
 	}, &stdout, &stderr); code != 0 {

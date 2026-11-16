@@ -1792,7 +1792,7 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 		printMessageActionUsage(stdout, "escalate")
 		return 0
 	}
-	question, flagArgs, ok := orgAddressedTextAndFlags(args, stderr)
+	question, flagArgs, ok := orgAddressedTextAndFlags(args)
 	if !ok {
 		fmt.Fprintln(stderr, "message escalate requires exactly one question")
 		return 2
@@ -1960,13 +1960,9 @@ func orgEscalateResolveIDAndFlags(args []string) (string, []string, bool) {
 	return strings.TrimSpace(args[idIndex]), flagArgs, strings.TrimSpace(args[idIndex]) != ""
 }
 
-func orgAddressedTextAndFlags(args []string, stderr io.Writer) (string, []string, bool) {
+func orgAddressedTextAndFlags(args []string) (string, []string, bool) {
 	needsValue := map[string]bool{"--home": true, "--to": true, "--campaign": true, "--role": true, "--repo": true}
-	args = append([]string(nil), args...)
 	for i := 0; i < len(args); i++ {
-		if i != len(args)-1 && strings.HasPrefix(args[i], "-") {
-			args[i] = renameFlagToken(args[i], stderr, FlagAlias{Old: "workflow", New: "campaign"})
-		}
 		arg := args[i]
 		if needsValue[arg] {
 			i++

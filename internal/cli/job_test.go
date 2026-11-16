@@ -686,7 +686,7 @@ func TestTranscriptRetentionForegroundAndDaemonShellE2E(t *testing.T) {
 	seedDaemonWorkerAgent(t, store, "capture-shell", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo")
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "ask", "capture-shell", "foreground", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	code := Run([]string{"ask", "capture-shell", "foreground", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("foreground ask code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
@@ -701,7 +701,7 @@ func TestTranscriptRetentionForegroundAndDaemonShellE2E(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "ask", "capture-shell", "background", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	code = Run([]string{"ask", "capture-shell", "background", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("background enqueue code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
@@ -860,7 +860,7 @@ func TestRunJobCancelBulkFiltersCompose(t *testing.T) {
 	// --older-than in Go-duration form (168h == 7d) composed with repo + agent:
 	// only blocked-old-a is owner/repo + audit + old enough.
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"run", "cancel", "--home", home, "--state", "blocked", "--older-than", "168h", "--repo", "owner/repo", "--agent", "audit"}, &stdout, &stderr)
+	code := Run([]string{"run", "cancel", "--home", home, "--state", "blocked", "--older-than", "168h", "--repo", "owner/repo", "--reviewer", "audit"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("bulk compose exit code = %d, stderr=%s", code, stderr.String())
 	}

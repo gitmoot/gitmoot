@@ -51,16 +51,16 @@ func TestFreeTextCommandsPrintHelpAndSaveNothing(t *testing.T) {
 		{"campaign-close", func(h string) []string { return []string{"campaign", "close", "wf-1", "--reason", h} }, "campaign close"},
 		{"pr-successor", func(h string) []string { return []string{"pr", "successor", "t-1", "--reason", h} }, "pr successor"},
 		{"job-open", func(h string) []string {
-			return []string{"run", "open", "--agent", "a", "--repo", "o/r", "--type", "implement", "--title", h}
+			return []string{"run", "open", "--implementer", "a", "--repo", "o/r", "--type", "implement", "--title", h}
 		}, "run open"},
 		{"job-close", func(h string) []string {
 			return []string{"run", "close", "job-1", "--decision", "approve", "--summary", h}
 		}, "run close"},
 		{"job-record", func(h string) []string {
-			return []string{"run", "record", "--agent", "a", "--repo", "o/r", "--type", "implement", "--decision", "approve", "--summary", h}
+			return []string{"run", "record", "--implementer", "a", "--repo", "o/r", "--type", "implement", "--decision", "approve", "--summary", h}
 		}, "run record"},
 		{"agent-ask", func(h string) []string { return []string{"ask", "a", h} }, "gitmoot ask"},
-		{"agent-review", func(h string) []string { return []string{"reviewer", "review", "a", h, "--repo", "o/r", "--pr", "1"} }, "agent review"},
+		{"reviewer-review", func(h string) []string { return []string{"reviewer", "review", "a", h, "--repo", "o/r", "--pr", "1"} }, "reviewer review"},
 		{"org-events-rule-add", func(h string) []string {
 			return []string{"org", "events", "rule", "add", "--on", "reply", "--match", h, "--wake", "deimos"}
 		}, "org events rule add"},
@@ -101,9 +101,9 @@ func TestFreeTextCommandsRefuseFlagLikeText(t *testing.T) {
 		{"campaign", "register", "wf-1", "-x"},
 		{"campaign", "close", "wf-1", "--reason", "-x"},
 		{"pr", "successor", "t-1", "--reason", "-x"},
-		{"run", "open", "--agent", "a", "--repo", "o/r", "--type", "implement", "--title", "-x"},
+		{"run", "open", "--implementer", "a", "--repo", "o/r", "--type", "implement", "--title", "-x"},
 		{"run", "close", "job-1", "--decision", "approve", "--summary", "-x"},
-		{"run", "record", "--agent", "a", "--repo", "o/r", "--type", "implement", "--decision", "approve", "--summary", "-x"},
+		{"run", "record", "--implementer", "a", "--repo", "o/r", "--type", "implement", "--decision", "approve", "--summary", "-x"},
 		{"ask", "a", "--bogus"},
 		{"org", "events", "rule", "add", "--on", "reply", "--match", "-x", "--wake", "deimos"},
 	} {

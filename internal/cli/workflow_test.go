@@ -189,23 +189,6 @@ func TestPRListAndShowJoinTasksAndPullRequests(t *testing.T) {
 	}
 }
 
-// TestTaskCommandAliasStillWorks pins the one-release transition alias.
-func TestTaskCommandAliasStillWorks(t *testing.T) {
-	home := t.TempDir()
-	store := openCLIJobStore(t, home)
-	if err := store.UpsertTask(context.Background(), db.Task{ID: "review-pr-3-ab", RepoFullName: "o/r", State: "reviewing"}); err != nil {
-		t.Fatalf("UpsertTask: %v", err)
-	}
-	store.Close()
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"task", "list", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("task list alias exit = %d, stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "review-pr-3-ab") || !strings.Contains(stderr.String(), `"task" is now "pr"`) {
-		t.Fatalf("task alias: stdout=%q stderr=%q", stdout.String(), stderr.String())
-	}
-}
-
 func TestTaskBranchNameFallsBackToTaskID(t *testing.T) {
 	if got := taskBranchName("task-001", "!!!"); got != "task-001" {
 		t.Fatalf("taskBranchName returned %q, want task-001", got)

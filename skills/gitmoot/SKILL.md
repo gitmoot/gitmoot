@@ -44,9 +44,9 @@ own change.
 - **note**: a durable entry in a campaign's journal
   (`gitmoot note add <campaign> "text"`).
 
-**Renamed in this release.** Old names still work for one release; each prints
-a notice such as `"job" is now "run"`. Commands below drop the `gitmoot`
-prefix.
+**Renamed.** The old names below were removed after one transition release:
+an old command now fails as an unknown command and an old flag as an unknown
+flag. Commands below drop the `gitmoot` prefix.
 
 | Old | New |
 |---|---|

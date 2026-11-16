@@ -104,8 +104,6 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	// and the "workflows" cache key already includes the workflow-note-id so a
 	// status change busts the cache.
 	mux.HandleFunc("GET /api/campaigns", ds.handleWorkflows)
-	// transition alias for one release (#2596); remove with the old command names
-	mux.HandleFunc("GET /api/workflows", ds.handleWorkflows)
 	registerDashboardCommsRoutes(mux, ds)
 	mux.HandleFunc("GET /api/fleet/activity", ds.handleFleetActivity)
 	mux.HandleFunc("GET /api/fleet/activity/events", ds.handleFleetActivityEvents)

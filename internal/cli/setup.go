@@ -32,7 +32,7 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "agent", New: "reviewer"}); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}

@@ -61,7 +61,7 @@ func TestSessionJobFullChainE2E(t *testing.T) {
 	// --- (a) job open: clock in ---------------------------------------------
 	var openOut bytes.Buffer
 	if code := runJobOpen(append(append([]string{}, homeArgs...),
-		"--agent", "lead", "--repo", "owner/repo", "--type", "implement", "--json"), &openOut, io.Discard); code != 0 {
+		"--implementer", "lead", "--repo", "owner/repo", "--type", "implement", "--json"), &openOut, io.Discard); code != 0 {
 		t.Fatalf("job open exit code = %d, want 0; out=%q", code, openOut.String())
 	}
 	sessionID := decodeSessionJobID(t, openOut.Bytes())

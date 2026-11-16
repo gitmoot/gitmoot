@@ -206,7 +206,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		fs.Int64Var(&before, "before", 0, "older than this message ID")
 		fs.IntVar(&limit, "limit", 20, "page size 1–100")
 	}
-	if err := parseWithFlagAliases(fs, args[positional+1:], stderr, FlagAlias{Old: "workflow", New: "campaign"}); err != nil {
+	if err := fs.Parse(args[positional+1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}

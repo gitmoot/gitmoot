@@ -44,8 +44,8 @@ func TestReviewRunCommandsAreLimitedToReviews(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "show", "ask-run", "--home", home}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "id: ask-run") || !strings.Contains(stderr.String(), `"job" is now "run"`) {
-		t.Fatalf("job show alias: exit = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	if code := Run([]string{"run", "show", "ask-run", "--home", home}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "id: ask-run") {
+		t.Fatalf("run show of an ask run: exit = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 }
 

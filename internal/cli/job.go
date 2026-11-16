@@ -99,7 +99,7 @@ func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string)
 	// failure messages for two different renderings of the same fact.
 	killed := fs.Bool("killed", false, "only runs whose delivery was killed by a signal and which nothing requeued")
 	jsonOutput := fs.Bool("json", false, "print runs (with operational detail) as JSON")
-	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "workflow", New: "campaign"}); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -1163,7 +1163,7 @@ func cancelRun(args []string, stdout, stderr io.Writer, command, onlyType string
 		positional = args[0]
 		parseArgs = args[1:]
 	}
-	if err := parseWithFlagAliases(fs, parseArgs, stderr, FlagAlias{Old: "agent", New: "reviewer"}); err != nil {
+	if err := fs.Parse(parseArgs); err != nil {
 		return 2
 	}
 	extra := fs.Args()
