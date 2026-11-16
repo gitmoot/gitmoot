@@ -491,9 +491,12 @@ func (e Engine) HandlePullRequestReadyToMergeDecision(ctx context.Context, event
 // pr_open/reviewing/changes_requested/ready_to_merge/awaiting_human_merge/blocked;
 // an already-merged task is accepted only to repair its stale PR mirror. A
 // clean closed-unmerged detection resolves pr_open/reviewing/changes_requested/
-// awaiting_human_merge, plus branchless ready_to_merge tasks, to blocked. An
-// already-blocked branchless task is accepted to repair its stale PR mirror.
-// The daemon's closed-PR reconcile pass owns that transition.
+// awaiting_human_merge, plus branchless ready_to_merge tasks, to blocked; a
+// review task with no live job is retired to dismissed instead (#2668). An
+// already-blocked branchless task is accepted to repair its stale PR mirror;
+// an already-blocked review task, with or without a branch, is accepted to
+// retire it once no job is live. The daemon's closed-PR reconcile passes own
+// those transitions.
 // Existing PR row fields (url/base/merge SHA) are preserved.
 func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullRequestEvent, merged bool) error {
 	if err := e.validate(); err != nil {
@@ -531,7 +534,7 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 				return nil
 			}
 		case TaskBlocked:
-			if strings.TrimSpace(task.Branch) != "" {
+			if strings.TrimSpace(task.Branch) != "" && !IsReviewRecordTask(task) {
 				return nil
 			}
 			alreadyBlocked = true
@@ -545,7 +548,19 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 		prState = "merged"
 		nextTaskState = TaskMerged
 	}
-	if !alreadyMerged && !alreadyBlocked {
+	settled := alreadyMerged || alreadyBlocked
+	if !merged && IsReviewRecordTask(task) {
+		retired, lost, err := e.retireClosedReviewTask(ctx, task, event.PullRequest, alreadyBlocked)
+		if err != nil {
+			return err
+		}
+		if lost {
+			// A concurrent lifecycle move won the CAS; see the blocked arm below.
+			return nil
+		}
+		settled = settled || retired
+	}
+	if !settled {
 		stateRef := ref
 		if strings.TrimSpace(task.Branch) == "" {
 			// Legacy/local review-pr tasks intentionally have no branch because the
@@ -560,8 +575,7 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 			}
 		} else {
 			changed, observedState, _, err := e.Store.TransitionTaskStateWithEventObserved(ctx, task.ID,
-				[]string{string(TaskPullRequestOpen), string(TaskReviewing), string(TaskChangesRequested), string(TaskReadyToMerge), string(TaskAwaitingHumanMerge)},
-				string(TaskBlocked), "pr_closed_unmerged", "pull request closed without merging")
+				closedUnmergedFromStates, string(TaskBlocked), TaskEventPullRequestClosedUnmerged, "pull request closed without merging")
 			if err != nil {
 				return err
 			}
@@ -609,6 +623,68 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 	// intentionally swallowed so observability can never undo lifecycle state.
 	_, _ = RecordPullRequestWorkflowTransition(ctx, e.Store, event, transition)
 	return nil
+}
+
+// TaskEventPullRequestClosedUnmerged parks a task blocked because its pull
+// request closed without merging.
+const TaskEventPullRequestClosedUnmerged = "pr_closed_unmerged"
+
+// TaskEventReviewRetiredPullRequestClosed dismisses a review task because its
+// pull request closed without merging (#2668).
+const TaskEventReviewRetiredPullRequestClosed = "review_retired_pr_closed"
+
+// closedUnmergedFromStates are the lifecycle states a closed-unmerged pull
+// request resolves.
+var closedUnmergedFromStates = []string{
+	string(TaskPullRequestOpen), string(TaskReviewing), string(TaskChangesRequested),
+	string(TaskReadyToMerge), string(TaskAwaitingHumanMerge),
+}
+
+// retireClosedReviewTask dismisses a review task whose pull request closed
+// without merging (#2668). No head of that PR will be reviewed or merged again,
+// so parking it blocked only made it a permanent blocked-task alert subject. A
+// task with a live job keeps the blocked parking, so the job's own outcome is
+// never overwritten. fromBlocked retires a task the caller already parked
+// blocked for this close. lost reports a concurrent move that won the CAS. A
+// reopened PR re-binds through the review dispatch's successor path.
+func (e Engine) retireClosedReviewTask(ctx context.Context, task db.Task, number int, fromBlocked bool) (retired, lost bool, err error) {
+	if _, live, err := FindLiveTaskJob(ctx, e.Store, task); err != nil || live {
+		return false, false, err
+	}
+	from := closedUnmergedFromStates
+	if fromBlocked {
+		from = []string{string(TaskBlocked)}
+	}
+	changed, _, err := e.Store.TransitionTaskStateWithEventIfNoActiveJob(ctx, task.ID, from, string(TaskDismissed),
+		TaskEventReviewRetiredPullRequestClosed, fmt.Sprintf("review retired: pull request #%d closed without merging", number))
+	if errors.Is(err, db.ErrTaskHasActiveJob) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	return changed, !changed, nil
+}
+
+// ReviewRetiredByPullRequestClose reports whether task is a review record whose
+// current dismissal is retireClosedReviewTask's, rather than an operator's or a
+// reaper's. Such a review was disposed only because its PR closed, so a new
+// review request (the PR reopened) re-binds to a successor instead of refusing.
+func ReviewRetiredByPullRequestClose(ctx context.Context, store *db.Store, task db.Task) (bool, error) {
+	if task.State != string(TaskDismissed) || !IsReviewRecordTask(task) {
+		return false, nil
+	}
+	events, err := store.ListTaskEvents(ctx, task.ID)
+	if err != nil {
+		return false, err
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].ToState == "" {
+			continue
+		}
+		return events[i].ToState == string(TaskDismissed) && events[i].Kind == TaskEventReviewRetiredPullRequestClosed, nil
+	}
+	return false, nil
 }
 
 // reconcileMergedCleanup removes the task worktree after

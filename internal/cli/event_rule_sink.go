@@ -314,14 +314,18 @@ func eventRuleMatchesAddressee(rule db.EventRule, event events.Event) bool {
 // boundary before durable routing. Persisted job attribution
 // remains strongest only while that role belongs to the current live roster.
 // Archived or removed attribution falls back to the current live role selected
-// for the event repository.
+// for the event repository. A blocked-since digest names tasks, not a job; its
+// producer addresses it to the tasks' own attributed role (#2668), which is
+// treated as persisted attribution: honoured while live, else the repo owner.
 func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Event) events.Event {
 	if event.Type != events.EventJobBlocked {
 		return event
 	}
 	targetRole := workflow.NormalizeActingOrgRole(event.WakeTargetRole)
 	persistedRole := ""
-	if s.store != nil && strings.TrimSpace(event.JobID) != "" {
+	if event.Cause == "blocked_since" {
+		persistedRole = targetRole
+	} else if s.store != nil && strings.TrimSpace(event.JobID) != "" {
 		if job, err := s.store.GetJob(ctx, event.JobID); err == nil {
 			if payload, err := daemonJobPayload(job); err == nil {
 				persistedRole = workflow.NormalizeActingOrgRole(payload.ActingOrgRole)

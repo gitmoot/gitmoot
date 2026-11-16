@@ -289,6 +289,48 @@ LIMIT 1`, repo, pullRequest, taskID, taskID).Scan(&owner)
 	return strings.TrimSpace(owner), nil
 }
 
+// TaskJobAttribution is who a task's own jobs say it belongs to.
+type TaskJobAttribution struct {
+	// Requester is the newest review_requests requester of any of the task's jobs.
+	Requester string
+	// ActingRole is the acting_org_role of the newest task job that carries one.
+	ActingRole string
+	// PullRequest is the pull request number of the newest task job naming one.
+	PullRequest int
+}
+
+// TaskJobAttribution reads the attribution recorded on the jobs of one task
+// (payload task_id) in repo. A task with no attributed job is a zero value.
+func (s *Store) TaskJobAttribution(ctx context.Context, repo, taskID string) (TaskJobAttribution, error) {
+	repo = strings.TrimSpace(repo)
+	taskID = strings.TrimSpace(taskID)
+	var out TaskJobAttribution
+	if repo == "" || taskID == "" {
+		return out, nil
+	}
+	const taskJobs = `FROM jobs j WHERE j.repo = ? AND json_valid(j.payload) AND json_extract(j.payload, '$.task_id') = ?`
+	var requester, actingRole sql.NullString
+	var pullRequest sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT
+	(SELECT (SELECT trim(r.requester) FROM review_requests r WHERE r.job_id = j.id AND trim(r.requester) != '' LIMIT 1) `+taskJobs+`
+		AND EXISTS (SELECT 1 FROM review_requests r WHERE r.job_id = j.id AND trim(r.requester) != '')
+		ORDER BY j.created_at DESC, j.id DESC LIMIT 1),
+	(SELECT trim(json_extract(j.payload, '$.acting_org_role')) `+taskJobs+`
+		AND json_type(j.payload, '$.acting_org_role') = 'text'
+		AND trim(json_extract(j.payload, '$.acting_org_role')) != ''
+		ORDER BY j.created_at DESC, j.id DESC LIMIT 1),
+	(SELECT j.pull_request `+taskJobs+` AND j.pull_request > 0
+		ORDER BY j.created_at DESC, j.id DESC LIMIT 1)`,
+		repo, taskID, repo, taskID, repo, taskID).Scan(&requester, &actingRole, &pullRequest)
+	if err != nil {
+		return TaskJobAttribution{}, err
+	}
+	out.Requester = strings.TrimSpace(requester.String)
+	out.ActingRole = strings.TrimSpace(actingRole.String)
+	out.PullRequest = int(pullRequest.Int64)
+	return out, nil
+}
+
 // JobWorktreePath returns the worktree path recorded in one job payload without
 // scanning the rest of the job row. The daemon's best-effort reclaim pass uses
 // this narrow lookup to distinguish a candidate-local GetJob scan failure from a

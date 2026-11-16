@@ -1714,7 +1714,7 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 	task := db.Task{
 		ID:           taskID,
 		RepoFullName: repo.FullName(),
-		GoalID:       firstNonEmpty(request.GoalID, "local-review"),
+		GoalID:       firstNonEmpty(request.GoalID, workflow.LocalReviewGoalID),
 		Title:        firstNonEmpty(request.TaskTitle, fmt.Sprintf("Review PR #%d", request.PullRequest)),
 		State:        string(workflow.TaskReviewing),
 	}
@@ -1751,16 +1751,28 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 }
 
 // liveReviewTaskSuccessor returns the newest task in a disposed task's
-// successor chain, or the refusal naming the command that creates one.
+// successor chain, or the refusal naming the command that creates one. A review
+// retired only because its PR closed unmerged (#2668) gets that successor here:
+// a review requested again means the PR is back in play, exactly as a blocked
+// review task used to re-arm.
 func liveReviewTaskSuccessor(ctx context.Context, store *db.Store, disposedID string) (db.Task, error) {
 	latest, err := store.LatestTaskInChain(ctx, disposedID)
 	if err != nil {
 		return db.Task{}, err
 	}
-	if workflow.IsDisposedTaskState(latest.State) {
+	if !workflow.IsDisposedTaskState(latest.State) {
+		return latest, nil
+	}
+	retired, err := workflow.ReviewRetiredByPullRequestClose(ctx, store, latest)
+	if err != nil {
+		return db.Task{}, err
+	}
+	if !retired {
 		return db.Task{}, disposedReviewTaskError(latest)
 	}
-	return latest, nil
+	successor, _, err := store.CreateTaskSuccessor(ctx, latest.ID, []string{string(workflow.TaskDismissed)},
+		string(workflow.TaskReviewing), "review requested again after its pull request closed unmerged")
+	return successor, err
 }
 
 func disposedReviewTaskError(task db.Task) error {

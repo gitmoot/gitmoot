@@ -3,7 +3,22 @@ package workflow
 import (
 	"strconv"
 	"strings"
+
+	"github.com/gitmoot/gitmoot/internal/db"
 )
+
+// LocalReviewGoalID is the goal a review dispatch files a new review record
+// (task) under.
+const LocalReviewGoalID = "local-review"
+
+// IsReviewRecordTask reports whether task is a review record created by a
+// review dispatch rather than implementation work.
+func IsReviewRecordTask(task db.Task) bool {
+	if _, ok := ReviewRecordPRNumber(task.ID); ok {
+		return true
+	}
+	return strings.TrimSpace(task.GoalID) == LocalReviewGoalID
+}
 
 // ReviewRecordPRNumber reads the pull request number out of a review record
 // (task) id, "review-pr-<number>-<suffix>"; successors keep the prefix. It

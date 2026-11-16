@@ -768,11 +768,12 @@ func TestPollOnceLeavesUnclassifiedBlockedReviewTaskBlocked(t *testing.T) {
 	}
 }
 
-// TestPollOnceLeavesTransientBlockOnClosedPullRequestBlocked pins the open-PR
+// TestPollOnceDoesNotReleaseTransientBlockOnClosedPullRequest pins the open-PR
 // requirement. A closed PR cannot clear a transient condition, and releasing it to
 // ready_to_merge would hand a moot subject to the merge path; that population
-// belongs to the external-merge and closed-reviewing reconcilers.
-func TestPollOnceLeavesTransientBlockOnClosedPullRequestBlocked(t *testing.T) {
+// belongs to the external-merge and closed-reviewing reconcilers, which retire a
+// blocked review record of a closed-unmerged PR to dismissed (#2668).
+func TestPollOnceDoesNotReleaseTransientBlockOnClosedPullRequest(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
 	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
@@ -796,8 +797,8 @@ func TestPollOnceLeavesTransientBlockOnClosedPullRequestBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask returned error: %v", err)
 	}
-	if task.State != string(workflow.TaskBlocked) {
-		t.Fatalf("task state = %q, want blocked while the pull request is not open", task.State)
+	if task.State != string(workflow.TaskDismissed) {
+		t.Fatalf("task state = %q, want the closed PR's review record retired, never released to ready_to_merge", task.State)
 	}
 }
 
