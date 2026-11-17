@@ -169,6 +169,15 @@ Some paths always need review before merge (agent instructions such as
 dependency manifests and locks, migrations), and so does every pull request on
 `gitmoot/gitmoot`.
 
+A pull request's level never drops: if an earlier head of it, or an earlier
+run on the same head, was judged higher, that level holds. `reason:` then says
+`ratchet:` and names the earlier decision (head, time, reason) and this head's
+own judgement. A level 3 that came from JEV being unreachable does not hold. A
+truncated diff that JEV judged level 2 with level 3 close behind (p >= 0.30)
+is level 3 (`truncated_near_tie`). If the record of earlier levels
+(`review-levels.jsonl` in the Gitmoot home) cannot be read, the level is 3
+(`history_unreadable`).
+
 ## 2. Read the verdict and re-review after a fix
 
 ```sh

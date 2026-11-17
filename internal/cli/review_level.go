@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -86,6 +88,8 @@ func runReviewLevel(args []string, stdout, stderr io.Writer) int {
 	}
 
 	decision := reviewlevel.Decide(ctx, newReviewLevelJudge(reviewLevelAPIKey(ctx, *home)), jev.DefaultModel, input)
+	history, historyErr := reviewLevelHistory(*home, repo.FullName(), *pr)
+	decision = heldReviewLevel(decision, history, historyErr)
 
 	if _, err := gh.CreateCommitStatus(ctx, github.CommitStatusInput{
 		Repo:        repo,
@@ -131,6 +135,57 @@ type reviewLevelLogEntry struct {
 	Repo string `json:"repo"`
 	PR   int    `json:"pr"`
 	reviewlevel.Decision
+}
+
+// reviewLevelHistory returns every recorded decision for repo/pr, oldest
+// first. A missing log is no history and a malformed line is skipped; any
+// other read failure is an error, which heldReviewLevel turns into level 3.
+func reviewLevelHistory(home, repo string, pr int) ([]reviewLevelLogEntry, error) {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.Open(filepath.Join(paths.Home, reviewLevelLogName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var history []reviewLevelLogEntry
+	reader := bufio.NewReader(file)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(bytes.TrimSpace(line)) > 0 {
+			var entry reviewLevelLogEntry
+			if json.Unmarshal(line, &entry) == nil && entry.PR == pr &&
+				strings.EqualFold(strings.TrimSpace(entry.Repo), strings.TrimSpace(repo)) {
+				history = append(history, entry)
+			}
+		}
+		if readErr == io.EOF {
+			return history, nil
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+}
+
+// heldReviewLevel is the one place both deciders (`review level` and the
+// low-risk merge gate) apply the pull request ratchet (#2674): the level never
+// drops below an earlier real judgement recorded for the same pull request,
+// and an unreadable record fails closed to level 3.
+func heldReviewLevel(fresh reviewlevel.Decision, history []reviewLevelLogEntry, historyErr error) reviewlevel.Decision {
+	if historyErr != nil {
+		return reviewlevel.HistoryUnreadable(fresh, historyErr)
+	}
+	records := make([]reviewlevel.Record, len(history))
+	for i, entry := range history {
+		records[i] = reviewlevel.Record{Time: entry.Time, Decision: entry.Decision}
+	}
+	return reviewlevel.Ratchet(fresh, records)
 }
 
 // appendReviewLevelLog adds one JSON line per decision. It never blocks the
@@ -187,8 +242,24 @@ func reviewLevelStatusDescription(decision reviewlevel.Decision) string {
 	default:
 		text = "L3 review before merge (" + decision.Source + ")"
 	}
+	if held := decision.HeldBy; decision.Source == reviewlevel.SourceRatchet && held != nil {
+		suffix := "ratchet: held by " + held.Source + " at " + shortReviewLevelHead(held.HeadSHA)
+		if decision.Level == reviewlevel.LevelRequired {
+			text = "L3 review before merge (" + suffix + ")"
+		} else {
+			text += " (" + suffix + ")"
+		}
+	}
 	if len(text) > 140 {
 		text = text[:140]
 	}
 	return text
+}
+
+func shortReviewLevelHead(head string) string {
+	head = strings.TrimSpace(head)
+	if len(head) > 8 {
+		return head[:8]
+	}
+	return head
 }

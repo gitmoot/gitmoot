@@ -15,6 +15,7 @@ type fakeJudge struct {
 	calls  int
 	risk   float64
 	choice string
+	probs  map[string]float64
 	err    error
 	drop   string
 }
@@ -28,9 +29,13 @@ func (f *fakeJudge) Evaluate(_ context.Context, request jev.Request) (jev.Exchan
 		return jev.Exchange{}, errors.New("risk question not sent")
 	}
 	risk := f.risk
+	probs := f.probs
+	if probs == nil {
+		probs = map[string]float64{f.choice: 0.9}
+	}
 	answers := map[string]jev.Answer{
 		questionRisk:  {Type: "noul", Noul: &risk},
-		questionLevel: {Type: "choice", Choice: f.choice, Probabilities: map[string]float64{f.choice: 0.9}},
+		questionLevel: {Type: "choice", Choice: f.choice, Probabilities: probs},
 	}
 	delete(answers, f.drop)
 	return jev.Exchange{Response: jev.Response{Answers: answers}}, nil
@@ -118,6 +123,36 @@ func TestDecideRejectsNaNRisk(t *testing.T) {
 	got := Decide(context.Background(), judge, jev.DefaultModel, appInput())
 	if got.Level != LevelRequired || got.Source != "classifier_error" {
 		t.Fatalf("NaN risk decided %s/%s, want level3_required/classifier_error", got.Level, got.Source)
+	}
+}
+
+// A truncated diff judged level 2 with level 3 close behind fails closed
+// (herdr#437: L3 p=0.44-0.50 on a truncated diff); a confident level 2 or a
+// complete diff stays level 2.
+func TestDecideTruncatedNearTieFailsClosed(t *testing.T) {
+	truncated := appInput(File{Path: "assets/logo.png"}, File{Path: "src/app.ts", Patch: "+x"})
+	cases := []struct {
+		name       string
+		in         Input
+		l3         float64
+		wantLevel  string
+		wantSource string
+	}{
+		{"truncated near tie", truncated, 0.45, LevelRequired, "truncated_near_tie"},
+		{"truncated confident level 2", truncated, 0.05, LevelBackground, "jev"},
+		{"complete near tie", appInput(), 0.45, LevelBackground, "jev"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			judge := &fakeJudge{risk: 0.12, choice: LevelBackground, probs: map[string]float64{LevelBackground: 1 - tc.l3, LevelRequired: tc.l3}}
+			got := Decide(context.Background(), judge, jev.DefaultModel, tc.in)
+			if got.Level != tc.wantLevel || got.Source != tc.wantSource {
+				t.Fatalf("Decide = %s/%s (%s), want %s/%s", got.Level, got.Source, got.Reason, tc.wantLevel, tc.wantSource)
+			}
+			if tc.wantSource == "truncated_near_tie" && (!strings.Contains(got.Reason, "truncated") || !strings.Contains(got.Reason, "p=0.45")) {
+				t.Fatalf("reason %q does not name the truncated diff and the level 3 probability", got.Reason)
+			}
+		})
 	}
 }
 
