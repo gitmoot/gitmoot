@@ -269,3 +269,108 @@ func TestReviewLevelRatchet(t *testing.T) {
 		})
 	}
 }
+
+// reviewLevelRacingJudge is another writer racing the classification: while
+// judging, it records a real level 3 for the same pull request, then judges
+// level 2.
+type reviewLevelRacingJudge struct {
+	t    *testing.T
+	home string
+}
+
+func (j *reviewLevelRacingJudge) Evaluate(ctx context.Context, request jev.Request) (jev.Exchange, error) {
+	seedReviewLevelLog(j.t, j.home, reviewLevelSeed{"jerryfane/joltra", 7, reviewLevelEarlierHead, reviewlevel.LevelRequired, "risk"})
+	return (&reviewLevelLevel2Judge{}).Evaluate(ctx, request)
+}
+
+// reviewLevelDeciders are both writers of review-levels.jsonl, deciding
+// jerryfane/joltra#7 at lowRiskCLIHead.
+var reviewLevelDeciders = []struct {
+	name   string
+	decide func(t *testing.T, home string, gh *reviewLevelFakeGitHub, judge reviewlevel.Judge) reviewlevel.Decision
+}{
+	{"review level", func(t *testing.T, home string, gh *reviewLevelFakeGitHub, judge reviewlevel.Judge) reviewlevel.Decision {
+		prevGH, prevJudge := newReviewLevelGitHubClient, newReviewLevelJudge
+		newReviewLevelGitHubClient = func() reviewLevelGitHubClient { return gh }
+		newReviewLevelJudge = func(string) reviewlevel.Judge { return judge }
+		t.Cleanup(func() { newReviewLevelGitHubClient, newReviewLevelJudge = prevGH, prevJudge })
+		t.Setenv(reviewLevelAPIKeyName, "test-key")
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{"review", "level", "--repo", "jerryfane/joltra", "--pr", "7", "--json", "--home", home}, &stdout, &stderr); code != 0 {
+			t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+		}
+		var decision reviewlevel.Decision
+		if err := json.Unmarshal(stdout.Bytes(), &decision); err != nil {
+			t.Fatalf("%v: %s", err, stdout.String())
+		}
+		return decision
+	}},
+	{"low-risk merge gate", func(t *testing.T, home string, gh *reviewLevelFakeGitHub, judge reviewlevel.Judge) reviewlevel.Decision {
+		classify := lowRiskReviewLevel(home, gh, func() reviewlevel.Judge { return judge }, time.Now)
+		decision, err := classify(context.Background(), "jerryfane/joltra", 7, lowRiskCLIHead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decision
+	}},
+}
+
+// A real level 3 recorded by another writer while this head was being
+// classified holds the level: both writers re-read the record under its lock
+// after judging, so neither returns nor logs the fresh level 2.
+func TestReviewLevelSettlesAgainstLevelRecordedDuringClassification(t *testing.T) {
+	for _, decider := range reviewLevelDeciders {
+		t.Run(decider.name, func(t *testing.T) {
+			home := t.TempDir()
+			gh := &reviewLevelFakeGitHub{files: []github.PullRequestFile{{Filename: "README.md", Patch: "+typo"}}}
+			decision := decider.decide(t, home, gh, &reviewLevelRacingJudge{t: t, home: home})
+			if decision.Level != reviewlevel.LevelRequired || decision.Source != reviewlevel.SourceRatchet || !strings.Contains(decision.Reason, "head aaaaaaaaaaaa") {
+				t.Fatalf("decision = %s/%s (%s), want level 3 held by the racing record", decision.Level, decision.Source, decision.Reason)
+			}
+			if len(gh.statuses) != 1 || !strings.Contains(gh.statuses[0].Description, "ratchet: held by risk at aaaaaaaa") {
+				t.Fatalf("statuses = %+v, want one ratchet status", gh.statuses)
+			}
+			raw, err := os.ReadFile(filepath.Join(config.PathsForHome(home).Home, reviewLevelLogName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+			var last reviewLevelLogEntry
+			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
+				t.Fatal(err)
+			}
+			if len(lines) != 2 || last.Level != reviewlevel.LevelRequired || last.Source != reviewlevel.SourceRatchet || last.HeadSHA != lowRiskCLIHead {
+				t.Fatalf("log =\n%s\nwant the racing level 3, then this head held at level 3", raw)
+			}
+		})
+	}
+}
+
+// While another writer holds the record lock past the bounded wait, a writer
+// fails closed to level 3 and appends nothing.
+func TestReviewLevelLockedRecordFailsClosed(t *testing.T) {
+	prevWait := reviewLevelLockWait
+	reviewLevelLockWait = 100 * time.Millisecond
+	t.Cleanup(func() { reviewLevelLockWait = prevWait })
+	for _, decider := range reviewLevelDeciders {
+		t.Run(decider.name, func(t *testing.T) {
+			home := t.TempDir()
+			unlock, err := lockReviewLevelLog(home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unlock()
+			gh := &reviewLevelFakeGitHub{files: []github.PullRequestFile{{Filename: "README.md", Patch: "+typo"}}}
+			decision := decider.decide(t, home, gh, &reviewLevelLevel2Judge{})
+			if decision.Level != reviewlevel.LevelRequired || decision.Source != reviewlevel.SourceHistoryLocked || !strings.Contains(decision.Reason, "could not be locked") {
+				t.Fatalf("decision = %s/%s (%s), want a fail-closed history_locked level 3", decision.Level, decision.Source, decision.Reason)
+			}
+			if len(gh.statuses) != 1 || !strings.Contains(gh.statuses[0].Description, "history_locked") {
+				t.Fatalf("statuses = %+v, want one history_locked status", gh.statuses)
+			}
+			if _, err := os.Stat(filepath.Join(config.PathsForHome(home).Home, reviewLevelLogName)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("log stat err = %v, want nothing appended", err)
+			}
+		})
+	}
+}

@@ -114,6 +114,9 @@ const (
 	// SourceHistoryUnreadable: the earlier decisions could not be read, so a
 	// higher earlier level cannot be ruled out.
 	SourceHistoryUnreadable = "history_unreadable"
+	// SourceHistoryLocked: the record of earlier decisions stayed locked by
+	// another writer, so this decision could not be ratcheted against it.
+	SourceHistoryLocked = "history_locked"
 )
 
 // Record is one earlier decision for a pull request, as recorded.
@@ -124,8 +127,9 @@ type Record struct {
 
 // RealJudgement reports whether a decision from source judged the pull
 // request itself. Fail-closed results (classifier_error,
-// classifier_unavailable, history_unreadable) do not, so recovering from an
-// outage lowers the level again; ratchet results only repeat an earlier one.
+// classifier_unavailable, history_unreadable, history_locked) do not, so
+// recovering from an outage lowers the level again; ratchet results only
+// repeat an earlier one.
 func RealJudgement(source string) bool {
 	switch strings.TrimSpace(source) {
 	case "repo", "path", "risk", "uncertain", "jev", "truncated", "truncated_near_tie":
@@ -173,16 +177,17 @@ func Ratchet(fresh Decision, history []Record) Decision {
 	return held
 }
 
-// HistoryUnreadable fails closed when the earlier decisions could not be
-// read: a fresh level below level 3 becomes level 3, source
-// SourceHistoryUnreadable. fresh may be empty when nothing was judged.
-func HistoryUnreadable(fresh Decision, err error) Decision {
+// HistoryUnavailable fails closed when the earlier decisions could not be
+// consulted (source SourceHistoryUnreadable or SourceHistoryLocked, why says
+// what failed): a fresh level below level 3 becomes level 3. fresh may be
+// empty when nothing was judged.
+func HistoryUnavailable(fresh Decision, source, why string) Decision {
 	if fresh.Level == LevelRequired {
 		return fresh
 	}
 	held := fresh
-	held.Level, held.Source = LevelRequired, SourceHistoryUnreadable
-	held.Reason = fmt.Sprintf("earlier review levels of this pull request could not be read (%v), so a higher earlier level cannot be ruled out", err)
+	held.Level, held.Source = LevelRequired, source
+	held.Reason = why + ", so a higher earlier level cannot be ruled out"
 	if fresh.Level != "" {
 		held.Judged = judgedOf(fresh)
 		held.Reason += "; this head was judged " + describeJudgement(held.Judged)

@@ -57,40 +57,45 @@ func rawHomeFromResolved(home string) string {
 // auto_merge = "low_risk". It reuses the newest decision recorded for the exact
 // head in review-levels.jsonl and otherwise classifies that head exactly as
 // `gitmoot review level` does, recording the result in the same log and status.
-// Either way the pull request ratchet (heldReviewLevel) applies, so the gate
-// never sees a level below an earlier real judgement of the pull request; an
-// unreadable log is level 3 without classifying.
+// Either way the decision goes through settleReviewLevel, so the gate never
+// sees a level below an earlier real judgement of the pull request, including
+// one recorded while this head was being classified; an unreadable log is
+// level 3 without classifying.
 func lowRiskReviewLevel(home string, gh reviewLevelGitHubClient, judge func() reviewlevel.Judge, now func() time.Time) func(ctx context.Context, repo string, pr int, headSHA string) (reviewlevel.Decision, error) {
 	return func(ctx context.Context, repoName string, pr int, headSHA string) (reviewlevel.Decision, error) {
 		headSHA = strings.ToLower(strings.TrimSpace(headSHA))
 		history, err := reviewLevelHistory(home, repoName, pr)
 		if err != nil {
-			return heldReviewLevel(reviewlevel.Decision{HeadSHA: headSHA}, nil, err), nil
+			return reviewLevelHistoryUnreadable(reviewlevel.Decision{HeadSHA: headSHA}, err), nil
 		}
 		repo, err := github.ParseRepository(repoName)
 		if err != nil {
 			return reviewlevel.Decision{}, err
 		}
-		record := func(decision reviewlevel.Decision) {
+		// settle posts the status of the decision settled under the record
+		// lock: always for a fresh judgement, and for a recorded one only
+		// when settling raised (and recorded) it.
+		settle := func(fresh reviewlevel.Decision, onlyIfRaised bool) reviewlevel.Decision {
+			decision, recorded, err := settleReviewLevel(home, repo.FullName(), pr, fresh, now(), onlyIfRaised)
+			if err != nil {
+				log.Printf("low-risk merge gate: could not save review level for %s#%d: %v", repo.FullName(), pr, err)
+			}
+			if onlyIfRaised && !recorded {
+				return decision
+			}
 			if _, err := gh.CreateCommitStatus(ctx, github.CommitStatusInput{
 				Repo: repo, SHA: decision.HeadSHA, State: "success",
 				Context: reviewLevelStatusContext, Description: reviewLevelStatusDescription(decision),
 			}); err != nil {
 				log.Printf("low-risk merge gate: could not post %s status for %s#%d: %v", reviewLevelStatusContext, repo.FullName(), pr, err)
 			}
-			if err := appendReviewLevelLog(home, repo.FullName(), pr, decision, now()); err != nil {
-				log.Printf("low-risk merge gate: could not save review level for %s#%d: %v", repo.FullName(), pr, err)
-			}
+			return decision
 		}
 		if entry, found := latestReviewLevelEntryAtHead(history, headSHA); found &&
 			!(failedClosed(entry.Source) && reviewLevelEntryAge(entry, now()) >= lowRiskClassifierRetryAfter) {
-			decision := heldReviewLevel(entry.Decision, history, nil)
-			if decision.Level != entry.Level {
-				// Recorded before the ratchet existed: record the held level
-				// once, so the status and the log match what the gate used.
-				record(decision)
-			}
-			return decision, nil
+			// A level recorded before the ratchet existed, or before a higher
+			// one was recorded, is raised and recorded once.
+			return settle(entry.Decision, true), nil
 		}
 		pull, err := gh.GetPullRequest(ctx, repo, int64(pr))
 		if err != nil {
@@ -116,17 +121,15 @@ func lowRiskReviewLevel(home string, gh reviewLevelGitHubClient, judge func() re
 		for _, file := range files {
 			input.Files = append(input.Files, reviewlevel.File{Path: file.Filename, Patch: file.Patch})
 		}
-		decision := heldReviewLevel(reviewlevel.Decide(ctx, judge(), jev.DefaultModel, input), history, nil)
-		record(decision)
-		return decision, nil
+		return settle(reviewlevel.Decide(ctx, judge(), jev.DefaultModel, input), false), nil
 	}
 }
 
-// failedClosed reports a level 3 that judged nothing; the gate asks again
-// after lowRiskClassifierRetryAfter.
+// failedClosed reports a recorded level 3 that judged nothing; the gate asks
+// again after lowRiskClassifierRetryAfter.
 func failedClosed(source string) bool {
 	switch strings.TrimSpace(source) {
-	case "classifier_error", "classifier_unavailable", reviewlevel.SourceHistoryUnreadable:
+	case "classifier_error", "classifier_unavailable":
 		return true
 	default:
 		return false

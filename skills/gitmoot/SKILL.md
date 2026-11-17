@@ -176,7 +176,8 @@ own judgement. A level 3 that came from JEV being unreachable does not hold. A
 truncated diff that JEV judged level 2 with level 3 close behind (p >= 0.30)
 is level 3 (`truncated_near_tie`). If the record of earlier levels
 (`review-levels.jsonl` in the Gitmoot home) cannot be read, the level is 3
-(`history_unreadable`).
+(`history_unreadable`); if another run keeps it locked for over 10 seconds,
+the level is 3 (`history_locked`) and nothing is recorded.
 
 ## 2. Read the verdict and re-review after a fix
 
