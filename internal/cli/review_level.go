@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -86,6 +89,12 @@ func runReviewLevel(args []string, stdout, stderr io.Writer) int {
 	}
 
 	decision := reviewlevel.Decide(ctx, newReviewLevelJudge(reviewLevelAPIKey(ctx, *home)), jev.DefaultModel, input)
+	decision, recorded, err := settleReviewLevel(*home, repo.FullName(), *pr, decision, time.Now(), false)
+	if err != nil {
+		fmt.Fprintf(stderr, "warning: could not save the decision to %s: %v\n", reviewLevelLogName, err)
+	} else if !recorded {
+		fmt.Fprintf(stderr, "warning: the decision was not saved to %s: %s\n", reviewLevelLogName, decision.Reason)
+	}
 
 	if _, err := gh.CreateCommitStatus(ctx, github.CommitStatusInput{
 		Repo:        repo,
@@ -95,10 +104,6 @@ func runReviewLevel(args []string, stdout, stderr io.Writer) int {
 		Description: reviewLevelStatusDescription(decision),
 	}); err != nil {
 		fmt.Fprintf(stderr, "warning: could not post %s status: %v\n", reviewLevelStatusContext, err)
-	}
-
-	if err := appendReviewLevelLog(*home, repo.FullName(), *pr, decision, time.Now()); err != nil {
-		fmt.Fprintf(stderr, "warning: could not save the decision to %s: %v\n", reviewLevelLogName, err)
 	}
 
 	if *asJSON {
@@ -133,8 +138,121 @@ type reviewLevelLogEntry struct {
 	reviewlevel.Decision
 }
 
+// reviewLevelHistory returns every recorded decision for repo/pr, oldest
+// first. A missing log is no history and a malformed line is skipped; any
+// other read failure is an error, which fails closed to level 3.
+func reviewLevelHistory(home, repo string, pr int) ([]reviewLevelLogEntry, error) {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.Open(filepath.Join(paths.Home, reviewLevelLogName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var history []reviewLevelLogEntry
+	reader := bufio.NewReader(file)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(bytes.TrimSpace(line)) > 0 {
+			var entry reviewLevelLogEntry
+			if json.Unmarshal(line, &entry) == nil && entry.PR == pr &&
+				strings.EqualFold(strings.TrimSpace(entry.Repo), strings.TrimSpace(repo)) {
+				history = append(history, entry)
+			}
+		}
+		if readErr == io.EOF {
+			return history, nil
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+}
+
+func reviewLevelHistoryUnreadable(fresh reviewlevel.Decision, err error) reviewlevel.Decision {
+	return reviewlevel.HistoryUnavailable(fresh, reviewlevel.SourceHistoryUnreadable,
+		fmt.Sprintf("earlier review levels of this pull request could not be read (%v)", err))
+}
+
+// reviewLevelLockWait bounds how long a writer waits for the record lock
+// before failing closed.
+var reviewLevelLockWait = 10 * time.Second
+
+// lockReviewLevelLog takes the exclusive flock on review-levels.jsonl.lock,
+// next to the log, waiting at most reviewLevelLockWait. The lock is on the
+// open file, so separate goroutines and processes exclude each other; unlock
+// closes it.
+func lockReviewLevelLog(home string) (unlock func(), err error) {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(paths.Home, reviewLevelLogName+".lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(reviewLevelLockWait)
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() { _ = f.Close() }, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			_ = f.Close()
+			return nil, err
+		}
+		if !time.Now().Before(deadline) {
+			_ = f.Close()
+			return nil, fmt.Errorf("still held by another writer after %s", reviewLevelLockWait)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// settleReviewLevel is the one critical section both deciders (`review
+// level` and the low-risk merge gate) use to apply the pull request ratchet
+// (#2674) and record the result: under the record lock it reads the
+// pull request's history, raises fresh to the highest earlier real judgement,
+// and appends the result, so no writer records a lower level after another
+// recorded a higher one. Callers judge BEFORE calling it: the lock is never
+// held across GitHub or JEV. With onlyIfRaised, nothing is appended unless the
+// level was raised. A lock or history that cannot be read fails closed to
+// level 3 and is not appended. recorded reports that the decision was
+// appended (or the append attempted; err is its failure), so the caller
+// posts the matching commit status.
+func settleReviewLevel(home, repo string, pr int, fresh reviewlevel.Decision, now time.Time, onlyIfRaised bool) (decision reviewlevel.Decision, recorded bool, err error) {
+	unlock, err := lockReviewLevelLog(home)
+	if err != nil {
+		return reviewlevel.HistoryUnavailable(fresh, reviewlevel.SourceHistoryLocked,
+			fmt.Sprintf("the review-level record could not be locked (%v)", err)), false, nil
+	}
+	defer unlock()
+	history, err := reviewLevelHistory(home, repo, pr)
+	if err != nil {
+		return reviewLevelHistoryUnreadable(fresh, err), false, nil
+	}
+	records := make([]reviewlevel.Record, len(history))
+	for i, entry := range history {
+		records[i] = reviewlevel.Record{Time: entry.Time, Decision: entry.Decision}
+	}
+	decision = reviewlevel.Ratchet(fresh, records)
+	if onlyIfRaised && decision.Level == fresh.Level {
+		return decision, false, nil
+	}
+	return decision, true, appendReviewLevelLog(home, repo, pr, decision, now)
+}
+
 // appendReviewLevelLog adds one JSON line per decision. It never blocks the
 // answer: a failure is a warning, since the decision itself is still sound.
+// Deciders append through settleReviewLevel, under the record lock.
 func appendReviewLevelLog(home, repo string, pr int, decision reviewlevel.Decision, now time.Time) error {
 	paths, err := pathsFromFlag(home)
 	if err != nil {
@@ -187,8 +305,24 @@ func reviewLevelStatusDescription(decision reviewlevel.Decision) string {
 	default:
 		text = "L3 review before merge (" + decision.Source + ")"
 	}
+	if held := decision.HeldBy; decision.Source == reviewlevel.SourceRatchet && held != nil {
+		suffix := "ratchet: held by " + held.Source + " at " + shortReviewLevelHead(held.HeadSHA)
+		if decision.Level == reviewlevel.LevelRequired {
+			text = "L3 review before merge (" + suffix + ")"
+		} else {
+			text += " (" + suffix + ")"
+		}
+	}
 	if len(text) > 140 {
 		text = text[:140]
 	}
 	return text
+}
+
+func shortReviewLevelHead(head string) string {
+	head = strings.TrimSpace(head)
+	if len(head) > 8 {
+		return head[:8]
+	}
+	return head
 }

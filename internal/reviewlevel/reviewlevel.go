@@ -28,6 +28,12 @@ const (
 	// review before merge. Measured on 259 historical PRs; at 0.35 both real
 	// permission-bypass findings in the sample were forced to level 3.
 	RiskThreshold = 0.35
+	// TruncatedNearTieThreshold: when the diff was truncated and JEV picked
+	// level 2, a level-3 probability AT OR ABOVE this forces review before
+	// merge, since JEV did not see the whole change (#2674). Over 30 days, 10
+	// of 843 truncated level-2 decisions were this close; herdr#437 was
+	// 0.44-0.50. A truncated diff with a confident level 2 stays level 2.
+	TruncatedNearTieThreshold = 0.30
 	// StateBudgetBytes bounds the diff text sent to the model.
 	StateBudgetBytes = 48000
 
@@ -79,6 +85,135 @@ type Decision struct {
 	JEVChoice       string             `json:"jev_choice,omitempty"`
 	Probabilities   map[string]float64 `json:"probabilities,omitempty"`
 	DiffComplete    bool               `json:"diff_complete"`
+	// Judged is this head's own judgement when Source is SourceRatchet or
+	// SourceHistoryUnreadable; RiskProbability, JEVChoice and Probabilities
+	// stay those of that judgement.
+	Judged *Judgement `json:"judged,omitempty"`
+	// HeldBy is the earlier decision that holds a SourceRatchet level.
+	HeldBy *Hold `json:"held_by,omitempty"`
+}
+
+// Judgement is a level with its source and reason.
+type Judgement struct {
+	Level  string `json:"level"`
+	Source string `json:"source"`
+	Reason string `json:"reason"`
+}
+
+// Hold is an earlier recorded decision that keeps a pull request's level up.
+type Hold struct {
+	Time    string `json:"time"`
+	HeadSHA string `json:"head_sha"`
+	Judgement
+}
+
+const (
+	// SourceRatchet: an earlier real judgement of the same pull request had a
+	// higher level, and a pull request's level never drops (#2674).
+	SourceRatchet = "ratchet"
+	// SourceHistoryUnreadable: the earlier decisions could not be read, so a
+	// higher earlier level cannot be ruled out.
+	SourceHistoryUnreadable = "history_unreadable"
+	// SourceHistoryLocked: the record of earlier decisions stayed locked by
+	// another writer, so this decision could not be ratcheted against it.
+	SourceHistoryLocked = "history_locked"
+)
+
+// Record is one earlier decision for a pull request, as recorded.
+type Record struct {
+	Time string
+	Decision
+}
+
+// RealJudgement reports whether a decision from source judged the pull
+// request itself. Fail-closed results (classifier_error,
+// classifier_unavailable, history_unreadable, history_locked) do not, so
+// recovering from an outage lowers the level again; ratchet results only
+// repeat an earlier one.
+func RealJudgement(source string) bool {
+	switch strings.TrimSpace(source) {
+	case "repo", "path", "risk", "uncertain", "jev", "truncated", "truncated_near_tie":
+		return true
+	}
+	return false
+}
+
+func levelRank(level string) int {
+	switch level {
+	case LevelNoReview:
+		return 1
+	case LevelBackground:
+		return 2
+	case LevelRequired:
+		return 3
+	}
+	return 0
+}
+
+// Ratchet keeps a pull request's level from dropping: it returns fresh unless
+// an earlier real judgement of the same pull request (history, oldest first,
+// any head) had a higher level. Then it returns that level, source
+// SourceRatchet, naming the newest such decision, with fresh kept in Judged.
+func Ratchet(fresh Decision, history []Record) Decision {
+	var hold *Record
+	for i := range history {
+		record := &history[i]
+		if !RealJudgement(record.Source) || levelRank(record.Level) <= levelRank(fresh.Level) {
+			continue
+		}
+		if hold == nil || levelRank(record.Level) >= levelRank(hold.Level) {
+			hold = record
+		}
+	}
+	if hold == nil {
+		return fresh
+	}
+	held := fresh
+	held.Judged = judgedOf(fresh)
+	held.HeldBy = &Hold{Time: hold.Time, HeadSHA: hold.HeadSHA, Judgement: Judgement{Level: hold.Level, Source: hold.Source, Reason: hold.Reason}}
+	held.Level, held.Source = hold.Level, SourceRatchet
+	held.Reason = fmt.Sprintf("held at %s by the decision at head %s on %s (%s: %s); this head was judged %s",
+		hold.Level, shortHead(hold.HeadSHA), hold.Time, hold.Source, hold.Reason, describeJudgement(held.Judged))
+	return held
+}
+
+// HistoryUnavailable fails closed when the earlier decisions could not be
+// consulted (source SourceHistoryUnreadable or SourceHistoryLocked, why says
+// what failed): a fresh level below level 3 becomes level 3. fresh may be
+// empty when nothing was judged.
+func HistoryUnavailable(fresh Decision, source, why string) Decision {
+	if fresh.Level == LevelRequired {
+		return fresh
+	}
+	held := fresh
+	held.Level, held.Source = LevelRequired, source
+	held.Reason = why + ", so a higher earlier level cannot be ruled out"
+	if fresh.Level != "" {
+		held.Judged = judgedOf(fresh)
+		held.Reason += "; this head was judged " + describeJudgement(held.Judged)
+	}
+	return held
+}
+
+// judgedOf keeps the original judgement of a decision that is already held.
+func judgedOf(decision Decision) *Judgement {
+	if decision.Judged != nil {
+		judged := *decision.Judged
+		return &judged
+	}
+	return &Judgement{Level: decision.Level, Source: decision.Source, Reason: decision.Reason}
+}
+
+func describeJudgement(judged *Judgement) string {
+	return fmt.Sprintf("%s (%s: %s)", judged.Level, judged.Source, judged.Reason)
+}
+
+func shortHead(head string) string {
+	head = strings.TrimSpace(head)
+	if len(head) > 12 {
+		return head[:12]
+	}
+	return head
 }
 
 // Judge evaluates one JEV request; *jev.Client satisfies it.
@@ -157,6 +292,8 @@ func Decide(ctx context.Context, judge Judge, model string, in Input) Decision {
 		return required("risk", fmt.Sprintf("high-impact category (p=%.2f)", risk))
 	case level.Choice == levelUncertain:
 		return required("uncertain", "JEV could not decide from the available evidence")
+	case level.Choice == LevelBackground && !complete && level.Probabilities[LevelRequired] >= TruncatedNearTieThreshold:
+		return required("truncated_near_tie", fmt.Sprintf("JEV judged a truncated diff level 2 with level 3 at p=%.2f", level.Probabilities[LevelRequired]))
 	case level.Choice == LevelNoReview && !complete:
 		decision.Level, decision.Source, decision.Reason = LevelBackground, "truncated", "diff was truncated, so no-review is not allowed"
 		return decision

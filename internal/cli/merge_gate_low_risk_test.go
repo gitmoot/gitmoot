@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,6 +85,51 @@ func TestLowRiskReviewLevelUsesRecordedExactHeadDecision(t *testing.T) {
 	var entry reviewLevelLogEntry
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The low-risk merge gate sees the ratcheted level (#2674): a fresh level 2
+// after an earlier level 3, and a level 2 recorded for the exact head before
+// the ratchet existed, are both level 3, recorded once in status and log.
+func TestLowRiskReviewLevelSeesRatchetedLevel(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	earlier := reviewLevelSeed{"gitmoot/test-check", 7, reviewLevelEarlierHead, reviewlevel.LevelRequired, "risk"}
+	cases := []struct {
+		name      string
+		seeds     []reviewLevelSeed
+		wantCalls int
+	}{
+		{"fresh judgement", []reviewLevelSeed{earlier}, 1},
+		{"recorded exact-head drop", []reviewLevelSeed{earlier, {"gitmoot/test-check", 7, lowRiskCLIHead, reviewlevel.LevelBackground, "jev"}}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			seedReviewLevelLog(t, home, tc.seeds...)
+			gh := &reviewLevelFakeGitHub{files: []github.PullRequestFile{{Filename: "README.md", Patch: "+typo"}}}
+			judge := &reviewLevelLevel2Judge{}
+			classify := lowRiskReviewLevel(home, gh, func() reviewlevel.Judge { return judge }, func() time.Time { return now })
+			for poll := range 2 {
+				decision, err := classify(context.Background(), "gitmoot/test-check", 7, lowRiskCLIHead)
+				if err != nil || decision.Level != reviewlevel.LevelRequired || decision.Source != "ratchet" ||
+					decision.HeadSHA != lowRiskCLIHead || !strings.Contains(decision.Reason, "head aaaaaaaaaaaa") {
+					t.Fatalf("poll %d: decision = %+v err = %v; want level 3 held by head aaaaaaaa", poll, decision, err)
+				}
+			}
+			if judge.calls != tc.wantCalls {
+				t.Fatalf("judge calls = %d, want %d", judge.calls, tc.wantCalls)
+			}
+			if len(gh.statuses) != 1 || !strings.Contains(gh.statuses[0].Description, "ratchet: held by risk at aaaaaaaa") {
+				t.Fatalf("statuses = %+v, want one ratchet status", gh.statuses)
+			}
+			raw, err := os.ReadFile(filepath.Join(config.PathsForHome(home).Home, reviewLevelLogName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lines := strings.Split(strings.TrimSpace(string(raw)), "\n"); len(lines) != len(tc.seeds)+1 || !strings.Contains(lines[len(lines)-1], `"source":"ratchet"`) {
+				t.Fatalf("log =\n%s\nwant one ratchet line after the seeds", raw)
+			}
+		})
 	}
 }
 

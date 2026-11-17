@@ -43,7 +43,8 @@ status` shows that it is running.
 
    `gitmoot review level --repo owner/repo --pr 42` says whether the head needs
    a review before merge; a `level2_background` head merges first and is
-   reviewed after, with `--post-merge`.
+   reviewed after, with `--post-merge`. The level never drops below an earlier
+   judgement of the same pull request (`ratchet`, naming that decision).
 
 3. Keep working. Gitmoot wakes your role when the verdict is saved: a
    `review_verdict` message arrives in your role's inbox, typed into your
