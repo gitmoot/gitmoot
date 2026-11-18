@@ -254,15 +254,15 @@ func (e *Envd) Start(ctx context.Context, request StartRequest) (*Stream, error)
 		defer cancel()
 		data, oversized, readErr := readProviderResponseBody(resp.Body)
 		if readErr != nil {
-			return nil, e.errorf(readErr, "envd Start returned HTTP %d and its response could not be read", resp.StatusCode)
+			return nil, e.statusError(resp.StatusCode, OperationEnvdStart, e.errorf(readErr, "envd Start returned HTTP %d and its response could not be read", resp.StatusCode))
 		}
 		if oversized {
-			return nil, e.errorf(nil, "envd Start returned HTTP %d with an oversized response", resp.StatusCode)
+			return nil, e.statusError(resp.StatusCode, OperationEnvdStart, e.errorf(nil, "envd Start returned HTTP %d with an oversized response", resp.StatusCode))
 		}
 		if resp.StatusCode == http.StatusUnsupportedMediaType {
-			return nil, e.errorf(nil, "envd Start reached the route but HTTP 415 rejected the Connect codec: %s", data)
+			return nil, e.statusError(resp.StatusCode, OperationEnvdStart, e.errorf(nil, "envd Start reached the route but HTTP 415 rejected the Connect codec: %s", data))
 		}
-		return nil, e.errorf(nil, "envd Start returned HTTP %d: %s", resp.StatusCode, data)
+		return nil, e.statusError(resp.StatusCode, OperationEnvdStart, e.errorf(nil, "envd Start returned HTTP %d: %s", resp.StatusCode, data))
 	}
 	if err := requireConnectMediaType(resp.Header); err != nil {
 		resp.Body.Close()
@@ -313,13 +313,13 @@ func (e *Envd) Upload(ctx context.Context, path string, reader io.Reader) error 
 	defer resp.Body.Close()
 	data, oversized, readErr := readProviderResponseBody(resp.Body)
 	if readErr != nil {
-		return e.errorf(readErr, "envd upload returned HTTP %d and its response could not be read", resp.StatusCode)
+		return e.statusError(resp.StatusCode, OperationEnvdUpload, e.errorf(readErr, "envd upload returned HTTP %d and its response could not be read", resp.StatusCode))
 	}
 	if oversized {
-		return e.errorf(nil, "envd upload returned HTTP %d with an oversized response", resp.StatusCode)
+		return e.statusError(resp.StatusCode, OperationEnvdUpload, e.errorf(nil, "envd upload returned HTTP %d with an oversized response", resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return e.errorf(nil, "envd upload returned HTTP %d: %s", resp.StatusCode, data)
+		return e.statusError(resp.StatusCode, OperationEnvdUpload, e.errorf(nil, "envd upload returned HTTP %d: %s", resp.StatusCode, data))
 	}
 	return nil
 }
@@ -710,6 +710,15 @@ func (e *Envd) errorf(cause error, format string, args ...any) error {
 		message: workflow.RedactedStderrTail(message, e.credential.token),
 		match:   contextErrorIdentity(cause),
 	}
+}
+
+// statusError tags an envd response error with its HTTP status. A read or size
+// failure on a 200 is not a status answer, so it stays untagged.
+func (e *Envd) statusError(status int, operation string, err error) error {
+	if status == http.StatusOK {
+		return err
+	}
+	return &HTTPStatusError{StatusCode: status, Operation: operation, Err: err}
 }
 
 var _ execbackend.Stream = (*Stream)(nil)

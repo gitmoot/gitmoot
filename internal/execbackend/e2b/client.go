@@ -529,16 +529,19 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 		// made this argument and it is better than the blanket rule I had: leaving
 		// a create-404 inconclusive stranded its reservation until TTL, the exact
 		// leak this work exists to close.
-		if operationForRequest(method, path) == OperationCreate {
-			return Unknown, resp.Header, &RequestRefusedError{
-				StatusCode: resp.StatusCode, Operation: OperationCreate,
-				Err: c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody),
-			}
+		statusErr := &HTTPStatusError{StatusCode: resp.StatusCode, Operation: operationForRequest(method, path)}
+		if statusErr.Operation == OperationCreate {
+			statusErr.Err = c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+			return Unknown, resp.Header, &RequestRefusedError{StatusCode: resp.StatusCode, Operation: OperationCreate, Err: statusErr}
 		}
-		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+		statusErr.Err = c.errorf(nil, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+		return Unknown, resp.Header, statusErr
 	}
 	if resp.StatusCode != expectedStatus {
-		refusal := c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+		var refusal error = &HTTPStatusError{
+			StatusCode: resp.StatusCode, Operation: operationForRequest(method, path),
+			Err: c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody),
+		}
 		if requestRefused(resp.StatusCode) {
 			refusal = &RequestRefusedError{StatusCode: resp.StatusCode, Operation: operationForRequest(method, path), Err: refusal}
 		}
@@ -624,10 +627,42 @@ const (
 	OperationSetTimeout = "set_timeout"
 	OperationMetrics    = "metrics"
 	OperationOther      = "other"
+	// The envd data-plane calls. Neither is a control-plane operation, so
+	// neither can carry a RequestRefusedError; they appear only on
+	// HTTPStatusError.
+	OperationEnvdStart  = "envd_start"
+	OperationEnvdUpload = "envd_upload"
 )
 
 func (e *RequestRefusedError) Error() string { return e.Err.Error() }
 func (e *RequestRefusedError) Unwrap() error { return e.Err }
+
+// HTTPStatusError carries the HTTP status of a provider response that was not
+// the success the call expected, from either the control plane or envd. It
+// says nothing about allocation on its own: RequestRefusedError, which wraps it
+// for the statuses that prove non-allocation, is the only ledger signal.
+//
+// It exists so a caller can classify a gateway answer by its status rather
+// than by parsing the message: on 2026-11-18 E2B answered both POST /sandboxes
+// and envd with HTTP 503 ("upstream connect error ...") while the account's
+// spending limit was reached, and the only way to tell that from a 4xx was the
+// text.
+type HTTPStatusError struct {
+	StatusCode int
+	// Operation is the call that got the status: a control-plane Operation*
+	// constant, OperationEnvdStart, or OperationEnvdUpload.
+	Operation string
+	Err       error
+}
+
+func (e *HTTPStatusError) Error() string { return e.Err.Error() }
+func (e *HTTPStatusError) Unwrap() error { return e.Err }
+
+// Envd reports whether the status came from the sandbox's envd data plane, so
+// the sandbox it belongs to is known and can be destroyed.
+func (e *HTTPStatusError) Envd() bool {
+	return e.Operation == OperationEnvdStart || e.Operation == OperationEnvdUpload
+}
 
 // requestRefused reports whether a status code proves the provider rejected the
 // request without allocating anything.
