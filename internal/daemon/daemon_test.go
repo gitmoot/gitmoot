@@ -583,6 +583,12 @@ func TestMergeGateMarkerRetriesAfterHeadStorageAdvances(t *testing.T) {
 	if err := store.UpsertMergeGate(ctx, blocked); err != nil {
 		t.Fatalf("UpsertMergeGate returned error: %v", err)
 	}
+	// The stored row, UpdatedAt included, is the expectation, so a rewrite of
+	// the blocked verdict is caught by its state, reason or updated_at.
+	blocked, err := store.GetMergeGate(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGate returned error: %v", err)
+	}
 	client.statusErrs = []error{errors.New("transient status failure")}
 	pull := client.pulls[0]
 

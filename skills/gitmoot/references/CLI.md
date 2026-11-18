@@ -76,8 +76,10 @@ disagrees, trust its live `--help`.
 - [gitmoot plugin path omp](#gitmoot-plugin-path-omp)
 - [gitmoot pr](#gitmoot-pr)
 - [gitmoot pr events](#gitmoot-pr-events)
+- [gitmoot pr hold](#gitmoot-pr-hold)
 - [gitmoot pr list](#gitmoot-pr-list)
 - [gitmoot pr show](#gitmoot-pr-show)
+- [gitmoot pr stalled](#gitmoot-pr-stalled)
 - [gitmoot repo](#gitmoot-repo)
 - [gitmoot repo add](#gitmoot-repo-add)
 - [gitmoot repo collisions](#gitmoot-repo-collisions)
@@ -957,12 +959,19 @@ Usage of plugin path omp:
 ```text
 Usage:
   gitmoot pr events <pr> [--repo owner/repo] [--json]
+  gitmoot pr hold owner/repo#N --reason TEXT [--role role] [--json]
+  gitmoot pr hold --clear owner/repo#N [--role role] [--json]
   gitmoot pr list [--repo owner/repo] [--state state] [--json]
   gitmoot pr show <pr> [--repo owner/repo] [--json]
+  gitmoot pr stalled [--repo owner/repo] [--json]
   gitmoot pr successor <id> [--reason text] [--json]
 
 <pr> is a pr id (review-pr-N-...), owner/repo#N, or N with --repo.
 pr list puts rows that have no pull request (old adhoc-/task- rows) last.
+pr stalled lists open pull requests stuck between steps (no_ci_on_head, ci_red,
+awaiting_review, green_not_merged, draft_stale) with the owning seat and a next
+command; it reads GitHub once per repository. pr hold silences one pull request
+until its head moves.
 ```
 
 ## gitmoot pr events
@@ -975,6 +984,22 @@ Usage of pr events:
     	print pr events as JSON
   -repo string
     	repo for a bare pull request number
+```
+
+## gitmoot pr hold
+
+```text
+Usage of pr hold:
+  -clear
+    	remove the hold
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the hold as JSON
+  -reason string
+    	why the pull request is held (required unless --clear)
+  -role string
+    	acting organization role recorded on the hold (defaults to GITMOOT_ORG_ROLE, then the calling seat's pane)
 ```
 
 ## gitmoot pr list
@@ -1001,6 +1026,18 @@ Usage of pr show:
     	print the pr as JSON
   -repo string
     	repo for a bare pull request number
+```
+
+## gitmoot pr stalled
+
+```text
+Usage of pr stalled:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the reports as JSON
+  -repo string
+    	only this repository (owner/repo); default every enabled repository [pr_stalled] covers
 ```
 
 ## gitmoot repo

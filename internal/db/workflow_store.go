@@ -1058,6 +1058,33 @@ func (s *Store) ListRepoWorkflowNotesByBodyPrefix(ctx context.Context, prefix st
 	return notes, nil
 }
 
+// ListAllRepoWorkflowNotesByBodyPrefix returns EVERY note whose body starts
+// with prefix and whose repo is repo (COLLATE NOCASE) or empty, newest first,
+// with no window. The journal's repo column is optional, so a repo-less note
+// is included and the caller decides from the body which repo it names. It is
+// for prefixes whose notes are few and must all be seen, such as the
+// stalled-PR holds (#2677): a windowed read let notes on one pull request hide
+// another pull request's newest hold decision.
+func (s *Store) ListAllRepoWorkflowNotesByBodyPrefix(ctx context.Context, prefix string, repo string) ([]WorkflowNote, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, author, body, repo, created_at
+FROM workflow_notes
+WHERE substr(body, 1, length(?)) = ? AND (repo = ? COLLATE NOCASE OR repo = '')
+ORDER BY id DESC`, prefix, prefix, strings.TrimSpace(repo))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	notes := []WorkflowNote{}
+	for rows.Next() {
+		var note WorkflowNote
+		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.CreatedAt); err != nil {
+			return nil, err
+		}
+		notes = append(notes, note)
+	}
+	return notes, rows.Err()
+}
+
 func (s *Store) workflowNotesByBodyPrefixWhere(ctx context.Context, scope string, args []any, prefix string) ([]WorkflowNote, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, author, body, repo, created_at
 FROM workflow_notes
