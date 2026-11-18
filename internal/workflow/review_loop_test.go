@@ -226,6 +226,7 @@ func TestReviewScopeInstructionsMatchesFollowUpText(t *testing.T) {
 	event := PullRequestEvent{Repo: "owner/repo", PullRequest: 12, HeadSHA: "b", TaskID: "task-7"}
 	scope := &ReviewScope{
 		PreviousHeadSHA: "a",
+		MergeBase:       "m",
 		Findings:        []string{"F1: guard has no test"},
 		ChangedFiles:    []string{"internal/cli/review.go"},
 	}
@@ -234,8 +235,42 @@ func TestReviewScopeInstructionsMatchesFollowUpText(t *testing.T) {
 	if got := scopedReviewInstructions(event, scope); got != want {
 		t.Fatalf("follow-up text drifted from the shared paragraph:\n got: %q\nwant: %q", got, want)
 	}
-	if !strings.Contains(want, "The reviewer last saw exact head a; the current head is b.") {
+	if !strings.Contains(want, "The reviewer last saw exact head a; the current head is b;") {
 		t.Fatalf("shared paragraph lost its head sentence: %q", want)
+	}
+}
+
+// #2682 (e). The brief names all three commits, reads the listed files from
+// the merge base rather than the prior head, and states the outside-PR rule:
+// report only lines this pull request adds or changes; anything else is P3 at
+// most, under 'Outside this PR', and never grounds for changes_requested.
+func TestReviewScopeInstructionsReadFromTheMergeBase(t *testing.T) {
+	scope := &ReviewScope{
+		PreviousHeadSHA:   "prior0000",
+		MergeBase:         "mergebase1",
+		Findings:          []string{"F1: own finding"},
+		OutsidePRFindings: []string{`{"file":"base/x.go","line":3}`},
+		ChangedFiles:      []string{"own/y.go"},
+	}
+	brief := ReviewScopeInstructions("head2222", scope)
+	for _, want := range []string{"prior0000", "head2222", "mergebase1", "git diff mergebase1 head2222", "own/y.go"} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("brief lacks %q: %q", want, brief)
+		}
+	}
+	if strings.Contains(brief, "git diff prior0000") || strings.Contains(brief, "Diff from that prior head") {
+		t.Fatalf("brief still reads the round from the prior head: %q", brief)
+	}
+	rule := brief[strings.Index(brief, "Report only defects"):]
+	rule = rule[:strings.Index(rule, "\n")]
+	for _, want := range []string{"lines this pull request adds or changes", "Outside this PR", "P3", "never justifies changes_requested"} {
+		if !strings.Contains(rule, want) {
+			t.Fatalf("outside-PR rule lacks %q: %q", want, rule)
+		}
+	}
+	outside := brief[strings.Index(brief, "outside this PR: do not re-raise as blocking"):]
+	if !strings.Contains(outside, "base/x.go") {
+		t.Fatalf("outside-PR finding is not listed as non-blocking: %q", brief)
 	}
 }
 

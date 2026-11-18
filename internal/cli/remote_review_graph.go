@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // The authenticated forge supplies the same identity/ancestry answers as local
@@ -14,6 +15,7 @@ type remoteReviewGraph struct {
 	client      github.Client
 	repo        github.Repository
 	head        string
+	subject     *reviewScopeSubject
 	comparisons map[string]string
 }
 
@@ -59,6 +61,6 @@ func (g *remoteReviewGraph) IsAncestor(ctx context.Context, ancestor, descendant
 	}
 }
 
-func (g *remoteReviewGraph) ChangedFiles(ctx context.Context, _ int, base, head string) ([]string, error) {
-	return forgeReviewChangedFiles(ctx, g.client, g.repo, base, head)
+func (g *remoteReviewGraph) ScopeDiff(ctx context.Context, baseline, head string) (workflow.ReviewScopeDiff, error) {
+	return forgeReviewScopeDiff(ctx, g.client, g.repo, g.subject, baseline, head)
 }

@@ -173,13 +173,16 @@ type Engine struct {
 	// review rounds wedged on that divergence while three comments asserted the
 	// equality, so it is now one field rather than one promise.
 	LedgerResolvers LedgerResolvers
-	// ReviewChangedFiles resolves the repository-relative files changed from the
-	// exact head a reviewer last saw to the current PR head. A scoped follow-up
+	// ReviewChangedFiles resolves a follow-up round's scope (#2682): the files
+	// whose own change (merge base to head) moved from the exact head a reviewer
+	// last saw to the current PR head, the current merge base with baseBranch,
+	// and the pull request's own diff that prior findings are filtered against.
+	// baseBranch is the cached PR base and may be empty. A scoped follow-up
 	// never degrades SILENTLY: when this seam is unavailable or cannot scope the
 	// range, HandlePullRequestOpened records a review_scope_unavailable task event
 	// and re-reviews the full PR at that head, which re-anchors the prior head so
 	// the next round is scoped again.
-	ReviewChangedFiles func(ctx context.Context, repo string, pullRequest int, previousHead string, currentHead string) ([]string, error)
+	ReviewChangedFiles func(ctx context.Context, repo string, pullRequest int, baseBranch string, previousHead string, currentHead string) (ReviewScopeDiff, error)
 }
 
 func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {

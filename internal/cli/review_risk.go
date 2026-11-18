@@ -86,17 +86,17 @@ func wireReviewPostMergeIssues(engine *workflow.Engine, gh github.Client) {
 }
 
 // wireReviewChangedFiles installs the engine seam that scopes an incremental
-// review to the files a follow-up range actually changed.
+// review to the files whose own change moved in a follow-up round (#2682).
 //
 // Completeness is the whole difficulty: an INCOMPLETE list silently
 // under-reviews, so the seam must only ever return a list it can prove whole.
 // No hosted compare response can supply that proof (see
 // github.compareFilesCap), so the primary instrument is the daemon's own
-// checkout, where `git diff -z --name-status base...head` is uncapped and
-// unambiguous. The API remains the fallback for a daemon with no checkout or a
-// range whose objects cannot be fetched, and there it fails CLOSED on a capped
-// page: a conservative ReviewScopeUnavailableError costs one unscoped full
-// review at the same head, which HandlePullRequestOpened already degrades to.
+// checkout, where every diff is uncapped and unambiguous. The API remains the
+// fallback for a daemon with no checkout or a range whose objects cannot be
+// fetched, and there it fails CLOSED on a capped page: a conservative
+// ReviewScopeUnavailableError costs one unscoped full review at the same head,
+// which HandlePullRequestOpened already degrades to.
 func wireReviewChangedFiles(engine *workflow.Engine, gh github.Client, checkout string, runner subprocess.Runner) {
 	if engine == nil {
 		return
@@ -105,33 +105,35 @@ func wireReviewChangedFiles(engine *workflow.Engine, gh github.Client, checkout 
 	if gh == nil && checkout == "" {
 		return
 	}
-	engine.ReviewChangedFiles = func(ctx context.Context, repo string, number int, previousHead string, currentHead string) ([]string, error) {
+	engine.ReviewChangedFiles = func(ctx context.Context, repo string, number int, baseBranch string, previousHead string, currentHead string) (workflow.ReviewScopeDiff, error) {
 		owner, name, ok := strings.Cut(strings.TrimSpace(repo), "/")
 		if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
-			return nil, fmt.Errorf("review scope: invalid repo %q", repo)
+			return workflow.ReviewScopeDiff{}, fmt.Errorf("review scope: invalid repo %q", repo)
 		}
-		base, head := strings.TrimSpace(previousHead), strings.TrimSpace(currentHead)
+		repository := github.Repository{Owner: owner, Name: name}
+		subject := &reviewScopeSubject{baseBranch: strings.TrimSpace(baseBranch), gh: gh, repo: repository, number: number}
+		prev, head := strings.TrimSpace(previousHead), strings.TrimSpace(currentHead)
 		if checkout != "" {
-			paths, err := localReviewChangedFiles(ctx, jobGitClient(checkout, runner), number, base, head)
+			diff, err := localReviewScopeDiff(ctx, jobGitClient(checkout, runner), subject, prev, head)
 			if err == nil {
-				return paths, nil
+				return diff, nil
 			}
 			var unavailable workflow.ReviewScopeUnavailableError
 			if errors.As(err, &unavailable) {
 				// The local objects PROVE the range is not a direct follow-up.
 				// The API cannot overturn a proof, so do not spend a call on it.
-				return nil, err
+				return workflow.ReviewScopeDiff{}, err
 			}
 			// The instrument could not RUN (cold checkout, refused fetch, git
 			// failure). Fall through to the API, which fails closed on a capped
 			// page rather than guessing at the remainder.
 		}
 		if gh == nil {
-			return nil, workflow.ReviewScopeUnavailableError{
+			return workflow.ReviewScopeDiff{}, workflow.ReviewScopeUnavailableError{
 				Reason: "review scope has no local checkout and no GitHub client",
 			}
 		}
-		return forgeReviewChangedFiles(ctx, gh, github.Repository{Owner: owner, Name: name}, base, head)
+		return forgeReviewScopeDiff(ctx, gh, repository, subject, prev, head)
 	}
 }
 

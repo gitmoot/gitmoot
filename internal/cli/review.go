@@ -133,6 +133,12 @@ func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "wakes --role (default $GITMOOT_ORG_ROLE) when the verdict is saved. A second request for")
 	fmt.Fprintln(w, "the same head attaches to the running review or to its saved verdict; it never spends")
 	fmt.Fprintln(w, "another reviewer. No verdict ever triggers a model change.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "A request at a later head of a pull request with a saved verdict is a follow-up: it reviews")
+	fmt.Fprintln(w, "only the files whose own change (merge base to head) moved since that verdict, read against")
+	fmt.Fprintln(w, "the pull request's merge base, so files a merge of the base branch brought in are not in")
+	fmt.Fprintln(w, "it. Findings outside the pull request's own diff never block and are not carried forward.")
+	fmt.Fprintln(w, "--full re-reads the whole diff instead.")
 }
 
 type reviewRequestOptions struct {
@@ -1429,13 +1435,13 @@ type reviewAncestry interface {
 	IsAncestor(context.Context, string, string) (bool, error)
 }
 
-func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.Client, repo string, pullRequest int, head, purpose string) (*workflow.ReviewScope, string) {
-	return resolveDeltaReviewScopeUsing(ctx, store, git, func(ctx context.Context, number int, base, head string) ([]string, error) {
-		return localReviewChangedFiles(ctx, git, number, base, head)
+func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.Client, subject *reviewScopeSubject, repo string, pullRequest int, head, purpose string) (*workflow.ReviewScope, string) {
+	return resolveDeltaReviewScopeUsing(ctx, store, git, func(ctx context.Context, baseline, head string) (workflow.ReviewScopeDiff, error) {
+		return localReviewScopeDiff(ctx, git, subject, baseline, head)
 	}, repo, pullRequest, head, purpose)
 }
 
-func resolveDeltaReviewScopeUsing(ctx context.Context, store *db.Store, git reviewAncestry, changedFiles func(context.Context, int, string, string) ([]string, error), repo string, pullRequest int, head, purpose string) (*workflow.ReviewScope, string) {
+func resolveDeltaReviewScopeUsing(ctx context.Context, store *db.Store, git reviewAncestry, scopeDiff func(context.Context, string, string) (workflow.ReviewScopeDiff, error), repo string, pullRequest int, head, purpose string) (*workflow.ReviewScope, string) {
 	// AN UNDECODABLE VERDICT IS NOT AN ABSENCE (#2179, #2178 round 1). A row
 	// SucceededReviewVerdicts cannot decode is dropped silently, so the loop
 	// below would walk straight past a real terminal verdict to an OLDER
@@ -1476,7 +1482,7 @@ func resolveDeltaReviewScopeUsing(ctx context.Context, store *db.Store, git revi
 			continue
 		}
 		candidates++
-		files, err := changedFiles(ctx, pullRequest, baseline, head)
+		diff, err := scopeDiff(ctx, baseline, head)
 		if err != nil {
 			var unavailable workflow.ReviewScopeUnavailableError
 			if errors.As(err, &unavailable) {
@@ -1487,6 +1493,11 @@ func resolveDeltaReviewScopeUsing(ctx context.Context, store *db.Store, git revi
 			}
 			// The instrument could not RUN. Do not keep hammering git.
 			return nil, "scope unavailable: " + err.Error()
+		}
+		if diff.EmptyAfterBaseMerge() {
+			// The newest baseline IS the one the reviewer last saw; an older
+			// one would drop its findings. Re-read the whole own diff instead.
+			return nil, "base merged in since " + baseline + " and no own change is proven to have moved: full review against the merge base"
 		}
 		job, err := store.GetJob(ctx, verdict.JobID)
 		if err != nil {
@@ -1500,6 +1511,7 @@ func resolveDeltaReviewScopeUsing(ctx context.Context, store *db.Store, git revi
 		if payload.Result != nil {
 			findings = workflow.NamedReviewFindings(*payload.Result)
 		}
+		findings, outside := workflow.SplitOutsidePRFindings(findings, diff)
 		// ANCESTRY-SCOPED, NOT PR-SCOPED (#2178 round 2). Refusing on ANY
 		// undecodable row over-refuses: a row orphaned by a rebase, or one for
 		// another purpose, could never have been selected as this baseline. The
@@ -1510,9 +1522,11 @@ func resolveDeltaReviewScopeUsing(ctx context.Context, store *db.Store, git revi
 			return nil, reason
 		}
 		return &workflow.ReviewScope{
-			PreviousHeadSHA: baseline,
-			Findings:        findings,
-			ChangedFiles:    files,
+			PreviousHeadSHA:   baseline,
+			MergeBase:         diff.MergeBase,
+			Findings:          findings,
+			OutsidePRFindings: outside,
+			ChangedFiles:      diff.ChangedFiles,
 		}, ""
 	}
 	if candidates == 0 {

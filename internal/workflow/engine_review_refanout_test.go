@@ -54,8 +54,8 @@ func TestFollowUpReviewEmptyScopeApprovesWithoutFullReread(t *testing.T) {
 	insertPriorReviewResult(t, store, "prior-approval", "head-one", AgentResult{
 		Decision: "approved",
 	})
-	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
-		return nil, nil
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string, string) (ReviewScopeDiff, error) {
+		return testScopeDiff(), nil
 	}
 	gate := &fakeMergeGate{decision: MergeDecision{Ready: true, Merged: true, MergeCommitSHA: "merge-scoped"}}
 	engine.MergeGate = gate

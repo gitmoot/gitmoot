@@ -61,9 +61,11 @@ func admitDispatchPreparation(ctx context.Context, store *db.Store, request *loc
 	return ctx, stop, nil
 }
 
-// Scope selection never repairs a checkout or fetches host history. Preserve
-// local graph semantics for local reviews; E2B uses authenticated forge data.
-// Dispatch rechecks routing before preparation if policy or PR metadata moves.
+// Scope selection never repairs a checkout. Preserve local graph semantics for
+// local reviews; E2B uses authenticated forge data. The one fetch a local scope
+// makes is origin's refresh before it takes the merge base (#2682), since a
+// stale base ref widens the scope to commits the base already holds. Dispatch
+// rechecks routing before preparation if policy or PR metadata moves.
 func resolveDispatchReviewScope(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest, runtimeName, purpose string) (*workflow.ReviewScope, string, error) {
 	backend, err := reviewDispatchExecBackend(request.ExecBackend)
 	if err != nil {
@@ -86,14 +88,19 @@ func resolveDispatchReviewScope(ctx context.Context, store *db.Store, record db.
 	if err != nil {
 		return nil, "", err
 	}
+	gh := jobGitHubClient("", newAgentDispatchGitHubClient(""), runner)
+	subject, err := newReviewScopeSubject(ctx, store, gh, repo, request.PullRequest)
+	if err != nil {
+		return nil, "scope unavailable: " + err.Error(), nil
+	}
 	if backend != execbackend.Remote || config.IsSandboxdProvider(request.ExecProvider) {
 		if strings.TrimSpace(record.CheckoutPath) == "" {
 			return nil, "local checkout unavailable", nil
 		}
-		scope, skipped := resolveDeltaReviewScope(ctx, store, jobGitClient(record.CheckoutPath, runner), repo.FullName(), request.PullRequest, request.HeadSHA, purpose)
+		scope, skipped := resolveDeltaReviewScope(ctx, store, jobGitClient(record.CheckoutPath, runner), subject, repo.FullName(), request.PullRequest, request.HeadSHA, purpose)
 		return scope, skipped, nil
 	}
-	graph := &remoteReviewGraph{client: jobGitHubClient("", newAgentDispatchGitHubClient(""), runner), repo: repo, head: request.HeadSHA}
-	scope, skipped := resolveDeltaReviewScopeUsing(ctx, store, graph, graph.ChangedFiles, repo.FullName(), request.PullRequest, request.HeadSHA, purpose)
+	graph := &remoteReviewGraph{client: gh, repo: repo, head: request.HeadSHA, subject: subject}
+	scope, skipped := resolveDeltaReviewScopeUsing(ctx, store, graph, graph.ScopeDiff, repo.FullName(), request.PullRequest, request.HeadSHA, purpose)
 	return scope, skipped, nil
 }

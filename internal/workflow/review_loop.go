@@ -3,7 +3,9 @@ package workflow
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -392,9 +394,11 @@ func routineScopeAggregates(candidates map[reviewScopeKey]reviewScopeCandidate, 
 		prior, ok := merged[routineKey]
 		if !ok {
 			merged[routineKey] = &ReviewScope{
-				PreviousHeadSHA: scope.PreviousHeadSHA,
-				Findings:        append([]string(nil), scope.Findings...),
-				ChangedFiles:    append([]string(nil), scope.ChangedFiles...),
+				PreviousHeadSHA:   scope.PreviousHeadSHA,
+				MergeBase:         scope.MergeBase,
+				Findings:          append([]string(nil), scope.Findings...),
+				OutsidePRFindings: append([]string(nil), scope.OutsidePRFindings...),
+				ChangedFiles:      append([]string(nil), scope.ChangedFiles...),
 			}
 			rounds[routineKey] = candidate.round
 			continue
@@ -404,10 +408,12 @@ func routineScopeAggregates(candidates map[reviewScopeKey]reviewScopeCandidate, 
 			rounds[routineKey] = candidate.round
 		}
 		prior.Findings = append(prior.Findings, scope.Findings...)
+		prior.OutsidePRFindings = append(prior.OutsidePRFindings, scope.OutsidePRFindings...)
 		prior.ChangedFiles = append(prior.ChangedFiles, scope.ChangedFiles...)
 	}
 	for _, scope := range merged {
 		scope.Findings = stableUniqueStrings(scope.Findings)
+		scope.OutsidePRFindings = stableUniqueStrings(scope.OutsidePRFindings)
 		scope.ChangedFiles = sortedUniqueStrings(scope.ChangedFiles)
 	}
 	return merged
@@ -513,24 +519,39 @@ func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent
 	if e.ReviewChangedFiles == nil {
 		return nil, fmt.Errorf("scoped follow-up review requires a changed-files resolver")
 	}
-	filesByHead := make(map[string][]string, len(candidates))
+	baseBranch := ""
+	if pull, err := e.Store.GetPullRequest(ctx, event.Repo, int64(event.PullRequest)); err == nil {
+		baseBranch = strings.TrimSpace(pull.BaseBranch)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	diffByHead := make(map[string]ReviewScopeDiff, len(candidates))
 	scopes := make(map[reviewScopeKey]*ReviewScope, len(candidates))
 	for scopeKey, candidate := range candidates {
 		previousHead := strings.TrimSpace(candidate.payload.HeadSHA)
-		files, ok := filesByHead[previousHead]
+		diff, ok := diffByHead[previousHead]
 		if !ok {
 			var err error
-			files, err = e.ReviewChangedFiles(ctx, event.Repo, event.PullRequest, previousHead, event.HeadSHA)
+			diff, err = e.ReviewChangedFiles(ctx, event.Repo, event.PullRequest, baseBranch, previousHead, event.HeadSHA)
 			if err != nil {
 				return nil, fmt.Errorf("resolve review scope from %s to %s: %w", previousHead, event.HeadSHA, err)
 			}
-			files = sortedUniqueStrings(files)
-			filesByHead[previousHead] = files
+			if strings.TrimSpace(diff.MergeBase) == "" {
+				return nil, ReviewScopeUnavailableError{Reason: fmt.Sprintf("review scope from %s to %s named no merge base to read the pull request's own change from", previousHead, event.HeadSHA)}
+			}
+			if diff.EmptyAfterBaseMerge() {
+				return nil, ReviewScopeUnavailableError{Reason: fmt.Sprintf("review scope from %s to %s: the base was merged in and no own change is proven to have moved, so the pull request is re-read against its merge base", previousHead, event.HeadSHA)}
+			}
+			diff.ChangedFiles = sortedUniqueStrings(diff.ChangedFiles)
+			diffByHead[previousHead] = diff
 		}
+		findings, outside := SplitOutsidePRFindings(candidate.findings, diff)
 		scopes[scopeKey] = &ReviewScope{
-			PreviousHeadSHA: previousHead,
-			Findings:        append([]string(nil), candidate.findings...),
-			ChangedFiles:    append([]string(nil), files...),
+			PreviousHeadSHA:   previousHead,
+			MergeBase:         strings.TrimSpace(diff.MergeBase),
+			Findings:          findings,
+			OutsidePRFindings: outside,
+			ChangedFiles:      append([]string(nil), diff.ChangedFiles...),
 		}
 	}
 	for key, aggregate := range routineScopeAggregates(candidates, scopes) {
@@ -623,9 +644,15 @@ const ReviewDesignChecklist = "Also check what this pull request adds or changes
 // engine's follow-up reviews and the review router's delta reviews (#2177).
 // The text is identical on both paths deliberately: a reviewer must not be able
 // to tell which producer bounded it, or the two briefs drift apart.
+//
+// The diff base is the merge base, never the prior head (#2682): a range from
+// the prior head carries everything a merge of the base branch brought in, and
+// reviewing that as this pull request's change blocked PRs on other PRs' code.
 func ReviewScopeInstructions(currentHead string, scope *ReviewScope) string {
 	var instructions strings.Builder
-	fmt.Fprintf(&instructions, "The reviewer last saw exact head %s; the current head is %s. Diff from that prior head, never from the PR base.\n", scope.PreviousHeadSHA, currentHead)
+	fmt.Fprintf(&instructions, "The reviewer last saw exact head %s; the current head is %s; this pull request's merge base with its base branch is %s. ", scope.PreviousHeadSHA, currentHead, scope.MergeBase)
+	fmt.Fprintf(&instructions, "Read the listed files' changes against the merge base (git diff %s %s -- <file>), never against the prior head: a range from the prior head also carries whatever a merge of the base branch brought in, and that is not this pull request's change.\n", scope.MergeBase, currentHead)
+	instructions.WriteString("Report only defects in lines this pull request adds or changes. Anything else goes under 'Outside this PR' as P3 at most and never justifies changes_requested.\n")
 	instructions.WriteString("Named findings still in scope:\n")
 	if len(scope.Findings) == 0 {
 		instructions.WriteString("- none\n")
@@ -634,7 +661,13 @@ func ReviewScopeInstructions(currentHead string, scope *ReviewScope) string {
 			fmt.Fprintf(&instructions, "- %s\n", finding)
 		}
 	}
-	instructions.WriteString("Files changed since the reviewer last saw the branch:\n")
+	if len(scope.OutsidePRFindings) > 0 {
+		instructions.WriteString("Previously reported outside this PR: do not re-raise as blocking:\n")
+		for _, finding := range scope.OutsidePRFindings {
+			fmt.Fprintf(&instructions, "- %s\n", finding)
+		}
+	}
+	instructions.WriteString("Files whose own changes moved since the reviewer last saw the branch:\n")
 	if len(scope.ChangedFiles) == 0 {
 		instructions.WriteString("- none\n")
 	} else {
@@ -642,7 +675,7 @@ func ReviewScopeInstructions(currentHead string, scope *ReviewScope) string {
 			fmt.Fprintf(&instructions, "- %s\n", path)
 		}
 	}
-	instructions.WriteString("Do not re-review the full PR-to-base diff. Validate the named findings and the listed changed files, inspecting dependencies only as needed to detect defects introduced by those changes. Report only unresolved named findings or new defects introduced since the prior head.")
+	instructions.WriteString("Do not re-review the full PR-to-base diff. Validate the named findings and the listed changed files, inspecting dependencies only as needed to detect defects introduced by those changes. Report only unresolved named findings or new defects this pull request introduced since the prior head.")
 	if len(scope.Findings) == 0 && len(scope.ChangedFiles) == 0 {
 		instructions.WriteString(" The scope is empty: approve without rereading the full diff.")
 	}

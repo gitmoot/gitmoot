@@ -69,6 +69,18 @@ code = ["sentinel/router-a", "sentinel/router-b"]
 	t.Cleanup(func() { store.Close() })
 	checkout, firstHead, head := readonlyReviewWorktreeGitCheckout(t)
 	seedReviewDispatchFixture(t, store, checkout)
+	// A delta scope measures the pull request's own change against
+	// origin/<base> (#2682). This checkout's origin is a GitHub URL that must
+	// never be fetched from a test, so origin/main is set by hand and the
+	// refresh is a no-op; the real refresh is exercised in review_scope_diff_test.
+	runGit(t, checkout, "update-ref", "refs/remotes/origin/main", "main")
+	if err := store.UpsertPullRequest(context.Background(), db.PullRequest{
+		RepoFullName: "owner/repo", Number: 12, HeadBranch: "feature/review", BaseBranch: "main", State: "open",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	previousRefresh := refreshReviewScopeOrigin
+	refreshReviewScopeOrigin = func(context.Context, gitutil.Client) error { return nil }
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
@@ -81,6 +93,7 @@ code = ["sentinel/router-a", "sentinel/router-b"]
 	t.Cleanup(func() {
 		newAgentDispatchGitHubClient = previousGitHubFactory
 		localRuntimeContractPreflight = previousPreflight
+		refreshReviewScopeOrigin = previousRefresh
 	})
 	return home, store, checkout, firstHead, head
 }
@@ -1236,11 +1249,6 @@ func saveReviewRouterVerdict(t *testing.T, store *db.Store, jobID string) {
 // shape a delta review inherits as its carried-forward brief (#2177).
 func saveReviewRouterVerdictWith(t *testing.T, store *db.Store, jobID, decision string, findings []string) {
 	t.Helper()
-	ctx := context.Background()
-	payload, err := workflow.ParseJobPayload(mustGetJob(t, store, jobID).Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// Findings are OBJECTS, which is what real reviewers emit and what
 	// db.SucceededReviewVerdicts can decode: its payload struct types findings
 	// as []struct{Severity string}, so a verdict carrying bare JSON strings
@@ -1252,6 +1260,16 @@ func saveReviewRouterVerdictWith(t *testing.T, store *db.Store, jobID, decision 
 			t.Fatal(err)
 		}
 		raw = append(raw, encoded)
+	}
+	saveReviewRouterVerdictFindings(t, store, jobID, decision, raw)
+}
+
+func saveReviewRouterVerdictFindings(t *testing.T, store *db.Store, jobID, decision string, raw []json.RawMessage) {
+	t.Helper()
+	ctx := context.Background()
+	payload, err := workflow.ParseJobPayload(mustGetJob(t, store, jobID).Payload)
+	if err != nil {
+		t.Fatal(err)
 	}
 	// Severity is REQUIRED for a review that requests changes; without it the
 	// result is not a terminal verdict and never reaches the baseline history.
@@ -1357,12 +1375,17 @@ func dispatchedReviewPayload(t *testing.T, store *db.Store, jobID string) workfl
 	return payload
 }
 
+// testReviewScopeSubject is the delta fixture's pull request #12 on main.
+func testReviewScopeSubject() *reviewScopeSubject {
+	return &reviewScopeSubject{baseBranch: "main", repo: github.Repository{Owner: "owner", Name: "repo"}, number: 12}
+}
+
 // #2177. A prior terminal verdict at an ancestor head bounds the next review to
 // that range and carries its findings, instead of paying to re-read the whole
 // pull request. Measured motivation: the same reviewer cost 1,192,188 input
 // tokens on the full diff and 342,583 on the delta.
 func TestReviewRequestDeltaFromPriorVerdictAtAncestorHead(t *testing.T) {
-	home, store, _, firstHead, secondHead := deltaReviewFixture(t)
+	home, store, checkout, firstHead, secondHead := deltaReviewFixture(t)
 
 	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, firstHead), "--role", "joltra")...)
 	if failure != "" {
@@ -1390,14 +1413,109 @@ func TestReviewRequestDeltaFromPriorVerdictAtAncestorHead(t *testing.T) {
 	if got := payload.ReviewScope.Findings; len(got) != 1 || !strings.Contains(got[0], "F1: guard has no test") {
 		t.Fatalf("carried findings = %v, want the baseline's finding: the reviewer is not told what it must answer", got)
 	}
-	if !strings.Contains(payload.Instructions, "Diff from that prior head, never from the PR base") {
-		t.Fatalf("instructions do not bound the diff: %q", payload.Instructions)
+	forkPoint := strings.TrimSpace(runGitOutput(t, checkout, "rev-parse", "main"))
+	if payload.ReviewScope.MergeBase != forkPoint {
+		t.Fatalf("scope merge base = %q, want the fork point %q", payload.ReviewScope.MergeBase, forkPoint)
+	}
+	if !strings.Contains(payload.Instructions, "git diff "+forkPoint+" "+secondHead) {
+		t.Fatalf("instructions do not read the files from the merge base: %q", payload.Instructions)
 	}
 	if !strings.Contains(payload.Instructions, "F1: guard has no test") {
 		t.Fatalf("instructions omit the carried finding: %q", payload.Instructions)
 	}
 	if strings.Contains(payload.Instructions, "Read the full diff against its base") {
 		t.Fatalf("instructions still order a full re-read: %q", payload.Instructions)
+	}
+}
+
+// #2682 at the review router. The seat merged main in between the rounds, so
+// the raw range from the prior head carries main's x.txt. The delta scope is
+// the pull request's own change: review.txt alone, read from the new merge
+// base, and the prior finding in x.txt is listed as outside this pull request
+// rather than carried as one the reviewer must answer.
+func TestReviewRequestDeltaAfterABaseMergeScopesTheOwnChange(t *testing.T) {
+	home, store, checkout, _, secondHead := deltaReviewFixture(t)
+	writeFile(t, filepath.Join(checkout, "x.txt"), "another pull request\n")
+	runGit(t, checkout, "add", "x.txt")
+	runGit(t, checkout, "commit", "-m", "another pull request lands on main")
+	mainTip := readonlyWorktreeHead(t, checkout)
+	runGit(t, checkout, "update-ref", "refs/remotes/origin/main", mainTip)
+	runGit(t, checkout, "switch", "feature/review")
+	runGit(t, checkout, "merge", "--no-edit", "main")
+	writeFile(t, filepath.Join(checkout, "review.txt"), "round three\n")
+	runGit(t, checkout, "add", "review.txt")
+	runGit(t, checkout, "commit", "-m", "review round three")
+	thirdHead := readonlyWorktreeHead(t, checkout)
+	runGit(t, checkout, "switch", "main")
+
+	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	outside := json.RawMessage(`{"severity":"P2","title":"x.txt is wrong","file":"x.txt","line":1}`)
+	own := json.RawMessage(`{"severity":"P2","title":"review.txt is wrong","file":"review.txt","line":1}`)
+	saveReviewRouterVerdictFindings(t, store, second.JobID, "changes_requested", []json.RawMessage{outside, own})
+
+	third, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, thirdHead), "--role", "owner")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	payload := dispatchedReviewPayload(t, store, third.JobID)
+	scope := payload.ReviewScope
+	if scope == nil || scope.PreviousHeadSHA != secondHead {
+		t.Fatalf("scope = %+v, want a delta from %s", scope, secondHead)
+	}
+	if raw := strings.Fields(runGitOutput(t, checkout, "diff", "--name-only", secondHead, thirdHead)); !slices.Contains(raw, "x.txt") {
+		t.Fatalf("fixture: the raw round %v does not carry x.txt", raw)
+	}
+	if !slices.Equal(scope.ChangedFiles, []string{"review.txt"}) {
+		t.Fatalf("changed files = %v, want [review.txt]: x.txt is main's, not this pull request's", scope.ChangedFiles)
+	}
+	if scope.MergeBase != mainTip {
+		t.Fatalf("merge base = %q, want the new merge base %q", scope.MergeBase, mainTip)
+	}
+	if len(scope.OutsidePRFindings) != 1 || !strings.Contains(scope.OutsidePRFindings[0], "x.txt is wrong") {
+		t.Fatalf("outside-PR findings = %q, want the x.txt finding", scope.OutsidePRFindings)
+	}
+	if len(scope.Findings) != 1 || !strings.Contains(scope.Findings[0], "review.txt is wrong") {
+		t.Fatalf("carried findings = %q, want only the review.txt finding", scope.Findings)
+	}
+	if !strings.Contains(payload.Instructions, mainTip) || !strings.Contains(payload.Instructions, "Outside this PR") {
+		t.Fatalf("instructions lack the merge base or the outside-PR rule: %q", payload.Instructions)
+	}
+}
+
+// #2682 round 2. The seat only merged main in: no own change moved, but the
+// pull request has one. That empty scope must not tell the reviewer to approve
+// without reading; the request falls back to a full review against the merge
+// base.
+func TestReviewRequestDeltaAfterABaseMergeAloneIsAFullReview(t *testing.T) {
+	home, store, checkout, _, secondHead := deltaReviewFixture(t)
+	writeFile(t, filepath.Join(checkout, "x.txt"), "another pull request\n")
+	runGit(t, checkout, "add", "x.txt")
+	runGit(t, checkout, "commit", "-m", "another pull request lands on main")
+	runGit(t, checkout, "update-ref", "refs/remotes/origin/main", readonlyWorktreeHead(t, checkout))
+	runGit(t, checkout, "switch", "feature/review")
+	runGit(t, checkout, "merge", "--no-edit", "main")
+	mergedHead := readonlyWorktreeHead(t, checkout)
+	runGit(t, checkout, "switch", "main")
+
+	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, second.JobID)
+
+	merged, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, mergedHead), "--role", "owner")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	payload := dispatchedReviewPayload(t, store, merged.JobID)
+	if payload.ReviewScope != nil {
+		t.Fatalf("scope = %+v, want a full review: no own change is proven to have moved", payload.ReviewScope)
+	}
+	if strings.Contains(payload.Instructions, "approve without rereading") || !strings.Contains(payload.Instructions, "Read the full diff against its base") {
+		t.Fatalf("instructions are not a full review: %q", payload.Instructions)
 	}
 }
 
@@ -1653,14 +1771,14 @@ func TestResolveDeltaScopeNeverBoundsAHeadAgainstItself(t *testing.T) {
 	// DESCENDANT, where a scope must be built - proving the resolver, the store
 	// and the git client all work before the real assertion claims a nil.
 	git := gitutil.NewHostClient(checkout)
-	control, controlReason := resolveDeltaReviewScope(ctx, store, git, "owner/repo", 12, descendant, "code")
+	control, controlReason := resolveDeltaReviewScope(ctx, store, git, testReviewScopeSubject(), "owner/repo", 12, descendant, "code")
 	if control == nil {
 		t.Fatalf("control: no scope built at a descendant head (%s), so a nil below would prove nothing", controlReason)
 	}
 	if control.PreviousHeadSHA != head {
 		t.Fatalf("control: baseline = %q, want the verdict head %q", control.PreviousHeadSHA, head)
 	}
-	scope, reason := resolveDeltaReviewScope(ctx, store, git, "owner/repo", 12, head, "code")
+	scope, reason := resolveDeltaReviewScope(ctx, store, git, testReviewScopeSubject(), "owner/repo", 12, head, "code")
 	if scope != nil {
 		t.Fatalf("scope = %+v, want nil: a head bounded against itself yields an empty range and an instruction to approve without reading", scope)
 	}
@@ -1807,7 +1925,7 @@ func TestDeltaStepsOverASameHeadVerdictToAnOlderAncestor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	scope, reason := resolveDeltaReviewScope(ctx, store, gitutil.NewHostClient(checkout), "owner/repo", 12, secondHead, "code")
+	scope, reason := resolveDeltaReviewScope(ctx, store, gitutil.NewHostClient(checkout), testReviewScopeSubject(), "owner/repo", 12, secondHead, "code")
 	if scope == nil || scope.PreviousHeadSHA != firstHead {
 		t.Fatalf("scope = %+v (%s), want the older ancestor %s: a same-head verdict must be stepped over, not end the search", scope, reason, firstHead)
 	}
@@ -1841,7 +1959,7 @@ func TestDeltaStepsOverAWrongPurposeVerdictToAnOlderMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	scope, reason := resolveDeltaReviewScope(ctx, store, gitutil.NewHostClient(checkout), "owner/repo", 12, secondHead, "code")
+	scope, reason := resolveDeltaReviewScope(ctx, store, gitutil.NewHostClient(checkout), testReviewScopeSubject(), "owner/repo", 12, secondHead, "code")
 	if scope == nil || scope.PreviousHeadSHA != firstHead {
 		t.Fatalf("scope = %+v (%s), want %s: a newer wrong-purpose verdict must be stepped over, not end the search", scope, reason, firstHead)
 	}

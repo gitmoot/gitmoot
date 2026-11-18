@@ -23,12 +23,12 @@ func TestUnscopableFollowUpReanchorsInsteadOfWedging(t *testing.T) {
 		Summary:  "Fix the boundary check.",
 	})
 	var ranges []string
-	engine.ReviewChangedFiles = func(_ context.Context, _ string, _ int, previousHead, currentHead string) ([]string, error) {
+	engine.ReviewChangedFiles = func(_ context.Context, _ string, _ int, _ string, previousHead, currentHead string) (ReviewScopeDiff, error) {
 		ranges = append(ranges, previousHead+".."+currentHead)
 		if previousHead == "head-one" {
-			return nil, ReviewScopeUnavailableError{Reason: `review scope compare is "diverged", not a direct follow-up`}
+			return ReviewScopeDiff{}, ReviewScopeUnavailableError{Reason: `review scope compare is "diverged", not a direct follow-up`}
 		}
-		return []string{"internal/boundary.go"}, nil
+		return testScopeDiff("internal/boundary.go"), nil
 	}
 
 	if err := engine.HandlePullRequestOpened(ctx, reviewRefanoutEvent("head-two")); err != nil {

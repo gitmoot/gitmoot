@@ -369,6 +369,11 @@ type CompareResult struct {
 	BaseCommit struct {
 		SHA string `json:"sha"`
 	} `json:"base_commit"`
+	// MergeBaseCommit is the merge base of a three-dot `base...head` compare:
+	// Files are the change from it to head.
+	MergeBaseCommit struct {
+		SHA string `json:"sha"`
+	} `json:"merge_base_commit"`
 	Files []PullRequestFile `json:"files"`
 	// Truncated reports that Files is demonstrably INCOMPLETE for this range:
 	// the compare endpoint returned its 300-file maximum and CompareCommits

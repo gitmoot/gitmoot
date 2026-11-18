@@ -58,6 +58,14 @@ status` shows that it is running.
    head of the pull request, so it need not be repeated. The re-review closes
    a finding only by citing its UID (`continues_uid`, see
    [RESULT_CONTRACT.md](RESULT_CONTRACT.md#the-findings-ledger)).
+   The re-review is a follow-up: it reads only the files whose own change
+   moved since the last verdict, against the pull request's merge base with
+   its base branch. Merging the base branch in between rounds adds nothing to
+   it; a round that only merged the base in, with nothing proven to have
+   moved, is a full review against the merge base. It reports only defects in
+   lines the pull request adds or changes; anything else goes under "Outside
+   this PR" as P3 at most, never blocks, and is not carried into the next
+   round. `--full` re-reads the whole diff.
 5. On `approved` at the current head with green CI, the gate merges (when
    automatic merge is on) or a `/gitmoot merge` comment asks it to (when it is
    off, and your role's `merge_rule` is `self`). If it holds, the reason names

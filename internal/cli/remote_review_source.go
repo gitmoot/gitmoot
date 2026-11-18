@@ -93,7 +93,7 @@ func (w jobWorker) prepareRemoteReviewSource(ctx context.Context, job db.Job, cf
 		plan.source.MergedSHA = strings.ToLower(strings.TrimSpace(pull.MergeSHA))
 	}
 	if payload.ReviewScope != nil {
-		plan.source.DiffBase = strings.ToLower(strings.TrimSpace(payload.ReviewScope.PreviousHeadSHA))
+		plan.source.DiffBase = strings.ToLower(reviewScopeDiffBase(payload.ReviewScope))
 	}
 	return plan, nil
 }
