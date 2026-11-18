@@ -527,21 +527,23 @@ func (s *Store) ListReviewJobsForPullRequest(ctx context.Context, repo string, p
 
 // ListReviewJobsInTaskScope returns every review job that could belong to the
 // same task as a job on repo/pullRequest, for workflow.sameTask to decide
-// exactly (#2470). It replaces a full ListJobs scan in review-round lookups,
-// which decoded every job payload on each advancement. The scope is a SUPERSET
-// of sameTask's matches: the repo projection must equal repo (sameTask rejects
-// differing non-empty repos), and when pullRequest > 0 the row's pull_request
-// projection is either that number or unset (0/NULL), because older rows carry
-// the PR only inside their payload. An empty repo cannot be narrowed, so it
-// returns every review job.
+// exactly (#2470). It replaces full ListJobs scans in review-round lookups and
+// the merge gate's review-required check (#2687), which decoded every job
+// payload on each call. The scope is a SUPERSET of sameTask's matches: the repo
+// projection must equal repo or be unset (sameTask rejects only differing
+// non-empty repos, and a row with no repo can still match by task id), and when
+// pullRequest > 0 the row's pull_request projection is either that number or
+// unset (0), because older rows carry the PR only inside their payload. Both
+// are IN lists, so the read seeks idx_jobs_review_repo_pr. An empty repo cannot
+// be narrowed, so it returns every review job.
 func (s *Store) ListReviewJobsInTaskScope(ctx context.Context, repo string, pullRequest int) ([]Job, error) {
 	if strings.TrimSpace(repo) == "" {
 		return s.ListJobsByType(ctx, "review")
 	}
-	query := `SELECT ` + jobColumns + ` FROM jobs WHERE type = 'review' AND repo = ?`
+	query := `SELECT ` + jobColumns + ` FROM jobs WHERE type = 'review' AND repo IN (?, '')`
 	args := []any{repo}
 	if pullRequest > 0 {
-		query += ` AND (pull_request = ? OR pull_request = 0 OR pull_request IS NULL)`
+		query += ` AND pull_request IN (?, 0)`
 		args = append(args, pullRequest)
 	}
 	rows, err := s.db.QueryContext(ctx, query+` ORDER BY id`, args...)
@@ -2197,7 +2199,7 @@ const (
 		WHERE kind = 'comment_post_failed'
 		  AND id IN (
 			SELECT MAX(id) FROM job_events
-			WHERE kind IN ('comment_post_failed', 'comment_posted', 'retry_queued')
+			WHERE kind IN ('comment_post_failed', 'comment_posted', 'retry_queued', 'comment_post_abandoned')
 			GROUP BY job_id
 		)
 		ORDER BY job_id`
@@ -2430,14 +2432,59 @@ func (s *Store) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, er
 }
 
 // JobIDsWithPendingCommentRetry returns the IDs of jobs whose LATEST comment event
-// (by id) is comment_post_failed with no subsequent comment_posted or retry_queued
-// — exactly jobWorker.jobNeedsCommentRetry's last-one-wins rule (daemon.go),
+// (by id) is comment_post_failed with no subsequent comment_posted, retry_queued
+// or comment_post_abandoned — exactly CommentRetryState's Pending rule,
 // evaluated set-at-once so the comment-retry pass iterates only genuine candidates
 // instead of a full ListJobs + per-terminal-job ListJobEvents on every 1s worker
-// tick (#598). The pass re-verifies each candidate with the Go predicate, so this
-// only has to be a superset; it is in fact exact.
+// tick (#598). The pass re-verifies each candidate with the per-job state, so
+// this only has to be a superset; it is in fact exact.
 func (s *Store) JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, error) {
 	return s.jobIDsByQuery(ctx, jobIDsWithPendingCommentRetrySQL)
+}
+
+// CommentRetryState is one job's PR result-comment delivery state.
+type CommentRetryState struct {
+	// Pending reports that the newest of comment_post_failed, comment_posted,
+	// retry_queued and comment_post_abandoned is comment_post_failed: a failed
+	// post nothing has resolved, re-posted, or given up on.
+	Pending bool
+	// Posted reports that the newest of comment_posted and retry_queued is
+	// comment_posted: this run's result comment is already on the PR.
+	Posted bool
+	// Failures counts the comment_post_failed events after the newest
+	// comment_posted or retry_queued, i.e. this run's failed post attempts.
+	Failures int
+	// LatestFailedAt is the newest comment_post_failed event's created_at, or
+	// "" when there is none.
+	LatestFailedAt string
+}
+
+// commentRetryStateSQL reads CommentRetryState with one MAX(id) seek per kind on
+// idx_job_events_kind_job_id plus a range count after the newest reset, instead
+// of the job's whole event history. A job whose comment failed every 1s tick for
+// days held ~48k events, and each retry re-read all of them (#2688).
+const commentRetryStateSQL = `WITH latest AS (SELECT
+		COALESCE((SELECT MAX(id) FROM job_events WHERE kind = 'comment_post_failed' AND job_id = ?), 0) AS failed,
+		COALESCE((SELECT MAX(id) FROM job_events WHERE kind = 'comment_posted' AND job_id = ?), 0) AS posted,
+		COALESCE((SELECT MAX(id) FROM job_events WHERE kind = 'retry_queued' AND job_id = ?), 0) AS requeued,
+		COALESCE((SELECT MAX(id) FROM job_events WHERE kind = 'comment_post_abandoned' AND job_id = ?), 0) AS abandoned)
+	SELECT failed, posted, requeued, abandoned,
+		COALESCE((SELECT created_at FROM job_events WHERE id = latest.failed), ''),
+		(SELECT COUNT(*) FROM job_events WHERE kind = 'comment_post_failed' AND job_id = ?
+			AND id > MAX(latest.posted, latest.requeued))
+	FROM latest`
+
+// CommentRetryState reads jobID's result-comment delivery state (#2688).
+func (s *Store) CommentRetryState(ctx context.Context, jobID string) (CommentRetryState, error) {
+	var failed, posted, requeued, abandoned int64
+	var state CommentRetryState
+	if err := s.db.QueryRowContext(ctx, commentRetryStateSQL, jobID, jobID, jobID, jobID, jobID).Scan(
+		&failed, &posted, &requeued, &abandoned, &state.LatestFailedAt, &state.Failures); err != nil {
+		return CommentRetryState{}, err
+	}
+	state.Pending = failed > posted && failed > requeued && failed > abandoned
+	state.Posted = posted > requeued
+	return state, nil
 }
 
 // JobIDsWithPendingSupersedeFinalization returns the IDs of jobs whose closed-PR

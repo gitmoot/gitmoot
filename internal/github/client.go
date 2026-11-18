@@ -1774,6 +1774,7 @@ func (c *GhClient) runRequest(ctx context.Context, mutate bool, conditional bool
 		c.mutateMu.Lock()
 		defer c.mutateMu.Unlock()
 	}
+	args = argvWithoutNUL(args)
 
 	runner := c.Runner
 	if runner == nil {
@@ -1866,6 +1867,27 @@ func (c *GhClient) runRequest(ctx context.Context, mutate bool, conditional bool
 	return result, nil
 }
 
+// argvWithoutNUL drops NUL bytes from every gh argument (#2688). execve takes C
+// strings, so one NUL anywhere in argv makes os/exec refuse the whole call with
+// EINVAL: a permanent failure that no retry can clear. Bodies never reach this
+// with a NUL — bodyNeedsFile moves them to a temp file, which carries the byte —
+// so it only touches short free-text fields built from job text (titles, merge
+// subjects, status descriptions, search queries), whose NUL has no meaning on
+// GitHub. The common case returns args unchanged without copying.
+func argvWithoutNUL(args []string) []string {
+	for i, arg := range args {
+		if strings.IndexByte(arg, 0) < 0 {
+			continue
+		}
+		clean := append([]string(nil), args...)
+		for j := i; j < len(clean); j++ {
+			clean[j] = strings.ReplaceAll(clean[j], "\x00", "")
+		}
+		return clean
+	}
+	return args
+}
+
 func isRESTGet(args []string) bool {
 	// `gh api graphql` is a POST, not a REST read.
 	if len(args) == 0 || args[0] != "api" || (len(args) > 1 && args[1] == "graphql") {
@@ -1935,14 +1957,23 @@ func writeGhBodyTempFile(body string) (string, func(), error) {
 	return name, cleanup, nil
 }
 
+// bodyNeedsFile reports whether body must reach gh through a temp file rather
+// than argv: it is too large for one argv element (#734), or it holds a NUL
+// byte, which no argv element can carry — execve takes C strings, so os/exec
+// refuses the whole call with EINVAL before gh runs (#2688). The file carries
+// any byte, so the body is delivered unaltered rather than stripped.
+func bodyNeedsFile(body string) bool {
+	return len(body) > bodyFileThreshold || strings.IndexByte(body, 0) >= 0
+}
+
 // bodyFlagArgs returns the gh arguments that supply body to a gh verb that
-// accepts `--body`/`--body-file` (e.g. `gh pr create`, `gh pr merge`). A body at
-// or below bodyFileThreshold is passed inline as `--body <body>` — byte-identical
-// to the historical behavior — while a larger one is written to a temp file and
-// passed as `--body-file <path>` to stay under ARG_MAX (#734). The returned
+// accepts `--body`/`--body-file` (e.g. `gh pr create`, `gh pr merge`). An
+// ordinary body is passed inline as `--body <body>` — byte-identical to the
+// historical behavior — while one bodyNeedsFile rejects for argv is written to a
+// temp file and passed as `--body-file <path>` (#734, #2688). The returned
 // cleanup removes any temp file and must be deferred by the caller.
 func bodyFlagArgs(body string) (args []string, cleanup func(), err error) {
-	if len(body) <= bodyFileThreshold {
+	if !bodyNeedsFile(body) {
 		return []string{"--body", body}, func() {}, nil
 	}
 	path, cleanup, err := writeGhBodyTempFile(body)
@@ -1953,16 +1984,16 @@ func bodyFlagArgs(body string) (args []string, cleanup func(), err error) {
 }
 
 // apiBodyFieldArgs returns the `gh api` field arguments that supply the "body"
-// parameter. A body at or below bodyFileThreshold is passed inline as
-// `-f body=<body>` — byte-identical to the historical behavior — while a larger
-// one is written to a temp file and passed as `-F body=@<path>`, which tells
-// `gh api` to read the field value from that file instead of taking it as a
-// single argv argument that would blow ARG_MAX (#734). gh's `-F/--field` `@file`
+// parameter. An ordinary body is passed inline as `-f body=<body>` —
+// byte-identical to the historical behavior — while one bodyNeedsFile rejects
+// for argv is written to a temp file and passed as `-F body=@<path>`, which
+// tells `gh api` to read the field value from that file instead of taking it as
+// a single argv argument (#734, #2688). gh's `-F/--field` `@file`
 // magic reads the file content verbatim as the string value; the file-read path
 // bypasses the true/false/number type coercion, so a body is never re-typed. The
 // returned cleanup removes any temp file and must be deferred by the caller.
 func apiBodyFieldArgs(body string) (args []string, cleanup func(), err error) {
-	if len(body) <= bodyFileThreshold {
+	if !bodyNeedsFile(body) {
 		return []string{"-f", "body=" + body}, func() {}, nil
 	}
 	path, cleanup, err := writeGhBodyTempFile(body)

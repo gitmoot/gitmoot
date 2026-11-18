@@ -2355,12 +2355,56 @@ func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[st
 		if ready.headSHA != "" && pull.HeadSHA != ready.headSHA {
 			continue
 		}
-		if err := d.handleReadyToMergeWorkflow(ctx, pull, ready.task); err != nil {
+		if pullRequestListedAsMerged(pull) {
+			if err := d.handleReadyToMergeWorkflow(ctx, pull, ready.task); err != nil {
+				return err
+			}
+		} else if err := d.settleClosedUnmergedReadyToMerge(ctx, pull, ready.task); err != nil {
 			return err
 		}
 		delete(readyBranches, pull.HeadRef)
 	}
 	return nil
+}
+
+// settleClosedUnmergedReadyToMerge ends a ready_to_merge task whose pull
+// request closed without merging (#2687). Running the merge gate for it changed
+// nothing, so retryClosedReadyToMerge re-ran the whole gate every poll, forever.
+// The engine dismisses a review record with no live job and parks anything else
+// blocked, so the task leaves ready_to_merge once. A retained merge claim would
+// fence that transition; the PR closing unmerged is the authoritative terminal
+// fact the claim awaits, so it is recovered to blocked first, exactly as the
+// branchless external-merge reconcile does.
+func (d Daemon) settleClosedUnmergedReadyToMerge(ctx context.Context, pull github.PullRequest, task db.Task) error {
+	if d.Workflow == nil {
+		return nil
+	}
+	ready, _, err := d.Store.RevalidateTaskState(ctx, task.ID, string(workflow.TaskReadyToMerge))
+	if err != nil || !ready {
+		return err
+	}
+	claimed, err := d.Store.HasTaskStateClaim(ctx, task.ID)
+	if err != nil {
+		return err
+	}
+	if claimed {
+		if _, _, err := d.Store.RecoverClaimedTaskState(ctx, task.ID,
+			string(workflow.TaskBlocked), workflow.TaskEventPullRequestClosedUnmerged,
+			fmt.Sprintf("pull request #%d closed without merging while holding a retained merge claim", pull.Number)); err != nil {
+			return err
+		}
+	}
+	return d.Workflow.HandleReadyToMergePullRequestClosedUnmerged(ctx, workflow.PullRequestEvent{
+		Repo:        d.Repo.FullName(),
+		Branch:      task.Branch,
+		PullRequest: int(pull.Number),
+		HeadSHA:     pull.HeadSHA,
+		GoalID:      task.GoalID,
+		TaskID:      task.ID,
+		TaskTitle:   task.Title,
+		LeadAgent:   "github",
+		Sender:      "github",
+	})
 }
 
 // reconcileClosedReviewingTasks self-heals tasks wedged in `reviewing` whose PR

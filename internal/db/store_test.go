@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1853,20 +1854,35 @@ func referenceJobNeedsAdvanceRetry(kinds []string) bool {
 	return needsRetry
 }
 
-// referenceJobNeedsCommentRetry mirrors jobWorker.jobNeedsCommentRetry.
+// referenceJobNeedsCommentRetry is the last-one-wins pending rule
+// CommentRetryState.Pending and JobIDsWithPendingCommentRetry implement.
 func referenceJobNeedsCommentRetry(kinds []string) bool {
 	needsRetry := false
 	for _, kind := range kinds {
 		switch kind {
 		case "comment_post_failed":
 			needsRetry = true
-		case "comment_posted":
-			needsRetry = false
-		case "retry_queued":
+		case "comment_posted", "retry_queued", "comment_post_abandoned":
 			needsRetry = false
 		}
 	}
 	return needsRetry
+}
+
+// referenceCommentRetryState replays kinds into the posted flag and the failed
+// attempts since the newest comment_posted or retry_queued.
+func referenceCommentRetryState(kinds []string) (posted bool, failures int) {
+	for _, kind := range kinds {
+		switch kind {
+		case "comment_post_failed":
+			failures++
+		case "comment_posted":
+			posted, failures = true, 0
+		case "retry_queued":
+			posted, failures = false, 0
+		}
+	}
+	return posted, failures
 }
 
 func TestJobIDsWithPendingAdvanceRetry(t *testing.T) {
@@ -1938,6 +1954,8 @@ func TestJobIDsWithPendingCommentRetry(t *testing.T) {
 		{name: "failed then retry_queued reset", events: []string{"comment_post_failed", "retry_queued"}, wantPending: false},
 		{name: "posted then failed last wins pending", events: []string{"comment_posted", "comment_post_failed"}, wantPending: true},
 		{name: "failed trailing noise still pending", events: []string{"comment_post_failed", "queued", "succeeded"}, wantPending: true},
+		{name: "failed then abandoned terminal", events: []string{"comment_post_failed", "comment_post_abandoned"}, wantPending: false},
+		{name: "abandoned then retry run failed pending", events: []string{"comment_post_abandoned", "retry_queued", "comment_post_failed"}, wantPending: true},
 	}
 
 	ctx := context.Background()
@@ -1992,7 +2010,7 @@ func TestJobIDsWithPendingRetryMutationGuard(t *testing.T) {
 		"queued", "route_selected", "blocker_deferred", // noise
 	}
 	cmtKinds := []string{
-		"comment_post_failed", "comment_posted", "retry_queued",
+		"comment_post_failed", "comment_posted", "retry_queued", "comment_post_abandoned",
 		"queued", "succeeded", "runtime_lock_wait", // noise
 	}
 
@@ -2026,6 +2044,16 @@ func TestJobIDsWithPendingRetryMutationGuard(t *testing.T) {
 		}
 		if referenceJobNeedsCommentRetry(seq) {
 			wantCmt[jobID] = true
+		}
+		state, err := store.CommentRetryState(ctx, jobID)
+		if err != nil {
+			t.Fatalf("CommentRetryState(%s): %v", jobID, err)
+		}
+		wantPosted, wantFailures := referenceCommentRetryState(seq)
+		if state.Pending != referenceJobNeedsCommentRetry(seq) || state.Posted != wantPosted || state.Failures != wantFailures ||
+			(state.LatestFailedAt != "") != slices.Contains(seq, "comment_post_failed") {
+			t.Fatalf("CommentRetryState(%v) = %+v, want pending=%v posted=%v failures=%d",
+				seq, state, referenceJobNeedsCommentRetry(seq), wantPosted, wantFailures)
 		}
 	}
 

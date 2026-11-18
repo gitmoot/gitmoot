@@ -672,6 +672,7 @@ func TestDaemonWorkerTickRetriesFailedResultCommentPost(t *testing.T) {
 	}
 
 	comments.postErr = nil
+	pinCommentRetryClock(t, time.Now().Add(commentRetryMaxDelay))
 	if err := retryPendingJobComments(ctx, worker, "owner/repo", "", newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobComments returned error: %v", err)
 	}
@@ -713,6 +714,7 @@ func TestRetryPendingJobCommentsPreservesStoredFailureDiagnostic(t *testing.T) {
 	worker.CommenterFactory = func(string) github.Client {
 		return comments
 	}
+	pinCommentRetryClock(t, time.Now().Add(commentRetryMaxDelay))
 
 	if err := retryPendingJobComments(ctx, worker, "owner/repo", "", newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobComments returned error: %v", err)
@@ -3475,6 +3477,7 @@ func TestRetryPendingJobCommentsBoundedToCandidates(t *testing.T) {
 	comments := &cliPollFakeGitHub{}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CommenterFactory = func(string) github.Client { return comments }
+	pinCommentRetryClock(t, time.Now().Add(commentRetryMaxDelay))
 
 	if err := retryPendingJobComments(ctx, worker, "owner/repo", "", newTickCandidates(worker.Store)); err != nil {
 		t.Fatalf("retryPendingJobComments returned error: %v", err)
