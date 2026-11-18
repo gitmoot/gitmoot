@@ -82,7 +82,7 @@ func TestRemoteProviderRefusalClusterAlertsOperatorOncePerHour(t *testing.T) {
 	ageThrottle := func(store *db.Store, by time.Duration) {
 		t.Helper()
 		stamp := time.Now().UTC().Add(-by).Format(db.BlockedEpisodeTimeLayout)
-		if err := store.ExecForTest(ctx, fmt.Sprintf(`UPDATE org_blocked_episodes SET emitted_at = '%s' WHERE subject = 'provider-refusal:e2b'`, stamp)); err != nil {
+		if err := store.ExecForTest(ctx, fmt.Sprintf(`UPDATE org_blocked_episodes SET emitted_at = '%s' WHERE subject = 'system-alert:provider-refusal:e2b'`, stamp)); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -94,17 +94,23 @@ func (s *Store) ClearBlockedEpisode(ctx context.Context, subject string) error {
 	return err
 }
 
-// SendThrottledSystemAlert sends recipient one system message for subject
-// unless the subject already sent one within interval, and reports whether it
-// sent. The throttle is the subject's episode row, claimed in the same
-// transaction that inserts the message: a restart cannot resend, and a failed
-// send stays owed. Use a subject no blocked_since evaluator reads (they read
-// only their own "role:", "task:" and "input-pending:" prefixes).
-func (s *Store) SendThrottledSystemAlert(ctx context.Context, subject, recipient, body string, now time.Time, interval time.Duration) (bool, error) {
-	subject, recipient = strings.TrimSpace(subject), strings.TrimSpace(recipient)
-	if subject == "" || recipient == "" || strings.TrimSpace(body) == "" || interval <= 0 {
-		return false, errors.New("throttled system alert needs a subject, a recipient, a body and a positive interval")
+// systemAlertSubjectPrefix is the episode-row namespace that
+// SendThrottledSystemAlert owns. Callers pass only their alert key, so a
+// throttle row can never collide with a blocked_since episode ("role:",
+// "task:", "input-pending:") that an evaluator would read or clear.
+const systemAlertSubjectPrefix = "system-alert:"
+
+// SendThrottledSystemAlert sends recipient one system message for key unless
+// the key already sent one within interval, and reports whether it sent. The
+// throttle is the key's episode row (under systemAlertSubjectPrefix), claimed in
+// the same transaction that inserts the message: a restart cannot resend, and a
+// failed send stays owed.
+func (s *Store) SendThrottledSystemAlert(ctx context.Context, key, recipient, body string, now time.Time, interval time.Duration) (bool, error) {
+	key, recipient = strings.TrimSpace(key), strings.TrimSpace(recipient)
+	if key == "" || recipient == "" || strings.TrimSpace(body) == "" || interval <= 0 {
+		return false, errors.New("throttled system alert needs a key, a recipient, a body and a positive interval")
 	}
+	subject := systemAlertSubjectPrefix + key
 	writeCtx, cancel := s.durableWriteContext(ctx, 2)
 	defer cancel()
 	sent := false

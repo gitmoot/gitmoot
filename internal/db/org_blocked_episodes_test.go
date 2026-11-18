@@ -80,3 +80,34 @@ func TestUpsertBlockedEpisodeRejectsEmptySubject(t *testing.T) {
 		t.Fatal("UpsertBlockedEpisode() error = nil, want validation error")
 	}
 }
+
+// A throttled alert keyed like a blocked-since subject must not create or
+// touch that subject's episode: an evaluator would otherwise read the throttle
+// row as a blocked task, or clear it and let the alert resend.
+func TestSendThrottledSystemAlertCannotEnterBlockedSinceNamespace(t *testing.T) {
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 11, 18, 20, 0, 0, 0, time.UTC)
+	if sent, err := store.SendThrottledSystemAlert(ctx, "task:owner/repo:task-1", "gitmoot", "alert", now, time.Hour); err != nil || !sent {
+		t.Fatalf("SendThrottledSystemAlert() = %v, %v; want sent", sent, err)
+	}
+	episodes, err := store.ListBlockedEpisodes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, episode := range episodes {
+		if episode.Subject == "task:owner/repo:task-1" {
+			t.Fatalf("alert throttle stored under the blocked-since subject %q", episode.Subject)
+		}
+	}
+	if err := store.ClearBlockedEpisode(ctx, "task:owner/repo:task-1"); err != nil {
+		t.Fatal(err)
+	}
+	if sent, err := store.SendThrottledSystemAlert(ctx, "task:owner/repo:task-1", "gitmoot", "alert", now.Add(time.Minute), time.Hour); err != nil || sent {
+		t.Fatalf("after clearing the blocked-since subject, SendThrottledSystemAlert() = %v, %v; want throttled", sent, err)
+	}
+}
