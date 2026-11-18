@@ -141,6 +141,10 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 		return runTaskEvents(args[1:], stdout, stderr)
 	case "successor":
 		return runTaskSuccessor(args[1:], stdout, stderr)
+	case "stalled":
+		return runPRStalled(args[1:], stdout, stderr)
+	case "hold":
+		return runPRHold(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown pr command %q\n\n", args[0])
 		printTaskUsage(stderr)
@@ -151,12 +155,19 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot pr events <pr> [--repo owner/repo] [--json]")
+	fmt.Fprintln(w, "  gitmoot pr hold owner/repo#N --reason TEXT [--role role] [--json]")
+	fmt.Fprintln(w, "  gitmoot pr hold --clear owner/repo#N [--role role] [--json]")
 	fmt.Fprintln(w, "  gitmoot pr list [--repo owner/repo] [--state state] [--json]")
 	fmt.Fprintln(w, "  gitmoot pr show <pr> [--repo owner/repo] [--json]")
+	fmt.Fprintln(w, "  gitmoot pr stalled [--repo owner/repo] [--json]")
 	fmt.Fprintln(w, "  gitmoot pr successor <id> [--reason text] [--json]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "<pr> is a pr id (review-pr-N-...), owner/repo#N, or N with --repo.")
 	fmt.Fprintln(w, "pr list puts rows that have no pull request (old adhoc-/task- rows) last.")
+	fmt.Fprintln(w, "pr stalled lists open pull requests stuck between steps (no_ci_on_head, ci_red,")
+	fmt.Fprintln(w, "awaiting_review, green_not_merged, draft_stale) with the owning seat and a next")
+	fmt.Fprintln(w, "command; it reads GitHub once per repository. pr hold silences one pull request")
+	fmt.Fprintln(w, "until its head moves.")
 }
 
 // runTaskSuccessor creates the successor of a disposed (stranded, superseded,

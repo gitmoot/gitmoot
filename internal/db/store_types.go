@@ -261,6 +261,9 @@ type MergeGate struct {
 	// row is not a block and correctly stores the zero value. It is durable
 	// precisely so an exit path outside the blocking call stack can read it.
 	BlockClass int
+	// UpdatedAt is the stored "2006-01-02 15:04:05" UTC instant of the last
+	// evaluation; reads fill it, UpsertMergeGate ignores it.
+	UpdatedAt string
 }
 
 // PullRequestTerminalReconciliation pins one canonical terminal-effects owner

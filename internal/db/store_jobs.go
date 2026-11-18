@@ -304,31 +304,52 @@ type TaskJobAttribution struct {
 func (s *Store) TaskJobAttribution(ctx context.Context, repo, taskID string) (TaskJobAttribution, error) {
 	repo = strings.TrimSpace(repo)
 	taskID = strings.TrimSpace(taskID)
-	var out TaskJobAttribution
 	if repo == "" || taskID == "" {
-		return out, nil
+		return TaskJobAttribution{}, nil
 	}
-	const taskJobs = `FROM jobs j WHERE j.repo = ? AND json_valid(j.payload) AND json_extract(j.payload, '$.task_id') = ?`
+	return s.jobAttribution(ctx,
+		`FROM jobs j WHERE j.repo = ? AND json_valid(j.payload) AND json_extract(j.payload, '$.task_id') = ?`,
+		"", repo, taskID)
+}
+
+// PullRequestJobAttribution is TaskJobAttribution keyed by pull request rather
+// than by task, so a pull request without a review task still resolves
+// (#2677): the newest review requester of any of its jobs, and the acting role
+// of its newest implement job. PullRequest is the pull request itself.
+func (s *Store) PullRequestJobAttribution(ctx context.Context, repo string, pullRequest int) (TaskJobAttribution, error) {
+	repo = strings.TrimSpace(repo)
+	if repo == "" || pullRequest <= 0 {
+		return TaskJobAttribution{}, nil
+	}
+	return s.jobAttribution(ctx, `FROM jobs j WHERE j.repo = ? AND j.pull_request = ?`,
+		`AND j.type = 'implement'`, repo, pullRequest)
+}
+
+// jobAttribution runs the attribution query over the jobs selected by scope
+// (a FROM ... WHERE clause taking args); actingFilter further narrows the jobs
+// whose acting role counts.
+func (s *Store) jobAttribution(ctx context.Context, scope, actingFilter string, args ...any) (TaskJobAttribution, error) {
 	var requester, actingRole sql.NullString
 	var pullRequest sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `SELECT
-	(SELECT (SELECT trim(r.requester) FROM review_requests r WHERE r.job_id = j.id AND trim(r.requester) != '' LIMIT 1) `+taskJobs+`
+	(SELECT (SELECT trim(r.requester) FROM review_requests r WHERE r.job_id = j.id AND trim(r.requester) != '' LIMIT 1) `+scope+`
 		AND EXISTS (SELECT 1 FROM review_requests r WHERE r.job_id = j.id AND trim(r.requester) != '')
 		ORDER BY j.created_at DESC, j.id DESC LIMIT 1),
-	(SELECT trim(json_extract(j.payload, '$.acting_org_role')) `+taskJobs+`
+	(SELECT trim(json_extract(j.payload, '$.acting_org_role')) `+scope+` `+actingFilter+`
 		AND json_type(j.payload, '$.acting_org_role') = 'text'
 		AND trim(json_extract(j.payload, '$.acting_org_role')) != ''
 		ORDER BY j.created_at DESC, j.id DESC LIMIT 1),
-	(SELECT j.pull_request `+taskJobs+` AND j.pull_request > 0
+	(SELECT j.pull_request `+scope+` AND j.pull_request > 0
 		ORDER BY j.created_at DESC, j.id DESC LIMIT 1)`,
-		repo, taskID, repo, taskID, repo, taskID).Scan(&requester, &actingRole, &pullRequest)
+		append(append(append([]any{}, args...), args...), args...)...).Scan(&requester, &actingRole, &pullRequest)
 	if err != nil {
 		return TaskJobAttribution{}, err
 	}
-	out.Requester = strings.TrimSpace(requester.String)
-	out.ActingRole = strings.TrimSpace(actingRole.String)
-	out.PullRequest = int(pullRequest.Int64)
-	return out, nil
+	return TaskJobAttribution{
+		Requester:   strings.TrimSpace(requester.String),
+		ActingRole:  strings.TrimSpace(actingRole.String),
+		PullRequest: int(pullRequest.Int64),
+	}, nil
 }
 
 // JobWorktreePath returns the worktree path recorded in one job payload without
@@ -462,6 +483,29 @@ func (s *Store) ListReviewJobsForRepoPoll(ctx context.Context, repo string) ([]J
 
 func (s *Store) ListJobsByRepo(ctx context.Context, repo string) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE repo = ? ORDER BY id`, repo)
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
+}
+
+// ListReviewJobsForPullRequests returns the review jobs of the given pull
+// requests of repo, newest first, in one indexed read (the stalled-PR sweep,
+// #2677, evaluates every open pull request of a repository at once).
+func (s *Store) ListReviewJobsForPullRequests(ctx context.Context, repo string, pullRequests []int) ([]Job, error) {
+	repo = strings.TrimSpace(repo)
+	if repo == "" || len(pullRequests) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(pullRequests)+1)
+	args = append(args, repo)
+	for _, number := range pullRequests {
+		args = append(args, number)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(pullRequests)), ",")
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs
+		WHERE repo = ? AND type = 'review' AND pull_request IN (`+placeholders+`)
+		ORDER BY created_at DESC, id DESC`, args...)
 	if err != nil {
 		return nil, err
 	}

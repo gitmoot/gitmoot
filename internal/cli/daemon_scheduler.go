@@ -1155,6 +1155,8 @@ type tickCandidates struct {
 	blockedTTLSwept bool
 	// blockedSince memoizes the tick's blocked-since event-rule guard.
 	blockedSince blockedSinceSinkMemo
+	// prStalled memoizes the tick's [pr_stalled] policy and sweep state.
+	prStalled prStalledTickMemo
 }
 
 type blockedSinceSinkMemo struct {
@@ -2289,6 +2291,16 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 			writeLine(stdout, "blocked_since task sweep failed: %v", err)
 		} else if err := evaluateBlockedTaskEpisodes(ctx, store, sink, repoFilter, wakeAfter, stdout, now); err != nil {
 			writeLine(stdout, "blocked_since task sweep failed: %v", err)
+		}
+	}
+	// Opt-in stalled-PR sweep (#2677), beside blocked-since and failing the
+	// same way: logged and swallowed. Each repo is queried at most once per
+	// [pr_stalled].interval; its alerts use the same event-rule guard.
+	if policy, sweep := cand.prStalledTick(ctx, store, workflowHome, stdout); policy.Enabled {
+		if sink, err := cand.blockedSinceEventSink(ctx, store, workflowHome); err != nil {
+			writeLine(stdout, "pr_stalled sweep failed: %v", err)
+		} else if err := sweepStalledPullRequests(ctx, store, sink, sweep, repoFilter, policy, stdout, now); err != nil {
+			writeLine(stdout, "pr_stalled sweep of %s failed: %v", repoFilter, err)
 		}
 	}
 	// Periodic off-box reconciliation (#1539). Before this, reconciliation ran

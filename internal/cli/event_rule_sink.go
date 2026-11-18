@@ -317,13 +317,15 @@ func eventRuleMatchesAddressee(rule db.EventRule, event events.Event) bool {
 // for the event repository. A blocked-since digest names tasks, not a job; its
 // producer addresses it to the tasks' own attributed role (#2668), which is
 // treated as persisted attribution: honoured while live, else the repo owner.
+// A stalled-PR alert (#2677) carries its pull request's attributed role the
+// same way.
 func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Event) events.Event {
 	if event.Type != events.EventJobBlocked {
 		return event
 	}
 	targetRole := workflow.NormalizeActingOrgRole(event.WakeTargetRole)
 	persistedRole := ""
-	if event.Cause == "blocked_since" {
+	if event.Cause == "blocked_since" || event.Cause == prStallCause {
 		persistedRole = targetRole
 	} else if s.store != nil && strings.TrimSpace(event.JobID) != "" {
 		if job, err := s.store.GetJob(ctx, event.JobID); err == nil {
@@ -639,7 +641,7 @@ func classifyEventRuleKinds(event events.Event) []string {
 		switch event.Cause {
 		case "merge_guard", "permission_guard":
 			return []string{"guard"}
-		case "blocked_since":
+		case "blocked_since", prStallCause:
 			return []string{"blocked"}
 		case "", "advance_blocked":
 			// A blocked terminal transition is both a terminal outcome and the

@@ -44,6 +44,7 @@ var (
 		"github_limiter.go::LoadGitHubLimiterPolicy",
 		"merge_gate.go::LoadMergeGatePolicy",
 		"orchestrate.go::LoadReviewConfig",
+		"pr_stalled.go::LoadPRStalledPolicy", // TestLoadPRStalledPolicyRefusesInvalidValues (#2677)
 		"remote_exec.go::LoadRemoteExecConfig",
 		"repo_concurrency.go::LoadRepoConcurrency",
 		"require_workflow.go::LoadRequireWorkflow",
@@ -155,11 +156,11 @@ func TestSectionHeaderCoverageIsDerivedNotAsserted(t *testing.T) {
 	if want := len(pinnedSectionHeaderSites) + len(unpinnedSectionHeaderSites); len(sites) != want {
 		t.Errorf("discovered %d sectionHeader call sites, classified %d: the lists and the package disagree", len(sites), want)
 	}
-	// 19 since #2590 deleted parallel_sessions.go (20 after #2588 deleted staged_review.go; 21 after #2585 deleted heartbeats.go; 22 after #2584 deleted router.go; 23 after #2542 deleted github_remote.go; 24 after #2375 added
+	// 20 since #2677 added pr_stalled.go (19 after #2590 deleted parallel_sessions.go; 20 after #2588 deleted staged_review.go; 21 after #2585 deleted heartbeats.go; 22 after #2584 deleted router.go; 23 after #2542 deleted github_remote.go; 24 after #2375 added
 	// worktrees.go::LoadWorktreeRoot; 23 after #2360 added cleanup_budget.go; 22
 	// after #2203 deleted internal/config/implement_base.go).
-	if distinctFiles != 19 {
-		t.Errorf("sectionHeader call sites span %d files, want 19: update this expectation together with the lists above", distinctFiles)
+	if distinctFiles != 20 {
+		t.Errorf("sectionHeader call sites span %d files, want 20: update this expectation together with the lists above", distinctFiles)
 	}
 }
 

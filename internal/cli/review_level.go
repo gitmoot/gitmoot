@@ -142,34 +142,64 @@ type reviewLevelLogEntry struct {
 // first. A missing log is no history and a malformed line is skipped; any
 // other read failure is an error, which fails closed to level 3.
 func reviewLevelHistory(home, repo string, pr int) ([]reviewLevelLogEntry, error) {
-	paths, err := pathsFromFlag(home)
+	var history []reviewLevelLogEntry
+	err := scanReviewLevelLog(home, func(entry reviewLevelLogEntry) {
+		if entry.PR == pr && strings.EqualFold(strings.TrimSpace(entry.Repo), strings.TrimSpace(repo)) {
+			history = append(history, entry)
+		}
+	})
 	if err != nil {
 		return nil, err
+	}
+	return history, nil
+}
+
+// reviewLevelHistories is reviewLevelHistory for every pull request at once,
+// keyed by lower-cased repo and then pull request, from ONE read of the log:
+// the stalled-PR evaluator (#2677) needs the level of every open pull request.
+func reviewLevelHistories(home string) (map[string]map[int][]reviewLevelLogEntry, error) {
+	histories := map[string]map[int][]reviewLevelLogEntry{}
+	err := scanReviewLevelLog(home, func(entry reviewLevelLogEntry) {
+		repo := strings.ToLower(strings.TrimSpace(entry.Repo))
+		if histories[repo] == nil {
+			histories[repo] = map[int][]reviewLevelLogEntry{}
+		}
+		histories[repo][entry.PR] = append(histories[repo][entry.PR], entry)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return histories, nil
+}
+
+// scanReviewLevelLog calls visit for every well-formed entry, oldest first.
+func scanReviewLevelLog(home string, visit func(reviewLevelLogEntry)) error {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return err
 	}
 	file, err := os.Open(filepath.Join(paths.Home, reviewLevelLogName))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer file.Close()
-	var history []reviewLevelLogEntry
 	reader := bufio.NewReader(file)
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(bytes.TrimSpace(line)) > 0 {
 			var entry reviewLevelLogEntry
-			if json.Unmarshal(line, &entry) == nil && entry.PR == pr &&
-				strings.EqualFold(strings.TrimSpace(entry.Repo), strings.TrimSpace(repo)) {
-				history = append(history, entry)
+			if json.Unmarshal(line, &entry) == nil {
+				visit(entry)
 			}
 		}
 		if readErr == io.EOF {
-			return history, nil
+			return nil
 		}
 		if readErr != nil {
-			return nil, readErr
+			return readErr
 		}
 	}
 }

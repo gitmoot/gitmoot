@@ -190,6 +190,22 @@ blocked_role_wake_after = "0s"
 # 0 keeps flagging disabled while the best-effort counter remains available.
 max_consecutive_missed_wakes = 0
 
+# [pr_stalled] is an OPT-IN daemon sweep (#2677) that flags open pull requests
+# stuck between steps and alerts each one's seat (blocked event rules), at most
+# three times per (PR, head, state), plus one daily digest to the seat's parent.
+# It costs one GraphQL query (about 2 points) per repo per interval.
+# "gitmoot pr stalled" evaluates on demand either way.
+# [pr_stalled]
+# enabled = false
+# interval = "30m"
+# no_ci_after = "30m"
+# ci_red_after = "6h"
+# awaiting_review_after = "1h"
+# green_not_merged_after = "2h"
+# draft_stale_after = "12h"
+# repos = ["owner/*"]        # optional allow list
+# skip_repos = ["owner/repo"] # optional deny list
+
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool
 # and the per-repo checkout / runtime-session locks (issue #365). With both caps

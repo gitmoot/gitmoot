@@ -66,6 +66,12 @@ status` shows that it is running.
    `gh pr merge 42 --repo owner/repo --squash --match-head-commit <40-hex-sha>`.
    Wait on CI checks, not on the `gitmoot/merge-gate` status, which is
    Gitmoot's own.
+6. If the pull request stops moving between steps (no CI on the head, red CI,
+   a level 3 head nobody asked to review, green but unmerged, a forgotten
+   draft), `gitmoot pr stalled --repo owner/repo` names the state, the owning
+   seat and the next command; with `[pr_stalled]` enabled the daemon tells
+   your seat itself. `gitmoot pr hold owner/repo#42 --reason TEXT` silences a
+   pull request that waits on purpose, until its head moves.
 
 ## A review with no model, on a throwaway home
 

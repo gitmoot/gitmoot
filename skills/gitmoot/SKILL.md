@@ -272,6 +272,26 @@ status. Read the gate's actual answer with `review status` or `/gitmoot merge`.
 
 Never merge around a held gate on your own authority.
 
+**Stalled pull requests.** `gitmoot pr stalled [--repo owner/repo] [--json]`
+lists open pull requests stuck between two steps, with the owning seat and a
+suggested next command:
+
+- `no_ci_on_head`: no check ran 30 min after the head commit; the cause says
+  whether it conflicts with the base or is a draft;
+- `ci_red`: a required check has failed for 6 h;
+- `awaiting_review`: level 3 (or no level recorded), green, and no review
+  requested or running at the head for 1 h;
+- `green_not_merged`: level 1 or 2 and green, or level 3 approved and green,
+  for 2 h, with no merge gate making progress;
+- `draft_stale`: a draft for 12 h.
+
+With `[pr_stalled] enabled = true` the daemon runs the same check every
+`interval` (30 min) per repository and sends each stalled pull request's seat
+at most three alerts per head and state; the seat's parent gets one digest a
+day. To silence a pull request that is stuck on purpose, until its head moves:
+`gitmoot pr hold owner/repo#N --reason TEXT` (`--clear` removes it). The hold
+records your role.
+
 ## 4. Messages
 
 ```sh

@@ -1867,7 +1867,8 @@ func (c *GhClient) runRequest(ctx context.Context, mutate bool, conditional bool
 }
 
 func isRESTGet(args []string) bool {
-	if len(args) == 0 || args[0] != "api" {
+	// `gh api graphql` is a POST, not a REST read.
+	if len(args) == 0 || args[0] != "api" || (len(args) > 1 && args[1] == "graphql") {
 		return false
 	}
 	for i := 1; i+1 < len(args); i++ {

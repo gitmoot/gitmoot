@@ -458,14 +458,34 @@ func (s *Store) UpsertMergeGate(ctx context.Context, gate MergeGate) error {
 }
 
 func (s *Store) GetMergeGate(ctx context.Context, repoFullName string, pullRequest int64) (MergeGate, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, pull_request, state, reason, block_class
+	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, pull_request, state, reason, block_class, updated_at
 		FROM merge_gates WHERE repo_full_name = ? AND pull_request = ?`,
 		repoFullName, pullRequest)
 	var gate MergeGate
-	if err := row.Scan(&gate.RepoFullName, &gate.PullRequest, &gate.State, &gate.Reason, &gate.BlockClass); err != nil {
+	if err := row.Scan(&gate.RepoFullName, &gate.PullRequest, &gate.State, &gate.Reason, &gate.BlockClass, &gate.UpdatedAt); err != nil {
 		return MergeGate{}, err
 	}
 	return gate, nil
+}
+
+// ListMergeGatesByRepo returns every merge-gate row of repo, keyed by pull
+// request.
+func (s *Store) ListMergeGatesByRepo(ctx context.Context, repoFullName string) (map[int64]MergeGate, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT repo_full_name, pull_request, state, reason, block_class, updated_at
+		FROM merge_gates WHERE repo_full_name = ?`, strings.TrimSpace(repoFullName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	gates := map[int64]MergeGate{}
+	for rows.Next() {
+		var gate MergeGate
+		if err := rows.Scan(&gate.RepoFullName, &gate.PullRequest, &gate.State, &gate.Reason, &gate.BlockClass, &gate.UpdatedAt); err != nil {
+			return nil, err
+		}
+		gates[gate.PullRequest] = gate
+	}
+	return gates, rows.Err()
 }
 
 func (s *Store) UpsertMergeGateStatusObservation(ctx context.Context, obs MergeGateStatusObservation) error {
