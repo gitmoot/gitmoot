@@ -116,10 +116,12 @@ func TestFollowUpScopeWithoutAMergeBaseDegradesToAFullReview(t *testing.T) {
 
 func TestSplitOutsidePRFindings(t *testing.T) {
 	diff := ReviewScopeDiff{
-		OwnFiles: []string{"own/y.go", "own/bin.png", "own/new.go"},
+		// renamed.go is added.go after the pull request renamed the file it added.
+		OwnFiles: []string{"own/y.go", "own/bin.png", "own/new.go", "own/renamed.go"},
 		PriorOwnLines: map[string][]ReviewLineRange{
-			"own/y.go":    {{Start: 10, End: 20}, {Start: 40, End: 41}},
-			"own/bin.png": nil,
+			"own/y.go":     {{Start: 10, End: 20}, {Start: 40, End: 41}},
+			"own/bin.png":  nil,
+			"own/added.go": {{Start: 1, End: 30}},
 		},
 	}
 	for _, tc := range []struct {
@@ -136,7 +138,8 @@ func TestSplitOutsidePRFindings(t *testing.T) {
 		{"own file, no line", `{"file":"own/y.go"}`, false},
 		{"own file, line as text range overlapping", `{"file":"own/y.go","line":"38-40"}`, false},
 		{"own binary file", `{"file":"own/bin.png","line":99}`, false},
-		{"file the pull request newly touched", `{"file":"own/new.go","line":7}`, false},
+		{"file the pull request touched only after the finding", `{"file":"own/new.go","line":7}`, true},
+		{"file the pull request added, renamed since", `{"file":"own/added.go","line":7}`, false},
 		{"absolute path", `{"file":"/usr/lib/x.go","line":3}`, false},
 		{"dot-slash path outside", `{"file":"./base/x.go","line":3}`, true},
 		{"location outside", `{"location":"base/x.go:711-718"}`, true},
@@ -155,6 +158,34 @@ func TestSplitOutsidePRFindings(t *testing.T) {
 				t.Fatalf("finding lost or duplicated: kept %q, outside %q", kept, outside)
 			}
 		})
+	}
+	if kept, outside := SplitOutsidePRFindings([]string{`{"file":"base/x.go","line":3}`}, ReviewScopeDiff{OwnFiles: []string{"own/y.go"}}); len(kept) != 1 || len(outside) != 0 {
+		t.Fatalf("an unknown prior own diff dropped a finding: kept %q, outside %q", kept, outside)
+	}
+}
+
+// #2682 round 2. A base merge whose round proves no own change moved is not an
+// empty scope to approve unread: the engine records the loss of scope and
+// re-reads the pull request against its merge base.
+func TestFollowUpScopeEmptyAfterABaseMergeIsAFullReview(t *testing.T) {
+	ctx := context.Background()
+	store, engine := reviewRefanoutFixture(t)
+	insertPriorReviewResult(t, store, "prior-review", "head-one", AgentResult{Decision: "approved"})
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string, string) (ReviewScopeDiff, error) {
+		return ReviewScopeDiff{MergeBase: "mb-two", BaseMoved: true, OwnFiles: []string{"own/y.go"}, PriorOwnLines: map[string][]ReviewLineRange{}}, nil
+	}
+	if err := engine.HandlePullRequestOpened(ctx, reviewRefanoutEvent("head-two")); err != nil {
+		t.Fatalf("HandlePullRequestOpened: %v", err)
+	}
+	payload, err := unmarshalPayload(mustJob(t, store, "review-audit-task-1678-review-2").Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.ReviewScope != nil || strings.Contains(payload.Instructions, "approve without rereading") {
+		t.Fatalf("scope = %+v, instructions %q: want a full review", payload.ReviewScope, payload.Instructions)
+	}
+	if !hasReviewScopeUnavailableEvent(t, store, "head-two") {
+		t.Fatal("the unscoped head left no review_scope_unavailable record")
 	}
 }
 

@@ -1494,6 +1494,11 @@ func resolveDeltaReviewScopeUsing(ctx context.Context, store *db.Store, git revi
 			// The instrument could not RUN. Do not keep hammering git.
 			return nil, "scope unavailable: " + err.Error()
 		}
+		if diff.EmptyAfterBaseMerge() {
+			// The newest baseline IS the one the reviewer last saw; an older
+			// one would drop its findings. Re-read the whole own diff instead.
+			return nil, "base merged in since " + baseline + " and no own change is proven to have moved: full review against the merge base"
+		}
 		job, err := store.GetJob(ctx, verdict.JobID)
 		if err != nil {
 			return nil, "scope unavailable: " + err.Error()

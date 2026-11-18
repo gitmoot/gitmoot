@@ -1485,6 +1485,40 @@ func TestReviewRequestDeltaAfterABaseMergeScopesTheOwnChange(t *testing.T) {
 	}
 }
 
+// #2682 round 2. The seat only merged main in: no own change moved, but the
+// pull request has one. That empty scope must not tell the reviewer to approve
+// without reading; the request falls back to a full review against the merge
+// base.
+func TestReviewRequestDeltaAfterABaseMergeAloneIsAFullReview(t *testing.T) {
+	home, store, checkout, _, secondHead := deltaReviewFixture(t)
+	writeFile(t, filepath.Join(checkout, "x.txt"), "another pull request\n")
+	runGit(t, checkout, "add", "x.txt")
+	runGit(t, checkout, "commit", "-m", "another pull request lands on main")
+	runGit(t, checkout, "update-ref", "refs/remotes/origin/main", readonlyWorktreeHead(t, checkout))
+	runGit(t, checkout, "switch", "feature/review")
+	runGit(t, checkout, "merge", "--no-edit", "main")
+	mergedHead := readonlyWorktreeHead(t, checkout)
+	runGit(t, checkout, "switch", "main")
+
+	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, second.JobID)
+
+	merged, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, mergedHead), "--role", "owner")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	payload := dispatchedReviewPayload(t, store, merged.JobID)
+	if payload.ReviewScope != nil {
+		t.Fatalf("scope = %+v, want a full review: no own change is proven to have moved", payload.ReviewScope)
+	}
+	if strings.Contains(payload.Instructions, "approve without rereading") || !strings.Contains(payload.Instructions, "Read the full diff against its base") {
+		t.Fatalf("instructions are not a full review: %q", payload.Instructions)
+	}
+}
+
 // An APPROVED ancestor is a baseline too, not only changes_requested: every
 // round after the first should benefit, which is the whole saving.
 func TestReviewRequestDeltaUsesApprovedBaselineToo(t *testing.T) {

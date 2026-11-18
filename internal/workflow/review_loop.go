@@ -539,6 +539,9 @@ func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent
 			if strings.TrimSpace(diff.MergeBase) == "" {
 				return nil, ReviewScopeUnavailableError{Reason: fmt.Sprintf("review scope from %s to %s named no merge base to read the pull request's own change from", previousHead, event.HeadSHA)}
 			}
+			if diff.EmptyAfterBaseMerge() {
+				return nil, ReviewScopeUnavailableError{Reason: fmt.Sprintf("review scope from %s to %s: the base was merged in and no own change is proven to have moved, so the pull request is re-read against its merge base", previousHead, event.HeadSHA)}
+			}
 			diff.ChangedFiles = sortedUniqueStrings(diff.ChangedFiles)
 			diffByHead[previousHead] = diff
 		}

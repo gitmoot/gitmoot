@@ -167,7 +167,11 @@ func localReviewScopeDiff(ctx context.Context, git gitutil.Client, subject *revi
 			return workflow.ReviewScopeDiff{}, err
 		}
 	} else {
-		changed = movedOwnPatches(priorPatches, headPatches)
+		basePatches, err := git.DiffPatches(ctx, mbPrev, mbHead)
+		if err != nil {
+			return workflow.ReviewScopeDiff{}, err
+		}
+		changed = movedOwnPatches(priorPatches, headPatches, basePatches)
 	}
 	priorLines := make(map[string][]workflow.ReviewLineRange, len(priorPatches))
 	for path, patch := range priorPatches {
@@ -176,6 +180,7 @@ func localReviewScopeDiff(ctx context.Context, git gitutil.Client, subject *revi
 	return workflow.ReviewScopeDiff{
 		ChangedFiles:  sortedUniqueReviewPaths(changed),
 		MergeBase:     mbHead,
+		BaseMoved:     mbPrev != mbHead,
 		OwnFiles:      sortedPatchPaths(headPatches),
 		PriorOwnLines: priorLines,
 	}, nil
@@ -204,7 +209,11 @@ func forgeReviewScopeDiff(ctx context.Context, gh github.Client, repo github.Rep
 	}
 	changed := roundFiles
 	if mbPrev != mbHead {
-		changed = movedForgeOwnPatches(prior, current)
+		base, known, err := forgeBaseMovement(ctx, gh, repo, mbPrev, mbHead)
+		if err != nil {
+			return workflow.ReviewScopeDiff{}, err
+		}
+		changed = movedForgeOwnPatches(prior, current, base, known)
 	}
 	priorLines := make(map[string][]workflow.ReviewLineRange, len(prior))
 	for path, file := range prior {
@@ -217,6 +226,7 @@ func forgeReviewScopeDiff(ctx context.Context, gh github.Client, repo github.Rep
 	return workflow.ReviewScopeDiff{
 		ChangedFiles:  sortedUniqueReviewPaths(changed),
 		MergeBase:     mbHead,
+		BaseMoved:     mbPrev != mbHead,
 		OwnFiles:      sortedUniqueReviewPaths(ownFiles),
 		PriorOwnLines: priorLines,
 	}, nil
@@ -248,12 +258,19 @@ func forgeOwnChange(ctx context.Context, gh github.Client, repo github.Repositor
 	return files, mergeBase, nil
 }
 
-// movedOwnPatches names every path whose own patch differs between the two
-// rounds, a path present at one end only included.
-func movedOwnPatches(prior, current map[string]string) []string {
+// movedOwnPatches names every path whose own change is not PROVEN identical
+// between the two rounds, a path present at one end only included. base is the
+// base's own movement between the two merge bases, mbPrev..mbHead.
+func movedOwnPatches(prior, current, base map[string]string) []string {
 	var moved []string
 	for path, patch := range current {
-		if before, ok := prior[path]; !ok || normalizedOwnPatch(before) != normalizedOwnPatch(patch) {
+		before, ok := prior[path]
+		if !ok {
+			moved = append(moved, path)
+			continue
+		}
+		basePatch, baseTouched := base[path]
+		if !sameOwnChange(before, patch, basePatch, baseTouched) {
 			moved = append(moved, path)
 		}
 	}
@@ -263,17 +280,46 @@ func movedOwnPatches(prior, current map[string]string) []string {
 		}
 	}
 	return moved
+}
+
+// forgeBaseMovement reads the base's own movement between the two merge bases
+// from the compare endpoint. known is false when the answer cannot be trusted
+// as complete (a capped page, or a range that is not a plain fast-forward), and
+// a file whose patch the API omitted maps to "", which proves nothing.
+func forgeBaseMovement(ctx context.Context, gh github.Client, repo github.Repository, mbPrev, mbHead string) (map[string]string, bool, error) {
+	compare, err := gh.CompareCommits(ctx, repo, mbPrev, mbHead)
+	if err != nil {
+		return nil, false, err
+	}
+	if compare.Truncated || strings.TrimSpace(compare.Status) != "ahead" ||
+		!strings.EqualFold(strings.TrimSpace(compare.MergeBaseCommit.SHA), mbPrev) {
+		return nil, false, nil
+	}
+	base := make(map[string]string, len(compare.Files))
+	for _, file := range compare.Files {
+		base[file.Filename] = file.Patch
+		if file.PreviousFilename != "" {
+			base[file.PreviousFilename] = ""
+		}
+	}
+	return base, true, nil
 }
 
 // movedForgeOwnPatches is movedOwnPatches over compare files. The API omits the
 // patch of a binary or very large file, and an absent patch proves nothing, so
-// such a file is always in scope.
-func movedForgeOwnPatches(prior, current map[string]github.PullRequestFile) []string {
+// such a file is always in scope; so is every file when the base's movement is
+// unknown.
+func movedForgeOwnPatches(prior, current map[string]github.PullRequestFile, base map[string]string, baseKnown bool) []string {
 	var moved []string
 	for path, file := range current {
 		before, ok := prior[path]
-		if !ok || file.Patch == "" || before.Patch == "" || before.Status != file.Status ||
-			before.PreviousFilename != file.PreviousFilename || normalizedOwnPatch(before.Patch) != normalizedOwnPatch(file.Patch) {
+		if !ok || !baseKnown || file.Patch == "" || before.Patch == "" || before.Status != file.Status ||
+			before.PreviousFilename != file.PreviousFilename {
+			moved = append(moved, path)
+			continue
+		}
+		basePatch, baseTouched := base[path]
+		if baseTouched && basePatch == "" || !sameOwnChange(before.Patch, file.Patch, basePatch, baseTouched) {
 			moved = append(moved, path)
 		}
 	}
@@ -285,11 +331,64 @@ func movedForgeOwnPatches(prior, current map[string]github.PullRequestFile) []st
 	return moved
 }
 
+// sameOwnChange reports whether two own patches of one file are PROVEN to be
+// the same edit at the same place, moved only by the base (#2682 round 2). The
+// patches must be identical apart from blob ids and hunk line numbers, section
+// headings included, and every hunk's new old-side start must be exactly its
+// prior start shifted by the net lines the base added or removed above it, with
+// no base hunk touching the lines it covers. Anything else, such as reverting
+// an edit in one function and repeating it under identical context in another,
+// is a moved own change and stays in scope.
+func sameOwnChange(prior, current, base string, baseTouched bool) bool {
+	if normalizedOwnPatch(prior) != normalizedOwnPatch(current) {
+		return false
+	}
+	priorHunks, currentHunks := patchHunks(prior), patchHunks(current)
+	if len(priorHunks) != len(currentHunks) {
+		return false
+	}
+	var baseHunks []patchHunk
+	if baseTouched {
+		if baseHunks = patchHunks(base); len(baseHunks) == 0 {
+			return len(priorHunks) == 0 && prior == current
+		}
+	}
+	for i, before := range priorHunks {
+		after := currentHunks[i]
+		mapped, ok := mapThroughBase(before, baseHunks)
+		if !ok || mapped != after.oldStart || after.newStart-after.oldStart != before.newStart-before.oldStart {
+			return false
+		}
+	}
+	return true
+}
+
+// mapThroughBase maps an own hunk's old-side start from mbPrev's numbering to
+// mbHead's. It is not provable when a base hunk touches the lines the own hunk
+// covers, context included.
+func mapThroughBase(own patchHunk, base []patchHunk) (int, bool) {
+	lo, hi := own.oldRange()
+	shift := 0
+	for _, hunk := range base {
+		blo, bhi := hunk.oldRange()
+		switch {
+		case bhi < lo:
+			shift += hunk.newCount - hunk.oldCount
+		case blo > hi:
+		default:
+			return 0, false
+		}
+	}
+	return own.oldStart + shift, true
+}
+
 // normalizedOwnPatch strips what a base merge changes in a patch without
-// changing the pull request's own edit: hunk line numbers and section headings,
-// and the index line naming pre- and post-image blobs. A binary patch keeps its
-// index line, the only thing that tells two binary changes apart. Context lines
-// stay, so an own edit whose neighbouring base lines moved stays in scope.
+// changing the pull request's own edit: hunk line numbers, which
+// sameOwnChange checks separately against the base's movement, and the index
+// line naming pre- and post-image blobs. Section headings stay. A binary patch
+// keeps its index line, the only thing that tells two binary changes apart.
+// Context lines stay, so an own edit whose neighbouring base lines moved stays
+// in scope.
 func normalizedOwnPatch(patch string) string {
 	binary := strings.Contains(patch, "\nBinary files ") || strings.HasPrefix(patch, "Binary files ")
 	var normalized strings.Builder
@@ -302,46 +401,68 @@ func normalizedOwnPatch(patch string) string {
 		} else {
 			patch = ""
 		}
-		switch {
-		case strings.HasPrefix(line, "@@"):
+		if header := patchHunkHeader.FindStringIndex(line); header != nil {
 			inHunk = true
-			normalized.WriteString("@@\n")
-		case !inHunk && !binary && strings.HasPrefix(line, "index "):
-		default:
-			normalized.WriteString(line)
+			normalized.WriteString("@@ @@")
+			normalized.WriteString(line[header[1]:])
+			continue
 		}
+		if !inHunk && !binary && strings.HasPrefix(line, "index ") {
+			continue
+		}
+		normalized.WriteString(line)
 	}
 	return normalized.String()
 }
 
-var patchHunkHeader = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+var patchHunkHeader = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
+
+type patchHunk struct {
+	oldStart, oldCount, newStart, newCount int
+}
+
+// oldRange is the old-side lines a hunk covers; a hunk with no old lines sits
+// between oldStart and oldStart+1.
+func (h patchHunk) oldRange() (int, int) {
+	if h.oldCount == 0 {
+		return h.oldStart, h.oldStart + 1
+	}
+	return h.oldStart, h.oldStart + h.oldCount - 1
+}
+
+func patchHunks(patch string) []patchHunk {
+	var hunks []patchHunk
+	for _, line := range strings.Split(patch, "\n") {
+		match := patchHunkHeader.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		number := func(value string) int {
+			if value == "" {
+				return 1
+			}
+			n, _ := strconv.Atoi(value)
+			return n
+		}
+		oldStart, _ := strconv.Atoi(match[1])
+		newStart, _ := strconv.Atoi(match[3])
+		hunks = append(hunks, patchHunk{oldStart: oldStart, oldCount: number(match[2]), newStart: newStart, newCount: number(match[4])})
+	}
+	return hunks
+}
 
 // patchLineRanges returns the post-image line ranges a patch's hunks cover,
 // context included, or nil when the patch has no hunks (binary, mode-only, or
 // a patch the forge omitted): such a file has no line a finding can be outside.
 func patchLineRanges(patch string) []workflow.ReviewLineRange {
 	var ranges []workflow.ReviewLineRange
-	for _, line := range strings.Split(patch, "\n") {
-		match := patchHunkHeader.FindStringSubmatch(line)
-		if match == nil {
-			continue
-		}
-		start, err := strconv.Atoi(match[1])
-		if err != nil {
-			continue
-		}
-		count := 1
-		if match[2] != "" {
-			if count, err = strconv.Atoi(match[2]); err != nil {
-				continue
-			}
-		}
-		if count == 0 {
+	for _, hunk := range patchHunks(patch) {
+		if hunk.newCount == 0 {
 			// A pure deletion sits between line start and start+1.
-			ranges = append(ranges, workflow.ReviewLineRange{Start: start, End: start + 1})
+			ranges = append(ranges, workflow.ReviewLineRange{Start: hunk.newStart, End: hunk.newStart + 1})
 			continue
 		}
-		ranges = append(ranges, workflow.ReviewLineRange{Start: start, End: start + count - 1})
+		ranges = append(ranges, workflow.ReviewLineRange{Start: hunk.newStart, End: hunk.newStart + hunk.newCount - 1})
 	}
 	return ranges
 }

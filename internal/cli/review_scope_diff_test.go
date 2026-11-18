@@ -39,6 +39,7 @@ func newOwnScopeRepos(t *testing.T) ownScopeRepos {
 	runGit(t, r.origin, "config", "user.name", "Gitmoot")
 	writeFile(t, filepath.Join(r.origin, "y.go"), ownScopeLines(nil))
 	writeFile(t, filepath.Join(r.origin, "README.md"), "base\n")
+	writeFile(t, filepath.Join(r.origin, "blocks.txt"), ownScopeBlocks(nil))
 	r.forkPoint = r.commit(t, "base")
 	runGit(t, r.checkout, "clone", "-q", r.origin, r.checkout)
 	runGit(t, r.origin, "switch", "-q", "-c", "feature")
@@ -295,9 +296,12 @@ func TestRemoteReviewDiffBaseHEADUsesTheScopeMergeBase(t *testing.T) {
 
 func TestNormalizedOwnPatchIgnoresWhatABaseMergeShifts(t *testing.T) {
 	before := "diff --git a/y.go b/y.go\nindex 1111111..2222222 100644\n--- a/y.go\n+++ b/y.go\n@@ -1,4 +1,4 @@ func A()\n line 1\n-line 2\n+own\n line 3\n"
-	after := "diff --git a/y.go b/y.go\nindex 3333333..4444444 100644\n--- a/y.go\n+++ b/y.go\n@@ -9,4 +9,4 @@ func B()\n line 1\n-line 2\n+own\n line 3\n"
+	after := "diff --git a/y.go b/y.go\nindex 3333333..4444444 100644\n--- a/y.go\n+++ b/y.go\n@@ -9,4 +9,4 @@ func A()\n line 1\n-line 2\n+own\n line 3\n"
 	if normalizedOwnPatch(before) != normalizedOwnPatch(after) {
 		t.Fatalf("same own edit at shifted lines normalizes differently:\n%q\n%q", normalizedOwnPatch(before), normalizedOwnPatch(after))
+	}
+	if normalizedOwnPatch(before) == normalizedOwnPatch(strings.Replace(after, "func A()", "func B()", 1)) {
+		t.Fatal("an edit under another section heading normalizes the same")
 	}
 	changed := strings.Replace(after, "+own", "+other", 1)
 	if normalizedOwnPatch(before) == normalizedOwnPatch(changed) {
@@ -313,5 +317,125 @@ func TestNormalizedOwnPatchIgnoresWhatABaseMergeShifts(t *testing.T) {
 	}
 	if got := patchLineRanges(binaryA); got != nil {
 		t.Fatalf("binary line ranges = %v, want nil", got)
+	}
+}
+
+// ownScopeBlocks renders blocks.txt: two blocks with identical lines, so the
+// same edit in either block has the same hunk body and the same section
+// heading, and only its position tells them apart.
+func ownScopeBlocks(edit map[int]bool) string {
+	var b strings.Builder
+	for block := 1; block <= 2; block++ {
+		b.WriteString("block\n  a\n  b\n  c\n")
+		if edit[block] {
+			b.WriteString("  own\n")
+		} else {
+			b.WriteString("  target\n")
+		}
+		b.WriteString("  d\n  e\n  f\n")
+	}
+	return b.String()
+}
+
+// #2682 round 2, P2-1. The pull request reverts its edit in the first block
+// and applies the identical edit, under identical context and heading, in the
+// second, in the same round that merges the base in. Its own patch differs only
+// in hunk position, and the base never touched blocks.txt, so no base movement
+// explains the move: the file stays in scope.
+func TestReviewScopeKeepsARelocatedIdenticalEdit(t *testing.T) {
+	r := newOwnScopeRepos(t)
+	writeFile(t, filepath.Join(r.origin, "blocks.txt"), ownScopeBlocks(map[int]bool{1: true}))
+	prior := r.commit(t, "own edit in the first block")
+	r.advanceBase(t)
+	r.mergeBase(t)
+	writeFile(t, filepath.Join(r.origin, "blocks.txt"), ownScopeBlocks(map[int]bool{2: true}))
+	head := r.commit(t, "move the edit to the second block")
+
+	diff := r.scope(t, prior, head)
+	if !slices.Equal(diff.ChangedFiles, []string{"blocks.txt"}) {
+		t.Fatalf("scope = %v, want [blocks.txt]: the own edit moved to another block", diff.ChangedFiles)
+	}
+}
+
+// The narrowing still holds where it is proven: the base inserted two lines
+// above the own edit, which shifts the hunk by exactly two, so blocks.txt is
+// not in scope; the round's one own change, z.go, is.
+func TestReviewScopeDropsAnOwnEditTheBaseShiftedByExactlyItsLines(t *testing.T) {
+	r := newOwnScopeRepos(t)
+	writeFile(t, filepath.Join(r.origin, "blocks.txt"), ownScopeBlocks(map[int]bool{2: true}))
+	prior := r.commit(t, "own edit in the second block")
+	runGit(t, r.origin, "switch", "-q", "main")
+	writeFile(t, filepath.Join(r.origin, "blocks.txt"), "top one\ntop two\n"+ownScopeBlocks(nil))
+	r.commit(t, "base inserts two lines at the top")
+	runGit(t, r.origin, "switch", "-q", "feature")
+	r.mergeBase(t)
+	writeFile(t, filepath.Join(r.origin, "z.go"), "package z\n")
+	head := r.commit(t, "own z")
+
+	diff := r.scope(t, prior, head)
+	if !slices.Equal(diff.ChangedFiles, []string{"z.go"}) {
+		t.Fatalf("scope = %v, want [z.go]: blocks.txt moved by exactly the base's two lines", diff.ChangedFiles)
+	}
+}
+
+// #2682 round 2, P2-2. A finding on a file the pull request added is its own
+// even after the pull request renames that file: it stays carried.
+func TestReviewScopeKeepsAFindingOnAnAddedThenRenamedFile(t *testing.T) {
+	r := newOwnScopeRepos(t)
+	writeFile(t, filepath.Join(r.origin, "added.go"), "package added\n\nfunc A() {\n\treturn\n}\n")
+	prior := r.commit(t, "add added.go")
+	r.advanceBase(t)
+	r.mergeBase(t)
+	runGit(t, r.origin, "mv", "added.go", "renamed.go")
+	head := r.commit(t, "rename added.go")
+
+	diff := r.scope(t, prior, head)
+	finding := `{"severity":"P2","title":"A returns nothing","file":"added.go","line":4}`
+	kept, outside := workflow.SplitOutsidePRFindings([]string{finding}, diff)
+	if !slices.Equal(kept, []string{finding}) || len(outside) != 0 {
+		t.Fatalf("kept %q, outside %q: a finding in a file this pull request added must stay carried", kept, outside)
+	}
+}
+
+// P2-1 through the API fallback: a moved own hunk is dropped only when the
+// base's compare proves the shift.
+func TestForgeReviewScopeDropsAMovedOwnEditOnlyWhenTheBaseExplainsIt(t *testing.T) {
+	const prev, head = "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"
+	body := " block\n   a\n   b\n   c\n-  target\n+  own\n   d\n   e\n   f\n"
+	first := github.PullRequestFile{Filename: "blocks.txt", Status: "modified", Patch: "@@ -2,7 +2,7 @@ block\n" + body}
+	second := github.PullRequestFile{Filename: "blocks.txt", Status: "modified", Patch: "@@ -10,7 +10,7 @@ block\n" + body}
+	shifted := github.PullRequestFile{Filename: "blocks.txt", Status: "modified", Patch: "@@ -12,7 +12,7 @@ block\n" + body}
+	z := github.PullRequestFile{Filename: "z.go", Status: "added", Patch: "@@ -0,0 +1 @@\n+package z\n"}
+	topInsert := github.PullRequestFile{Filename: "blocks.txt", Status: "modified", Patch: "@@ -1,3 +1,5 @@\n+top one\n+top two\n block\n   a\n   b\n"}
+	x := github.PullRequestFile{Filename: "x.go", Status: "added", Patch: "@@ -0,0 +1 @@\n+package x\n"}
+	truncated := compareAt("mb-one", x)
+	truncated.Truncated = true
+	for _, tc := range []struct {
+		name        string
+		prior, now  github.PullRequestFile
+		base        github.CompareResult
+		wantInScope bool
+	}{
+		{"relocated, base never touched the file", first, second, compareAt("mb-one", x), true},
+		{"shifted by exactly the base's lines above", second, shifted, compareAt("mb-one", x, topInsert), false},
+		{"shift unknown: capped base compare", second, shifted, truncated, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &reviewCompareClient{byRange: map[string]github.CompareResult{
+				prev + "..." + head: compareAt(prev, tc.now, z),
+				"main..." + prev:    compareAt("mb-one", tc.prior),
+				"main..." + head:    compareAt("mb-two", tc.now, z),
+				"mb-one...mb-two":   tc.base,
+			}}
+			var engine workflow.Engine
+			wireReviewChangedFiles(&engine, client, "", nil)
+			diff, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, "main", prev, head)
+			if err != nil {
+				t.Fatalf("ReviewChangedFiles: %v", err)
+			}
+			if got := slices.Contains(diff.ChangedFiles, "blocks.txt"); got != tc.wantInScope {
+				t.Fatalf("blocks.txt in scope = %v (scope %v), want %v", got, diff.ChangedFiles, tc.wantInScope)
+			}
+		})
 	}
 }

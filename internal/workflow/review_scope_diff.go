@@ -20,14 +20,28 @@ type ReviewScopeDiff struct {
 	// MergeBase is merge-base(origin/<base>, current head): the base the
 	// reviewer diffs the listed files from.
 	MergeBase string
+	// BaseMoved reports that the merge base moved between the two rounds: the
+	// pull request merged its base branch in.
+	BaseMoved bool
 	// OwnFiles are the files in the pull request's own diff at the current head.
 	OwnFiles []string
 	// PriorOwnLines maps each file in the pull request's own diff at the PRIOR
 	// head to the line ranges its hunks cover in the prior head's numbering,
-	// context included, because a prior finding's line is numbered at the head
-	// it was reported on. A file mapped to nil has a diff git does not express
-	// in lines (binary, or a patch the forge omitted): any line counts as inside.
+	// context included, because a prior finding's file and line are named at
+	// the head it was reported on. A file mapped to nil has a diff git does not
+	// express in lines (binary, or a patch the forge omitted): any line counts
+	// as inside. A nil map means the prior own diff is unknown.
 	PriorOwnLines map[string][]ReviewLineRange
+}
+
+// EmptyAfterBaseMerge reports a scope that came out empty only because the
+// base was merged in: no own change is proven to have moved, yet the pull
+// request has one. "The scope is empty: approve without rereading" is right
+// for a round with no base merge and no change; here it would approve on a
+// narrowing nothing verified, so the round is a full review against the merge
+// base instead (#2682 round 2).
+func (d ReviewScopeDiff) EmptyAfterBaseMerge() bool {
+	return d.BaseMoved && len(d.ChangedFiles) == 0 && len(d.OwnFiles) > 0
 }
 
 // ReviewLineRange is an inclusive range of one-based line numbers.
@@ -38,21 +52,22 @@ type ReviewLineRange struct {
 
 // SplitOutsidePRFindings separates prior findings that name a location
 // outside the pull request's own diff from the ones still carried. A finding
-// is outside only when every file:line it names is outside: its file is not in
-// the own diff at the current head, or its line is not in any own hunk of that
-// file at the prior head. A finding that names no file, an absolute path, or a
-// file the pull request newly touched is kept, so an unparseable locator can
-// only keep a finding, never drop one.
+// is outside only when every file:line it names was outside the own diff AT
+// THE HEAD IT WAS REPORTED ON: its file is not in that own diff, or its line is
+// in no own hunk of the file. A finding inside the prior own diff always stays,
+// whatever the file is called now (a file the pull request added and then
+// renamed is still its own). A finding that names no file or an absolute path
+// is kept, and so is every finding when the prior own diff is unknown, so an
+// unparseable locator or an uncertain lineage can only keep a finding.
 func SplitOutsidePRFindings(findings []string, diff ReviewScopeDiff) (kept []string, outside []string) {
-	own := make(map[string]struct{}, len(diff.OwnFiles))
-	for _, path := range diff.OwnFiles {
-		own[path] = struct{}{}
+	if diff.PriorOwnLines == nil {
+		return findings, nil
 	}
 	for _, finding := range findings {
 		locators := findingLocators(finding)
 		dropped := len(locators) > 0
 		for _, locator := range locators {
-			if !locator.outside(own, diff.PriorOwnLines) {
+			if !locator.outside(diff.PriorOwnLines) {
 				dropped = false
 				break
 			}
@@ -71,18 +86,15 @@ type findingLocator struct {
 	start, end int
 }
 
-func (l findingLocator) outside(own map[string]struct{}, priorLines map[string][]ReviewLineRange) bool {
+func (l findingLocator) outside(priorLines map[string][]ReviewLineRange) bool {
 	if l.path == "" || strings.HasPrefix(l.path, "/") {
 		return false
 	}
-	if _, ok := own[l.path]; !ok {
+	ranges, inPrior := priorLines[l.path]
+	if !inPrior {
 		return true
 	}
-	if l.start == 0 {
-		return false
-	}
-	ranges, known := priorLines[l.path]
-	if !known || ranges == nil {
+	if l.start == 0 || ranges == nil {
 		return false
 	}
 	for _, r := range ranges {

@@ -435,6 +435,8 @@ func TestForgeReviewScopeExcludesFilesAMergedBaseBroughtIn(t *testing.T) {
 		prev + "..." + head: round,
 		"main..." + prev:    compareAt("mb-one", y1, z),
 		"main..." + head:    compareAt("mb-two", y2, zShifted),
+		// The base's own movement between the merge bases: it added x.go only.
+		"mb-one...mb-two": compareAt("mb-one", github.PullRequestFile{Filename: "x.go", Status: "added", Patch: "@@ -0,0 +1 @@\n+package x\n"}),
 	}}
 	var engine workflow.Engine
 	wireReviewChangedFiles(&engine, client, "", nil)
