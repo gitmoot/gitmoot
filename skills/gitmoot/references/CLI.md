@@ -1134,6 +1134,12 @@ for the purpose, falls back to the next model on a provider quota/auth failure, 
 wakes --role (default $GITMOOT_ORG_ROLE) when the verdict is saved. A second request for
 the same head attaches to the running review or to its saved verdict; it never spends
 another reviewer. No verdict ever triggers a model change.
+
+A request at a later head of a pull request with a saved verdict is a follow-up: it reviews
+only the files whose own change (merge base to head) moved since that verdict, read against
+the pull request's merge base, so files a merge of the base branch brought in are not in
+it. Findings outside the pull request's own diff never block and are not carried forward.
+--full re-reads the whole diff instead.
 ```
 
 ## gitmoot review cancel

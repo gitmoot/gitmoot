@@ -143,8 +143,8 @@ func TestDaemonLedgerAncestryResolverFallsBackWhenReviewedHeadIsMissingLocally(t
 	if got {
 		t.Fatal("compare fallback reported a missing, diverged reviewed head as an ancestor")
 	}
-	if client.calls != 1 || client.base != missingReviewedHead || client.head != current {
-		t.Fatalf("compare calls=%d base=%q head=%q, want one exact-head fallback for %q...%q",
-			client.calls, client.base, client.head, missingReviewedHead, current)
+	if client.calls != 1 || client.ranges[0] != missingReviewedHead+"..."+current {
+		t.Fatalf("compare ranges=%v, want one exact-head fallback for %q...%q",
+			client.ranges, missingReviewedHead, current)
 	}
 }

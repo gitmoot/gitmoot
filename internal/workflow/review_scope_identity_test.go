@@ -45,9 +45,9 @@ func TestUnscopableHeadRecordsOneEventAcrossDifferentResolverErrors(t *testing.T
 		Summary:  "Fix the boundary check.",
 	})
 	call := 0
-	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string, string) (ReviewScopeDiff, error) {
 		call++
-		return nil, ReviewScopeUnavailableError{
+		return ReviewScopeDiff{}, ReviewScopeUnavailableError{
 			Reason: "review scope compare is \"diverged\", not a direct follow-up (attempt " + strings.Repeat("x", call) + ")",
 		}
 	}
@@ -88,11 +88,11 @@ func TestExistingReviewLegBlocksDuplicateAtSameHeadAndRound(t *testing.T) {
 		Summary:  "Fix the boundary check.",
 	})
 	scopable := true
-	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string, string) (ReviewScopeDiff, error) {
 		if scopable {
-			return []string{"internal/boundary.go"}, nil
+			return testScopeDiff("internal/boundary.go"), nil
 		}
-		return nil, ReviewScopeUnavailableError{Reason: `review scope compare is "diverged", not a direct follow-up`}
+		return ReviewScopeDiff{}, ReviewScopeUnavailableError{Reason: `review scope compare is "diverged", not a direct follow-up`}
 	}
 
 	// First derivation: a SCOPED leg is enqueued and left queued.
@@ -143,11 +143,11 @@ func TestExistingTerminalReviewLegIsNotRederived(t *testing.T) {
 		Summary:  "Fix the boundary check.",
 	})
 	scopable := true
-	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string, string) (ReviewScopeDiff, error) {
 		if scopable {
-			return []string{"internal/boundary.go"}, nil
+			return testScopeDiff("internal/boundary.go"), nil
 		}
-		return nil, ReviewScopeUnavailableError{Reason: `review scope compare is "diverged", not a direct follow-up`}
+		return ReviewScopeDiff{}, ReviewScopeUnavailableError{Reason: `review scope compare is "diverged", not a direct follow-up`}
 	}
 	if err := engine.HandlePullRequestOpened(ctx, reviewRefanoutEvent("head-two")); err != nil {
 		t.Fatalf("HandlePullRequestOpened scoped: %v", err)

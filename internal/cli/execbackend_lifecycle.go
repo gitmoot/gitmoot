@@ -472,7 +472,7 @@ func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, che
 
 	base := ""
 	if payload.ReviewScope != nil {
-		base = strings.TrimSpace(payload.ReviewScope.PreviousHeadSHA)
+		base = reviewScopeDiffBase(payload.ReviewScope)
 	}
 	if base == "" {
 		var forgePull *github.PullRequest
@@ -546,7 +546,7 @@ func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, che
 	} else {
 		base, err = git.RevParse(ctx, base+"^{commit}")
 		if err != nil {
-			return "", fmt.Errorf("resolve prior review head %q: %w", payload.ReviewScope.PreviousHeadSHA, err)
+			return "", fmt.Errorf("resolve follow-up review diff base %q: %w", reviewScopeDiffBase(payload.ReviewScope), err)
 		}
 	}
 	ancestor, err := git.IsAncestor(ctx, base, head)
@@ -557,6 +557,18 @@ func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, che
 		return "", fmt.Errorf("review diff base %s is not an ancestor of head %s", base, head)
 	}
 	return base, nil
+}
+
+// reviewScopeDiffBase is the commit a scoped follow-up review reads its files
+// against: the pull request's merge base frozen into the scope with its brief
+// (#2682), so the sandbox upstream and the instructions name the same commit.
+// A scope queued before the merge base was recorded carries only the prior
+// head, and its brief says to diff from it, so that head stays its base.
+func reviewScopeDiffBase(scope *workflow.ReviewScope) string {
+	if base := strings.TrimSpace(scope.MergeBase); base != "" {
+		return base
+	}
+	return strings.TrimSpace(scope.PreviousHeadSHA)
 }
 
 // mergedPullRequestDiffBase returns the scope base of a PR whose head is

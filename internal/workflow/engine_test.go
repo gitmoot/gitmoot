@@ -1375,8 +1375,8 @@ func TestEngineReviewLoopAllowsNewHead(t *testing.T) {
 		TaskID: "task-7", ReviewRound: "review-1", Result: &AgentResult{Decision: "changes_requested"},
 	})
 	engine := testEngine(store)
-	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
-		return []string{"internal/workflow/engine.go"}, nil
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string, string) (ReviewScopeDiff, error) {
+		return testScopeDiff("internal/workflow/engine.go"), nil
 	}
 	if err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
 		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-b",
@@ -1412,8 +1412,8 @@ func TestEngineReviewLoopSparseHistoryDispatchesNextNumericRound(t *testing.T) {
 	engine := testEngine(store)
 	gate := &fakeMergeGate{decision: MergeDecision{Ready: true}}
 	engine.MergeGate = gate
-	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
-		return []string{"internal/workflow/engine.go"}, nil
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string, string) (ReviewScopeDiff, error) {
+		return testScopeDiff("internal/workflow/engine.go"), nil
 	}
 	if err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
 		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-b",

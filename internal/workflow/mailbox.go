@@ -109,11 +109,18 @@ func NewMailbox(store *db.Store) Mailbox {
 }
 
 // ReviewScope is the bounded input for a follow-up review. PreviousHeadSHA is
-// always the exact head this reviewer last saw, never the PR base.
+// always the exact head this reviewer last saw, never the PR base. MergeBase is
+// merge-base(origin/<base>, current head): ChangedFiles are the files whose own
+// change moved since PreviousHeadSHA, and the reviewer reads them against
+// MergeBase, so a base-branch merge between rounds never enters the scope
+// (#2682). OutsidePRFindings are prior findings whose file:line lies outside
+// the pull request's own diff; they are listed as not blocking, never carried.
 type ReviewScope struct {
-	PreviousHeadSHA string   `json:"previous_head_sha"`
-	Findings        []string `json:"findings,omitempty"`
-	ChangedFiles    []string `json:"changed_files,omitempty"`
+	PreviousHeadSHA   string   `json:"previous_head_sha"`
+	MergeBase         string   `json:"merge_base,omitempty"`
+	Findings          []string `json:"findings,omitempty"`
+	OutsidePRFindings []string `json:"outside_pr_findings,omitempty"`
+	ChangedFiles      []string `json:"changed_files,omitempty"`
 }
 
 type JobRequest struct {
@@ -1988,9 +1995,11 @@ func cloneReviewScope(scope *ReviewScope) *ReviewScope {
 		return nil
 	}
 	return &ReviewScope{
-		PreviousHeadSHA: strings.TrimSpace(scope.PreviousHeadSHA),
-		Findings:        compactStrings(scope.Findings),
-		ChangedFiles:    compactStrings(scope.ChangedFiles),
+		PreviousHeadSHA:   strings.TrimSpace(scope.PreviousHeadSHA),
+		MergeBase:         strings.TrimSpace(scope.MergeBase),
+		Findings:          compactStrings(scope.Findings),
+		OutsidePRFindings: compactStrings(scope.OutsidePRFindings),
+		ChangedFiles:      compactStrings(scope.ChangedFiles),
 	}
 }
 

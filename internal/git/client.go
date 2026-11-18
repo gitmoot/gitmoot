@@ -1047,6 +1047,135 @@ func (c Client) ChangedFiles(ctx context.Context, base string, head string) ([]s
 	return parseNameStatusZ(result.Stdout)
 }
 
+// DiffPaths lists every path whose content differs between two exact commits
+// (`from..to`, two-dot, so no merge base is taken). Renames are split into the
+// deleted and the added path, so a moved file is named at both ends; `-z`
+// keeps paths carrying whitespace, quotes or non-ASCII bytes unambiguous.
+func (c Client) DiffPaths(ctx context.Context, from string, to string) ([]string, error) {
+	from, to = strings.TrimSpace(from), strings.TrimSpace(to)
+	if err := validateRef(from); err != nil {
+		return nil, err
+	}
+	if err := validateRef(to); err != nil {
+		return nil, err
+	}
+	result, err := c.run(ctx, "diff", "-z", "--name-only", "--no-renames", "--submodule=short", from, to, "--")
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Split(result.Stdout, "\x00")
+	if n := len(fields); n > 0 && fields[n-1] == "" {
+		fields = fields[:n-1]
+	}
+	for index, path := range fields {
+		if path == "" {
+			return nil, fmt.Errorf("git diff --name-only field %d names an empty path", index)
+		}
+	}
+	return fields, nil
+}
+
+// DiffPatches returns the `from..to` patch of every changed path, keyed by
+// path, renames split as in DiffPaths. Prefixes, color, external drivers and
+// textconv are pinned so user configuration cannot change the text, and the
+// index line carries full blob ids, so a binary file's patch ("Binary files
+// differ") still names exactly which change it is without carrying its bytes.
+// The keys are checked against DiffPaths: a patch stream this parser read
+// differently from git's own path list is an error, never a silently missing
+// file.
+func (c Client) DiffPatches(ctx context.Context, from string, to string) (map[string]string, error) {
+	paths, err := c.DiffPaths(ctx, from, to)
+	if err != nil {
+		return nil, err
+	}
+	from, to = strings.TrimSpace(from), strings.TrimSpace(to)
+	result, err := c.run(ctx, "diff", "--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "--full-index",
+		"--submodule=short", "--src-prefix=a/", "--dst-prefix=b/", from, to, "--")
+	if err != nil {
+		return nil, err
+	}
+	patches, err := splitFilePatches(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	if len(patches) != len(paths) {
+		return nil, fmt.Errorf("git diff %s..%s: patch stream names %d paths, --name-only names %d", from, to, len(patches), len(paths))
+	}
+	for _, path := range paths {
+		if _, ok := patches[path]; !ok {
+			return nil, fmt.Errorf("git diff %s..%s: no patch parsed for %q", from, to, path)
+		}
+	}
+	return patches, nil
+}
+
+// splitFilePatches splits `git diff --no-renames` output at its `diff --git`
+// headers. Without renames the a/ and b/ paths are the same path, which makes
+// an unquoted header unambiguous even when the path holds spaces; a quoted
+// header is git's C-quoting, which Go's unquoting reads byte for byte.
+func splitFilePatches(out string) (map[string]string, error) {
+	patches := make(map[string]string)
+	current := ""
+	var body strings.Builder
+	flush := func() {
+		if current != "" {
+			patches[current] = body.String()
+		}
+		body.Reset()
+	}
+	for len(out) > 0 {
+		line := out
+		if cut := strings.IndexByte(out, '\n'); cut >= 0 {
+			line, out = out[:cut+1], out[cut+1:]
+		} else {
+			out = ""
+		}
+		if header, ok := strings.CutPrefix(line, "diff --git "); ok {
+			flush()
+			path, err := patchHeaderPath(strings.TrimRight(header, "\n"))
+			if err != nil {
+				return nil, err
+			}
+			if _, seen := patches[path]; seen {
+				return nil, fmt.Errorf("git diff names %q twice", path)
+			}
+			current = path
+		} else if current == "" {
+			return nil, fmt.Errorf("git diff output starts outside a file header: %q", strings.TrimRight(line, "\n"))
+		}
+		body.WriteString(line)
+	}
+	flush()
+	return patches, nil
+}
+
+func patchHeaderPath(header string) (string, error) {
+	if strings.HasPrefix(header, `"`) {
+		quoted, err := strconv.QuotedPrefix(header)
+		if err != nil {
+			return "", fmt.Errorf("git diff header %q: %w", header, err)
+		}
+		path, err := strconv.Unquote(quoted)
+		if err != nil {
+			return "", fmt.Errorf("git diff header %q: %w", header, err)
+		}
+		if path, ok := strings.CutPrefix(path, "a/"); ok && path != "" {
+			return path, nil
+		}
+		return "", fmt.Errorf("git diff header %q has no a/ path", header)
+	}
+	// Unquoted, the header is exactly "a/" + path + " b/" + path.
+	if len(header) < 7 || (len(header)-5)%2 != 0 || !strings.HasPrefix(header, "a/") {
+		return "", fmt.Errorf("git diff header %q is not a same-path header", header)
+	}
+	size := (len(header) - 5) / 2
+	path := header[2 : 2+size]
+	if header[2+size:] != " b/"+path {
+		return "", fmt.Errorf("git diff header %q is not a same-path header", header)
+	}
+	return path, nil
+}
+
 // parseNameStatusZ decodes `git diff -z --name-status`: NUL-TERMINATED fields
 // where a status is followed by one path, except rename/copy statuses (`R100`,
 // `C75`) which are followed by the old path AND the new path. A record that runs
