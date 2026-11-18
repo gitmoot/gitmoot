@@ -2568,9 +2568,9 @@ func jobStateEligibleForWorktreeReclaim(state string) bool {
 // is BOUNDED (#598): it asks the store for ONLY the jobs whose latest comment event
 // is a failure marker instead of listing EVERY job and re-reading each terminal
 // job's full event history on every 1s worker tick. Each candidate is re-verified
-// with the Go predicate jobNeedsCommentRetry, so behavior is identical. Comment
-// retries never touch a checkout, so (unlike advancements) they take no checkoutHeld
-// gate.
+// with jobNeedsCommentRetry, which also holds it until its backoff has elapsed and
+// abandons it at the attempt cap (#2688). Comment retries never touch a checkout,
+// so (unlike advancements) they take no checkoutHeld gate.
 func retryPendingJobComments(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, cand *tickCandidates) error {
 	jobIDs, err := cand.commentRetryCandidates(ctx)
 	if err != nil {

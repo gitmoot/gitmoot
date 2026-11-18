@@ -3420,4 +3420,14 @@ CREATE INDEX IF NOT EXISTS idx_jobs_agent_state_created ON jobs(agent, state, cr
 DROP INDEX IF EXISTS idx_jobs_workflow_id;
 CREATE INDEX idx_jobs_workflow_id ON jobs(workflow_id, state, created_at, updated_at, input_tokens, output_tokens, repo) WHERE workflow_id != '';
 	`,
+	// #2687: the merge gate's review-required check listed every job and decoded
+	// every payload (31.6k jobs, ~374 MB) on each evaluation, which a closed
+	// ready-to-merge task repeated every daemon tick. It now reads
+	// ListReviewJobsInTaskScope, which seeks this partial index. idx_jobs_repo
+	// only narrowed to the repo: every job in it, each read past its payload's
+	// overflow chain to reach type and pull_request (50-150 ms per call on the
+	// live store; under 10 ms with this index).
+	`
+CREATE INDEX IF NOT EXISTS idx_jobs_review_repo_pr ON jobs(repo, pull_request) WHERE type = 'review';
+	`,
 }

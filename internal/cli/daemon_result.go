@@ -8,6 +8,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/github"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -545,46 +546,108 @@ func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent
 		Diagnostic:             diagnostic,
 	})
 	if _, err := w.CommenterFactory("").PostIssueComment(ctx, repo, int64(payload.PullRequest), body); err != nil {
-		_ = w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "comment_post_failed", Message: err.Error()})
+		w.recordCommentPostFailure(ctx, job.ID, err)
 		return nil
 	}
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "comment_posted", Message: "posted attributed PR result comment"})
 }
 
-func (w jobWorker) jobResultCommentPosted(ctx context.Context, jobID string) (bool, error) {
-	events, err := w.Store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		return false, err
+// commentPostAbandonedKind ends a job's result-comment retries (#2688). Like
+// comment_posted and retry_queued it settles the latest comment_post_failed, so
+// JobIDsWithPendingCommentRetry stops offering the job; a later retry_queued
+// run starts a fresh delivery.
+const commentPostAbandonedKind = "comment_post_abandoned"
+
+// Result-comment retry cadence (#2688): the retry pass ran every 1s worker tick,
+// so one undeliverable comment wrote ~48k comment_post_failed events in three
+// days. A retryable failure now waits commentRetryBaseDelay, doubling per failed
+// attempt up to commentRetryMaxDelay, and the job gives up after
+// commentRetryMaxAttempts failed posts.
+const (
+	commentRetryBaseDelay   = time.Minute
+	commentRetryMaxDelay    = time.Hour
+	commentRetryMaxAttempts = 20
+)
+
+// commentRetryNow is the comment-retry clock; tests pin it.
+var commentRetryNow = time.Now
+
+// recordCommentPostFailure records a failed result-comment post. A permanent
+// failure, or the commentRetryMaxAttempts-th retryable one, also abandons the
+// delivery so the retry pass never tries it again. Errors are swallowed like
+// the historical comment_post_failed write: the comment is best effort.
+func (w jobWorker) recordCommentPostFailure(ctx context.Context, jobID string, postErr error) {
+	if permanentCommentPostError(postErr) {
+		_ = w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: commentPostAbandonedKind,
+			Message: "permanent failure, not retried: " + postErr.Error()})
+		return
 	}
-	posted := false
-	for _, event := range events {
-		switch event.Kind {
-		case "retry_queued":
-			posted = false
-		case "comment_posted":
-			posted = true
-		}
+	if err := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "comment_post_failed", Message: postErr.Error()}); err != nil {
+		return
 	}
-	return posted, nil
+	state, err := w.Store.CommentRetryState(ctx, jobID)
+	if err != nil || state.Failures < commentRetryMaxAttempts {
+		return
+	}
+	w.abandonCommentRetry(ctx, jobID, state.Failures)
 }
 
-func (w jobWorker) jobNeedsCommentRetry(ctx context.Context, jobID string) (bool, error) {
-	events, err := w.Store.ListJobEvents(ctx, jobID)
+func (w jobWorker) abandonCommentRetry(ctx context.Context, jobID string, failures int) {
+	_ = w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: commentPostAbandonedKind,
+		Message: fmt.Sprintf("gave up after %d failed result comment posts", failures)})
+}
+
+// permanentCommentPostError reports a failure no retry can clear: os/exec could
+// not start gh at all because the argv is invalid (EINVAL: a NUL byte) or too
+// large (E2BIG). Both arrive wrapped in exec's *fs.PathError; the same post
+// fails identically on every attempt (#2688).
+func permanentCommentPostError(err error) bool {
+	return errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.E2BIG)
+}
+
+// commentRetryDelay is the wait after a job's failures-th failed post.
+func commentRetryDelay(failures int) time.Duration {
+	delay := commentRetryBaseDelay
+	for i := 1; i < failures && delay < commentRetryMaxDelay; i++ {
+		delay *= 2
+	}
+	return min(delay, commentRetryMaxDelay)
+}
+
+// commentRetryDue reports whether the backoff after the latest failed post has
+// elapsed. A timestamp that cannot be read is treated as due, so a malformed
+// row degrades to the historical retry rather than wedging the comment.
+func commentRetryDue(state db.CommentRetryState, now time.Time) bool {
+	failedAt, err := time.Parse(time.DateTime, state.LatestFailedAt)
+	if err != nil {
+		return true
+	}
+	return !now.UTC().Before(failedAt.Add(commentRetryDelay(state.Failures)))
+}
+
+func (w jobWorker) jobResultCommentPosted(ctx context.Context, jobID string) (bool, error) {
+	state, err := w.Store.CommentRetryState(ctx, jobID)
 	if err != nil {
 		return false, err
 	}
-	needsRetry := false
-	for _, event := range events {
-		switch event.Kind {
-		case "comment_post_failed":
-			needsRetry = true
-		case "comment_posted":
-			needsRetry = false
-		case "retry_queued":
-			needsRetry = false
-		}
+	return state.Posted, nil
+}
+
+// jobNeedsCommentRetry reports whether jobID's failed result comment should be
+// posted again now. It reads the latest comment events through
+// Store.CommentRetryState rather than the job's whole event history (#2688). A
+// delivery that already failed commentRetryMaxAttempts times is abandoned here
+// (it may predate the cap); one still inside its backoff waits.
+func (w jobWorker) jobNeedsCommentRetry(ctx context.Context, jobID string) (bool, error) {
+	state, err := w.Store.CommentRetryState(ctx, jobID)
+	if err != nil || !state.Pending {
+		return false, err
 	}
-	return needsRetry, nil
+	if state.Failures >= commentRetryMaxAttempts {
+		w.abandonCommentRetry(ctx, jobID, state.Failures)
+		return false, nil
+	}
+	return commentRetryDue(state, commentRetryNow()), nil
 }
 
 func (w jobWorker) storedJobFailureDiagnostic(ctx context.Context, job db.Job) string {

@@ -241,6 +241,7 @@ func TestPendingJobCommentFailureDoesNotBlockDispatch(t *testing.T) {
 	h.worker.CommenterFactory = func(string) github.Client {
 		return &cliPollFakeGitHub{}
 	}
+	pinCommentRetryClock(t, time.Now().Add(commentRetryMaxDelay))
 
 	h.runAndAssertDispatched(t, "", "repo must be owner/repo")
 }
