@@ -367,7 +367,7 @@ func (c *tickCandidates) prStalledTick(ctx context.Context, store *db.Store, hom
 		prStalledConfigError.Store("")
 	}
 	sweep := &prStalledSweep{newEnv: func() *prStalledEnv {
-		return newPRStalledEnv(ctx, store, home, prStalledGitHubClient(), prStalledRequiredChecks)
+		return newPRStalledEnv(ctx, store, home, prStalledGitHubClient())
 	}}
 	c.prStalled = prStalledTickMemo{done: true, home: home, policy: policy, sweep: sweep}
 	return policy, sweep

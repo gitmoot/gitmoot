@@ -77,9 +77,11 @@ func parsePRHoldNote(body string) (repo string, pr int, hold prHold, ok bool) {
 }
 
 // listPRHolds returns repo's active hold notes by pull request: the newest
-// hold or clear note of each pull request, when it is a hold.
+// hold or clear note of each pull request, when it is a hold. Every hold note
+// of the repo is read, with no window: a busy pull request must not push an
+// older pull request's decision out of view.
 func listPRHolds(ctx context.Context, store *db.Store, repo string) (map[int]prHold, error) {
-	notes, err := store.ListRepoWorkflowNotesByBodyPrefix(ctx, prHoldNotePrefix, repo, 200)
+	notes, err := store.ListAllRepoWorkflowNotesByBodyPrefix(ctx, prHoldNotePrefix, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +145,7 @@ func runPRStalled(args []string, stdout, stderr io.Writer) int {
 				}
 			}
 		}
-		env := newPRStalledEnv(ctx, store, paths.Home, prStalledGitHubClient(), newPRRequiredCheckCache())
+		env := newPRStalledEnv(ctx, store, paths.Home, prStalledGitHubClient())
 		now := time.Now().UTC()
 		for _, repo := range repos {
 			report, err := evaluateStalledPullRequests(ctx, store, env, repo, policy, now)
@@ -189,6 +191,13 @@ func printPRStalled(w io.Writer, reports []prStalledReport) {
 		open += report.Open
 		if report.Truncated {
 			fmt.Fprintf(w, "%s: %d open pull requests; only the newest %d were evaluated\n", report.Repo, report.Open, len(report.open))
+		}
+		if len(report.ChecksTruncated) > 0 {
+			numbers := make([]string, len(report.ChecksTruncated))
+			for i, number := range report.ChecksTruncated {
+				numbers[i] = "#" + strconv.Itoa(number)
+			}
+			fmt.Fprintf(w, "%s: checks truncated (more than 100 contexts), not judged green: %s\n", report.Repo, strings.Join(numbers, ", "))
 		}
 	}
 	fmt.Fprintf(w, "%d stalled of %d open pull requests in %d repositories\n", len(stalled), open, len(reports))

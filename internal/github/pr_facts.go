@@ -14,8 +14,9 @@ const OpenPullRequestFactsLimit = 100
 
 // openPullRequestFactsQuery reads every fact the stalled-PR evaluator (#2677)
 // needs from GitHub for one repository in ONE GraphQL request: the open pull
-// requests, each with its head, draft and mergeable state and the head
-// commit's time and check rollup. Measured at 2 points per repository.
+// requests, each with its head, draft and mergeable state, the head commit's
+// time and check rollup, and the base branch's required checks (classic
+// protection and rulesets), so no REST lookup is needed.
 const openPullRequestFactsQuery = `query($owner: String!, $name: String!) {
   rateLimit { cost }
   repository(owner: $owner, name: $name) {
@@ -23,6 +24,12 @@ const openPullRequestFactsQuery = `query($owner: String!, $name: String!) {
       totalCount
       nodes {
         number title isDraft mergeable headRefOid baseRefName createdAt
+        baseRef {
+          branchProtectionRule { requiredStatusCheckContexts requiredStatusChecks { context } }
+          rules(first: 50) { pageInfo { hasNextPage } nodes { type parameters {
+            ... on RequiredStatusChecksParameters { requiredStatusChecks { context } }
+          } } }
+        }
         commits(last: 1) { nodes { commit { oid committedDate
           statusCheckRollup { state contexts(first: 100) { totalCount nodes {
             __typename
@@ -61,6 +68,12 @@ type PullRequestFacts struct {
 	// ChecksTruncated is set when the head has more check contexts than one
 	// page returned.
 	ChecksTruncated bool
+	// Required is the base branch's required status checks, the union of its
+	// classic protection and its rulesets. RequiredKnown is false when that
+	// set cannot be determined: no readable classic protection (unprotected
+	// and unreadable look alike) or more ruleset rules than one page.
+	Required      []string
+	RequiredKnown bool
 }
 
 // PullRequestCheckFact is one check run or commit status on a head. Bucket is
@@ -100,6 +113,54 @@ type graphQLCheckContext struct {
 	CreatedAt   string `json:"createdAt"`
 }
 
+type graphQLContextName struct {
+	Context string `json:"context"`
+}
+
+// graphQLBaseRef is a pull request's base branch with its protection.
+type graphQLBaseRef struct {
+	BranchProtectionRule *struct {
+		RequiredStatusCheckContexts []string             `json:"requiredStatusCheckContexts"`
+		RequiredStatusChecks        []graphQLContextName `json:"requiredStatusChecks"`
+	} `json:"branchProtectionRule"`
+	Rules struct {
+		PageInfo struct {
+			HasNextPage bool `json:"hasNextPage"`
+		} `json:"pageInfo"`
+		Nodes []struct {
+			Type       string `json:"type"`
+			Parameters *struct {
+				RequiredStatusChecks []graphQLContextName `json:"requiredStatusChecks"`
+			} `json:"parameters"`
+		} `json:"nodes"`
+	} `json:"rules"`
+}
+
+// requiredChecks unions the classic and ruleset required contexts. The set is
+// known only when the classic protection is readable (a null rule is either
+// unprotected or unreadable) and every ruleset rule was read.
+func (ref *graphQLBaseRef) requiredChecks() ([]string, bool) {
+	if ref == nil {
+		return nil, false
+	}
+	var contexts []string
+	if rule := ref.BranchProtectionRule; rule != nil {
+		contexts = append(contexts, rule.RequiredStatusCheckContexts...)
+		for _, check := range rule.RequiredStatusChecks {
+			contexts = append(contexts, check.Context)
+		}
+	}
+	for _, node := range ref.Rules.Nodes {
+		if node.Type == "REQUIRED_STATUS_CHECKS" && node.Parameters != nil {
+			for _, check := range node.Parameters.RequiredStatusChecks {
+				contexts = append(contexts, check.Context)
+			}
+		}
+	}
+	known := ref.BranchProtectionRule != nil && !ref.Rules.PageInfo.HasNextPage
+	return compactUniqueStrings(contexts), known
+}
+
 func decodeOpenPullRequestFacts(body []byte) (OpenPullRequestFacts, error) {
 	var response struct {
 		Data struct {
@@ -110,13 +171,14 @@ func decodeOpenPullRequestFacts(body []byte) (OpenPullRequestFacts, error) {
 				PullRequests struct {
 					TotalCount int `json:"totalCount"`
 					Nodes      []struct {
-						Number      int    `json:"number"`
-						Title       string `json:"title"`
-						IsDraft     bool   `json:"isDraft"`
-						Mergeable   string `json:"mergeable"`
-						HeadRefOid  string `json:"headRefOid"`
-						BaseRefName string `json:"baseRefName"`
-						CreatedAt   string `json:"createdAt"`
+						Number      int             `json:"number"`
+						Title       string          `json:"title"`
+						IsDraft     bool            `json:"isDraft"`
+						Mergeable   string          `json:"mergeable"`
+						HeadRefOid  string          `json:"headRefOid"`
+						BaseRefName string          `json:"baseRefName"`
+						CreatedAt   string          `json:"createdAt"`
+						BaseRef     *graphQLBaseRef `json:"baseRef"`
 						Commits     struct {
 							Nodes []struct {
 								Commit struct {
@@ -161,6 +223,7 @@ func decodeOpenPullRequestFacts(body []byte) (OpenPullRequestFacts, error) {
 			BaseRef:   node.BaseRefName,
 			CreatedAt: parseGraphQLTime(node.CreatedAt),
 		}
+		facts.Required, facts.RequiredKnown = node.BaseRef.requiredChecks()
 		if len(node.Commits.Nodes) > 0 {
 			commit := node.Commits.Nodes[0].Commit
 			facts.HeadCommittedAt = parseGraphQLTime(commit.CommittedDate)

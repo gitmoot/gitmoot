@@ -276,14 +276,20 @@ Never merge around a held gate on your own authority.
 lists open pull requests stuck between two steps, with the owning seat and a
 suggested next command:
 
-- `no_ci_on_head`: no check ran 30 min after the head commit; the cause says
-  whether it conflicts with the base or is a draft;
+- `no_ci_on_head`: no check ran 30 min after the head commit, or a required
+  check never reported; the cause says which, and whether the pull request
+  conflicts with the base or is a draft;
 - `ci_red`: a required check has failed for 6 h;
 - `awaiting_review`: level 3 (or no level recorded), green, and no review
   requested or running at the head for 1 h;
 - `green_not_merged`: level 1 or 2 and green, or level 3 approved and green,
   for 2 h, with no merge gate making progress;
 - `draft_stale`: a draft for 12 h.
+
+"Green" means every required check of the base branch passed (every reported
+check, when the required set cannot be read). Gitmoot's own `gitmoot/*`
+statuses are not CI, and a head with more than 100 checks is listed as
+"checks truncated" and never judged green.
 
 With `[pr_stalled] enabled = true` the daemon runs the same check every
 `interval` (30 min) per repository and sends each stalled pull request's seat

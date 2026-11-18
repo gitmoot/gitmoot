@@ -31,10 +31,9 @@ const (
 )
 
 // prStalledGitHub is the GitHub surface the evaluator reads: one GraphQL query
-// per repository, and the base branch's required checks (cached).
+// per repository, which also carries each base branch's required checks.
 type prStalledGitHub interface {
 	OpenPullRequestFacts(ctx context.Context, repo github.Repository) (github.OpenPullRequestFacts, error)
-	RequiredStatusCheckContexts(ctx context.Context, repo github.Repository, branch string) ([]string, bool, error)
 	// GetPullRequest reads the head `pr hold` binds the hold to.
 	GetPullRequest(ctx context.Context, repo github.Repository, number int64) (github.PullRequest, error)
 }
@@ -45,11 +44,9 @@ var prStalledGitHubClient = func() prStalledGitHub { return github.NewClient("")
 // prStallFacts is everything the classifier decides from, for one pull request.
 type prStallFacts struct {
 	Repo string
-	PR   github.PullRequestFacts
-	// Required is the base branch's required checks; RequiredKnown=false
-	// counts every check as required.
-	Required      map[string]bool
-	RequiredKnown bool
+	// PR carries the base branch's required checks: PR.RequiredKnown=false
+	// counts every reported check as required.
+	PR github.PullRequestFacts
 	// Level is the review level at the head ("" when none was recorded).
 	Level string
 	// ReviewRunning reports a pre-merge review queued, running or blocked at
@@ -77,7 +74,8 @@ func classifyStalledPR(f prStallFacts, policy config.PRStalledPolicy, now time.T
 		return prStall{}, false
 	}
 	ref := fmt.Sprintf("%d --repo %s", pr.Number, f.Repo)
-	if len(pr.Checks) == 0 {
+	checks := prCIChecks(pr.Checks)
+	if len(checks) == 0 {
 		since := firstNonZeroTime(pr.HeadCommittedAt, pr.CreatedAt)
 		if now.Sub(since) < policy.NoCIAfter {
 			return prStall{}, false
@@ -104,14 +102,31 @@ func classifyStalledPR(f prStallFacts, policy config.PRStalledPolicy, now time.T
 		return prStall{State: prStallDraftStale, Since: since, Cause: "a draft with no push since",
 			Next: "gh pr ready " + ref + ", or close it"}, true
 	}
-	ci := summarizePRChecks(pr.Checks, f.Required, f.RequiredKnown)
+	ci := summarizePRChecks(checks, pr.Required, pr.RequiredKnown)
 	if ci.failed != "" {
 		since := firstNonZeroTime(ci.redSince, pr.HeadCommittedAt)
 		if now.Sub(since) < policy.CIRedAfter {
 			return prStall{}, false
 		}
-		return prStall{State: prStallCIRed, Since: since, Cause: fmt.Sprintf("required check %q failed", ci.failed),
+		cause := fmt.Sprintf("required check %q failed", ci.failed)
+		if pr.ChecksTruncated {
+			cause += " (checks truncated)"
+		}
+		return prStall{State: prStallCIRed, Since: since, Cause: cause,
 			Next: "gh pr checks " + ref + ", then fix the failure or re-run it"}, true
+	}
+	// A truncated check page is no evidence of green, nor of a required check
+	// that never reported: it may be on the page not read.
+	if pr.ChecksTruncated {
+		return prStall{}, false
+	}
+	if ci.missing != "" {
+		since := firstNonZeroTime(pr.HeadCommittedAt, pr.CreatedAt)
+		if now.Sub(since) < policy.NoCIAfter {
+			return prStall{}, false
+		}
+		return prStall{State: prStallNoCIOnHead, Since: since, Cause: fmt.Sprintf("required check %q never reported", ci.missing),
+			Next: fmt.Sprintf("check the workflow triggers: gh run list --repo %s --commit %s", f.Repo, pr.HeadSHA)}, true
 	}
 	if ci.pending {
 		return prStall{}, false
@@ -157,22 +172,49 @@ func (f prStallFacts) mergeGateProgressing(policy config.PRStalledPolicy, now ti
 	return !updated.IsZero() && now.Sub(updated) < policy.GreenNotMergedAfter
 }
 
+// prCIChecks drops gitmoot's own bookkeeping statuses (gitmoot/merge-gate,
+// gitmoot/review-level): they are not CI, and the merge gate's progress is
+// read from its store row instead.
+func prCIChecks(checks []github.PullRequestCheckFact) []github.PullRequestCheckFact {
+	out := make([]github.PullRequestCheckFact, 0, len(checks))
+	for _, check := range checks {
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(check.Name)), "gitmoot/") {
+			out = append(out, check)
+		}
+	}
+	return out
+}
+
 type prCheckSummary struct {
-	failed     string // the first failing required check
+	failed     string // the earliest failing required check
 	redSince   time.Time
+	missing    string // a required check that has not reported
 	pending    bool
 	greenSince time.Time
 }
 
-func summarizePRChecks(checks []github.PullRequestCheckFact, required map[string]bool, requiredKnown bool) prCheckSummary {
+// summarizePRChecks judges CI. With a known, non-empty required set only the
+// required checks count, and every one of them must have reported; otherwise
+// (unknown, or protection that requires no check) every reported check counts.
+func summarizePRChecks(checks []github.PullRequestCheckFact, required []string, requiredKnown bool) prCheckSummary {
 	var summary prCheckSummary
+	requiredSet := make(map[string]bool, len(required))
+	for _, name := range required {
+		if name = strings.TrimSpace(name); name != "" && !strings.HasPrefix(strings.ToLower(name), "gitmoot/") {
+			requiredSet[name] = true
+		}
+	}
+	requiredKnown = requiredKnown && len(requiredSet) > 0
+	reported := map[string]bool{}
 	for _, check := range checks {
+		name := strings.TrimSpace(check.Name)
+		if requiredKnown && !requiredSet[name] {
+			continue
+		}
+		reported[name] = true
 		at := firstNonZeroTime(check.CompletedAt, check.StartedAt)
 		switch check.Bucket {
 		case "fail":
-			if requiredKnown && !required[strings.TrimSpace(check.Name)] {
-				continue
-			}
 			if summary.failed == "" || (!at.IsZero() && at.Before(summary.redSince)) {
 				summary.failed, summary.redSince = check.Name, at
 			}
@@ -180,6 +222,19 @@ func summarizePRChecks(checks []github.PullRequestCheckFact, required map[string
 			summary.greenSince = laterTime(summary.greenSince, at)
 		default:
 			summary.pending = true
+		}
+	}
+	if requiredKnown {
+		names := make([]string, 0, len(requiredSet))
+		for name := range requiredSet {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if !reported[name] {
+				summary.missing = name
+				break
+			}
 		}
 	}
 	return summary
@@ -227,6 +282,8 @@ type prStalledRow struct {
 	OwnerSource string    `json:"owner_source"`
 	Cause       string    `json:"cause"`
 	Next        string    `json:"next"`
+	// ChecksTruncated: the head has more check contexts than one page read.
+	ChecksTruncated bool `json:"checks_truncated,omitempty"`
 	// attributed is the role the PR's own records name, before any roster
 	// check; the alert carries it and the sink validates it.
 	attributed string
@@ -249,15 +306,16 @@ type prStalledReport struct {
 	Cost      int            `json:"graphql_cost"`
 	Stalled   []prStalledRow `json:"stalled"`
 	Held      []prHeldRow    `json:"held"`
+	// ChecksTruncated lists the open pull requests whose head has more check
+	// contexts than one page read; none of them is judged green.
+	ChecksTruncated []int `json:"checks_truncated"`
 	// open maps every open pull request read to its head.
 	open map[int]string
 }
 
 // prStalledEnv is what one evaluation shares across repositories.
 type prStalledEnv struct {
-	home     string
-	gh       prStalledGitHub
-	required *prRequiredCheckCache
+	gh prStalledGitHub
 	// levels loads the review-level log once per evaluation pass.
 	levels func() (map[string]map[int][]reviewLevelLogEntry, error)
 	org    config.OrgConfig
@@ -265,8 +323,8 @@ type prStalledEnv struct {
 	roster orgRoster
 }
 
-func newPRStalledEnv(ctx context.Context, store *db.Store, home string, gh prStalledGitHub, required *prRequiredCheckCache) *prStalledEnv {
-	env := &prStalledEnv{home: home, gh: gh, required: required}
+func newPRStalledEnv(ctx context.Context, store *db.Store, home string, gh prStalledGitHub) *prStalledEnv {
+	env := &prStalledEnv{gh: gh}
 	var once sync.Once
 	var histories map[string]map[int][]reviewLevelLogEntry
 	var historyErr error
@@ -284,7 +342,7 @@ func newPRStalledEnv(ctx context.Context, store *db.Store, home string, gh prSta
 // evaluateStalledPullRequests evaluates every open pull request of repo: one
 // GraphQL query, then store reads only.
 func evaluateStalledPullRequests(ctx context.Context, store *db.Store, env *prStalledEnv, repo string, policy config.PRStalledPolicy, now time.Time) (prStalledReport, error) {
-	report := prStalledReport{Repo: repo, Stalled: []prStalledRow{}, Held: []prHeldRow{}, open: map[int]string{}}
+	report := prStalledReport{Repo: repo, Stalled: []prStalledRow{}, Held: []prHeldRow{}, ChecksTruncated: []int{}, open: map[int]string{}}
 	ghRepo, err := github.ParseRepository(repo)
 	if err != nil {
 		return report, err
@@ -319,11 +377,13 @@ func evaluateStalledPullRequests(ctx context.Context, store *db.Store, env *prSt
 	levelsByPR := histories[strings.ToLower(repo)]
 	for _, pr := range facts.PullRequests {
 		f := prStallFacts{Repo: repo, PR: pr}
-		f.Required, f.RequiredKnown = env.required.get(ctx, env.gh, ghRepo, pr.BaseRef, now)
 		if historyErr == nil {
 			f.Level = prLevelAtHead(levelsByPR[pr.Number], pr.HeadSHA)
 		}
 		review := reviews[prHeadKey(pr.Number, pr.HeadSHA)]
+		if pr.ChecksTruncated {
+			report.ChecksTruncated = append(report.ChecksTruncated, pr.Number)
+		}
 		f.ReviewRunning, f.Verdict, f.VerdictAt = review.running, review.verdict, review.verdictAt
 		if gate, ok := gates[int64(pr.Number)]; ok {
 			f.MergeGate = &gate
@@ -341,7 +401,7 @@ func evaluateStalledPullRequests(ctx context.Context, store *db.Store, env *prSt
 		}
 		row := prStalledRow{Repo: repo, PullRequest: pr.Number, Title: pr.Title, Head: pr.HeadSHA, State: stall.State,
 			Since: stall.Since, Age: formatStallAge(now.Sub(stall.Since)), Level: prStallLevelLabel(f.Level),
-			Cause: stall.Cause, Next: stall.Next}
+			Cause: stall.Cause, Next: stall.Next, ChecksTruncated: pr.ChecksTruncated}
 		attributed, err := pullRequestAttributedRole(ctx, store, repo, pr.Number)
 		if err != nil {
 			return report, err
@@ -441,55 +501,6 @@ func prStalledReviewsAtHead(ctx context.Context, store *db.Store, repo string, n
 		out[key] = review
 	}
 	return out, nil
-}
-
-// prRequiredCheckCache caches each base branch's required checks: they change
-// rarely, and each lookup is two REST calls.
-type prRequiredCheckCache struct {
-	mu      sync.Mutex
-	ttl     time.Duration
-	entries map[string]prRequiredChecks
-}
-
-type prRequiredChecks struct {
-	at       time.Time
-	required map[string]bool
-	known    bool
-}
-
-const prRequiredCheckTTL = 6 * time.Hour
-
-// prStalledRequiredChecks is the daemon's process-wide cache.
-var prStalledRequiredChecks = newPRRequiredCheckCache()
-
-func newPRRequiredCheckCache() *prRequiredCheckCache {
-	return &prRequiredCheckCache{ttl: prRequiredCheckTTL, entries: map[string]prRequiredChecks{}}
-}
-
-func (c *prRequiredCheckCache) get(ctx context.Context, gh prStalledGitHub, repo github.Repository, branch string, now time.Time) (map[string]bool, bool) {
-	branch = strings.TrimSpace(branch)
-	if branch == "" {
-		return nil, false
-	}
-	key := strings.ToLower(repo.FullName()) + "\x00" + branch
-	c.mu.Lock()
-	entry, ok := c.entries[key]
-	c.mu.Unlock()
-	if ok && now.Sub(entry.at) < c.ttl {
-		return entry.required, entry.known
-	}
-	contexts, known, err := gh.RequiredStatusCheckContexts(ctx, repo, branch)
-	entry = prRequiredChecks{at: now, known: err == nil && known}
-	if entry.known {
-		entry.required = make(map[string]bool, len(contexts))
-		for _, name := range contexts {
-			entry.required[strings.TrimSpace(name)] = true
-		}
-	}
-	c.mu.Lock()
-	c.entries[key] = entry
-	c.mu.Unlock()
-	return entry.required, entry.known
 }
 
 func formatStallAge(age time.Duration) string {
