@@ -324,6 +324,12 @@ type remoteLifecycleHarness struct {
 	runtimeEnv     map[string]string
 	runtimeStarted bool
 	createdAt      time.Time
+	// createFault, if set, answers create number n (from 1) with its non-zero
+	// status instead of a sandbox; envdFault does the same for an envd call
+	// ("upload" with its path, or "start" with its joined argv) made while
+	// sandbox n is the newest.
+	createFault func(n int) int
+	envdFault   func(n int, call, detail string) int
 }
 
 // firstCreateAt is when the provider received its first create request, or
@@ -377,18 +383,26 @@ func (h *remoteLifecycleHarness) serveControl(w http.ResponseWriter, r *http.Req
 		if h.createdAt.IsZero() {
 			h.createdAt = time.Now()
 		}
+		number := len(h.creates)
+		fault := h.createFault
 		h.mu.Unlock()
+		if fault != nil {
+			if status := fault(number); status != 0 {
+				http.Error(w, remoteLifecycleGatewayRefusal, status)
+				return
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"sandboxID":       "sandbox-1",
+			"sandboxID":       fmt.Sprintf("sandbox-%d", number),
 			"templateID":      request.TemplateID,
 			"envdAccessToken": remoteLifecycleAccessToken,
 			"domain":          nil,
 		})
-	case r.Method == http.MethodDelete && r.URL.Path == "/sandboxes/sandbox-1":
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/sandboxes/sandbox-"):
 		h.mu.Lock()
-		h.deleted = append(h.deleted, "sandbox-1")
+		h.deleted = append(h.deleted, strings.TrimPrefix(r.URL.Path, "/sandboxes/"))
 		h.mu.Unlock()
 		// A destroyed sandbox takes read-only trees with it; the fake restores
 		// write bits first so an unprivileged test user can remove them too.
@@ -412,6 +426,9 @@ func (h *remoteLifecycleHarness) serveEnvd(w http.ResponseWriter, r *http.Reques
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/files":
 		remotePath := r.URL.Query().Get("path")
+		if h.injectEnvdFault(w, "upload", remotePath) {
+			return
+		}
 		local, err := h.guestPath(remotePath)
 		if err != nil {
 			h.t.Errorf("upload path = %q: %v", remotePath, err)
@@ -456,6 +473,9 @@ func (h *remoteLifecycleHarness) serveEnvd(w http.ResponseWriter, r *http.Reques
 			http.Error(w, "bad start", http.StatusBadRequest)
 			return
 		}
+		if h.injectEnvdFault(w, "start", strings.Join(append([]string{request.Process.Command}, request.Process.Args...), " ")) {
+			return
+		}
 		stdout, stderr, exitCode := h.runStart(request)
 		w.Header().Set("Content-Type", "application/connect+json")
 		writeRemoteLifecycleConnectJSON(h.t, w, 0, map[string]any{"event": map[string]any{"start": map[string]any{"pid": 73}}})
@@ -468,6 +488,25 @@ func (h *remoteLifecycleHarness) serveEnvd(w http.ResponseWriter, r *http.Reques
 		h.t.Errorf("unexpected envd request %s %s", r.Method, r.URL.RequestURI())
 		http.NotFound(w, r)
 	}
+}
+
+// remoteLifecycleGatewayRefusal is the body E2B's gateway sent with its 503s
+// on 2026-11-18 (#2680).
+const remoteLifecycleGatewayRefusal = "upstream connect error or disconnect/reset before headers. reset reason: remote connection failure"
+
+func (h *remoteLifecycleHarness) injectEnvdFault(w http.ResponseWriter, call, detail string) bool {
+	h.mu.Lock()
+	fault, number := h.envdFault, len(h.creates)
+	h.mu.Unlock()
+	if fault == nil {
+		return false
+	}
+	status := fault(number, call, detail)
+	if status == 0 {
+		return false
+	}
+	http.Error(w, remoteLifecycleGatewayRefusal, status)
+	return true
 }
 
 func (h *remoteLifecycleHarness) runStart(request remoteLifecycleStartRequest) ([]byte, []byte, int) {

@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
@@ -305,41 +307,109 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("construct %s execution backend: %w", backend, err)
 	}
+	plan := remoteProviderAttemptPlan{
+		backend: backend, runtimeName: runtimeName, job: job, ttl: ttl, materials: materials,
+		sourcePlan: sourcePlan, credentialPlan: credentialPlan, ompExecutable: ompExecutable, ompFile: ompFile,
+	}
+	// #2680: a provider 5xx while preparing a sandbox that already exists is
+	// retried on a fresh sandbox, after the failed one is destroyed and its
+	// reservation settled. Nothing here starts the runtime, so no retry can
+	// repeat a review.
+	for number := 1; ; number++ {
+		plan.number = number
+		instance, lease, env, provisioned, err := w.provisionExecutionBackendAttempt(ctx, lifecycle, plan)
+		if err == nil {
+			return lifecycle, instance, lease, env, nil
+		}
+		status, refused := remoteProviderRefusalStatus(err, provisioned)
+		if !refused {
+			if e2bSpendLimitRefusal(err, cfg.Provider) {
+				err = &remoteProviderRefusalError{
+					provider: cfg.Provider, status: http.StatusPaymentRequired, phase: remoteProviderPhaseProvision, attempts: number, err: err,
+				}
+			}
+			return lifecycle, instance, lease, nil, err
+		}
+		refusal := &remoteProviderRefusalError{
+			provider: cfg.Provider, status: status, phase: remoteProviderPhase(provisioned), attempts: number, err: err,
+		}
+		// A create 5xx is not retried: it is ambiguous, so its reservation stays
+		// held until TTL, and every retry would hold one more.
+		if !provisioned || number > len(remoteProviderRetryBackoffs) {
+			return lifecycle, instance, lease, nil, refusal
+		}
+		backoff := remoteProviderRetryBackoffs[number-1]
+		if lease != nil {
+			lease.Revoke()
+		}
+		if teardownErr := w.destroyExecutionBackend(job.ID, lifecycle, instance); teardownErr != nil {
+			// The sandbox may still exist and bill. Its row stays held for the
+			// reconcile pass, and a retry would add a second one.
+			return lifecycle, nil, nil, nil, refusal
+		}
+		w.recordRemoteProviderRetry(ctx, job, refusal, backoff)
+		if !sleepForRemoteProviderRetry(ctx, backoff) {
+			return lifecycle, nil, nil, nil, refusal
+		}
+	}
+}
+
+// remoteProviderAttemptPlan is what every provider attempt of one job shares:
+// the preparation done once, before any provider call.
+type remoteProviderAttemptPlan struct {
+	backend        execbackend.Backend
+	runtimeName    string
+	job            db.Job
+	ttl            time.Duration
+	number         int
+	materials      execbackend.Materials
+	sourcePlan     *remoteReviewSourcePlan
+	credentialPlan remoteCredentialGatewayPlan
+	ompExecutable  string
+	ompFile        *os.File
+}
+
+// provisionExecutionBackendAttempt makes and prepares one instance. provisioned
+// reports whether Provision returned the instance, so a failure after it
+// belongs to a known sandbox.
+func (w jobWorker) provisionExecutionBackendAttempt(ctx context.Context, lifecycle execbackend.ExecutionBackend, plan remoteProviderAttemptPlan) (*execbackend.Instance, *credgw.Lease, []string, bool, error) {
+	backend, job := plan.backend, plan.job
 	if backend == execbackend.Remote && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
 		latest, stateErr := w.Store.GetJob(context.WithoutCancel(ctx), job.ID)
 		if stateErr != nil {
-			return lifecycle, nil, nil, nil, fmt.Errorf("verify remote review %s before provider call: %w", job.ID, stateErr)
+			return nil, nil, nil, false, fmt.Errorf("verify remote review %s before provider call: %w", job.ID, stateErr)
 		}
 		if latest.State != string(workflow.JobRunning) || latest.LifecycleGeneration != job.LifecycleGeneration {
-			return lifecycle, nil, nil, nil, fmt.Errorf("provision remote execution backend for review job %s: durable state moved to %s generation %d: %w",
+			return nil, nil, nil, false, fmt.Errorf("provision remote execution backend for review job %s: durable state moved to %s generation %d: %w",
 				job.ID, latest.State, latest.LifecycleGeneration, context.Canceled)
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return lifecycle, nil, nil, nil, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
+		return nil, nil, nil, false, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
 	}
-	instance, err := lifecycle.Provision(ctx, execbackend.JobScope{JobID: job.ID, LifecycleGeneration: job.LifecycleGeneration, TTL: ttl})
+	instance, err := lifecycle.Provision(ctx, execbackend.JobScope{JobID: job.ID, Attempt: plan.number, LifecycleGeneration: job.LifecycleGeneration, TTL: plan.ttl})
 	if err != nil {
 		// A provider can create an instance and then fail to persist its handle in
 		// the ledger. Preserve both values so the caller installs its teardown defer
 		// before handling the error; discarding them here strands a billed sandbox.
-		return lifecycle, instance, nil, nil, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
+		return instance, nil, nil, false, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
 	}
 
-	if sourcePlan != nil {
-		sourceLease, source, err := sourcePlan.register(job.ID, instance.ID)
+	materials := plan.materials
+	if plan.sourcePlan != nil {
+		sourceLease, source, err := plan.sourcePlan.register(job.ID, instance.ID)
 		if err != nil {
-			return lifecycle, instance, nil, nil, fmt.Errorf("register remote review source: %w", err)
+			return instance, nil, nil, true, fmt.Errorf("register remote review source: %w", err)
 		}
 		defer sourceLease.Revoke()
 		materials.RemoteReview = source
 	}
 	if err := lifecycle.SyncIn(ctx, instance, materials); err != nil {
-		return lifecycle, instance, nil, nil, fmt.Errorf("sync job %s into %s execution backend: %w", job.ID, backend, err)
+		return instance, nil, nil, true, fmt.Errorf("sync job %s into %s execution backend: %w", job.ID, backend, err)
 	}
-	if ompExecutable != "" {
-		if err := installRemoteOmpRuntime(ctx, lifecycle, instance, ompExecutable, ompFile); err != nil {
-			return lifecycle, instance, nil, nil, err
+	if plan.ompExecutable != "" {
+		if err := installRemoteOmpRuntime(ctx, lifecycle, instance, plan.ompExecutable, plan.ompFile); err != nil {
+			return instance, nil, nil, true, err
 		}
 	}
 	var evidenceEnv []string
@@ -347,22 +417,22 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		var err error
 		evidenceEnv, err = w.installRemotePriorVerdicts(ctx, lifecycle, instance, job)
 		if err != nil {
-			return lifecycle, instance, nil, nil, err
+			return instance, nil, nil, true, err
 		}
 		attachmentEnv, err := w.installRemoteReviewEvidence(ctx, lifecycle, instance, job)
 		if err != nil {
-			return lifecycle, instance, nil, nil, err
+			return instance, nil, nil, true, err
 		}
 		evidenceEnv = append(evidenceEnv, attachmentEnv...)
 		if err := w.installRemoteReviewRelatedPRs(ctx, lifecycle, instance, job); err != nil {
-			return lifecycle, instance, nil, nil, err
+			return instance, nil, nil, true, err
 		}
 	}
-	lease, env, err := w.provisionRemoteCredentialGateway(ctx, backend, runtimeName, job.ID, ttl, credentialPlan, lifecycle, instance)
+	lease, env, err := w.provisionRemoteCredentialGateway(ctx, backend, plan.runtimeName, job.ID, plan.ttl, plan.credentialPlan, lifecycle, instance)
 	if err != nil {
-		return lifecycle, instance, lease, nil, err
+		return instance, lease, nil, true, err
 	}
-	return lifecycle, instance, lease, append(env, evidenceEnv...), nil
+	return instance, lease, append(env, evidenceEnv...), true, nil
 }
 
 // remotePriorVerdictsPath is where a remote review finds the same rendered,
@@ -438,6 +508,9 @@ func installRemoteOmpRuntime(ctx context.Context, lifecycle execbackend.Executio
 			return fmt.Errorf("open host omp executable: %w", err)
 		}
 		defer file.Close()
+	} else if _, err := file.Seek(0, io.SeekStart); err != nil {
+		// The pre-opened file is shared by every provider attempt of the job.
+		return fmt.Errorf("rewind host omp executable: %w", err)
 	}
 	info, err := file.Stat()
 	if err != nil {
@@ -646,9 +719,11 @@ func gitRefLockRace(err error) bool {
 		(strings.Contains(message, ".lock") && strings.Contains(message, "File exists"))
 }
 
-func (w jobWorker) destroyExecutionBackend(jobID string, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance) {
+// destroyExecutionBackend tears the instance down and settles its ledger row.
+// A failure is recorded on the job and returned; deferred callers ignore it.
+func (w jobWorker) destroyExecutionBackend(jobID string, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance) error {
 	if lifecycle == nil || instance == nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), executionBackendDestroyTimeout)
 	defer cancel()
@@ -665,12 +740,13 @@ func (w jobWorker) destroyExecutionBackend(jobID string, lifecycle execbackend.E
 		err = lifecycle.Destroy(ctx, instance)
 	}
 	if err == nil {
-		return
+		return nil
 	}
 	writeLine(w.Stdout, "job %s execution backend teardown failed: %v", jobID, err)
 	if w.Store != nil {
 		_ = w.Store.AddJobEvent(context.Background(), db.JobEvent{JobID: jobID, Kind: "execbackend_destroy_failed", Message: err.Error()})
 	}
+	return err
 }
 
 func (w *jobWorker) executionDeliveryAdapter(agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {

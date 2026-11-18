@@ -859,6 +859,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	}
 	if lifecycleErr != nil {
 		w.recordRetryableRemoteProviderFailure(ctx, job, lifecycleErr)
+		w.recordRemoteProviderRefusal(ctx, job, lifecycleErr)
 		if remoteReviewAdmitted {
 			requeued, expired := w.waitForRemoteReviewCapacity(ctx, job, execConfig.Provider, jobTimeout, lifecycleErr)
 			if requeued {

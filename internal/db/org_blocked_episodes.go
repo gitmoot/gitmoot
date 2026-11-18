@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -91,6 +92,57 @@ func (s *Store) MarkBlockedTaskEpisodeEmitted(ctx context.Context, subject strin
 func (s *Store) ClearBlockedEpisode(ctx context.Context, subject string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM org_blocked_episodes WHERE subject = ?`, strings.TrimSpace(subject))
 	return err
+}
+
+// SendThrottledSystemAlert sends recipient one system message for subject
+// unless the subject already sent one within interval, and reports whether it
+// sent. The throttle is the subject's episode row, claimed in the same
+// transaction that inserts the message: a restart cannot resend, and a failed
+// send stays owed. Use a subject no blocked_since evaluator reads (they read
+// only their own "role:", "task:" and "input-pending:" prefixes).
+func (s *Store) SendThrottledSystemAlert(ctx context.Context, subject, recipient, body string, now time.Time, interval time.Duration) (bool, error) {
+	subject, recipient = strings.TrimSpace(subject), strings.TrimSpace(recipient)
+	if subject == "" || recipient == "" || strings.TrimSpace(body) == "" || interval <= 0 {
+		return false, errors.New("throttled system alert needs a subject, a recipient, a body and a positive interval")
+	}
+	writeCtx, cancel := s.durableWriteContext(ctx, 2)
+	defer cancel()
+	sent := false
+	err := retryNotificationWrite(writeCtx, func() error {
+		var err error
+		sent, err = s.sendThrottledSystemAlertOnce(writeCtx, subject, recipient, body, now, interval)
+		return err
+	})
+	return sent, err
+}
+
+func (s *Store) sendThrottledSystemAlertOnce(ctx context.Context, subject, recipient, body string, now time.Time, interval time.Duration) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	stamp := now.UTC().Format(BlockedEpisodeTimeLayout)
+	result, err := tx.ExecContext(ctx, `INSERT INTO org_blocked_episodes(subject, blocked_since, emitted_at, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(subject) DO UPDATE SET emitted_at = excluded.emitted_at, updated_at = excluded.updated_at
+		WHERE org_blocked_episodes.emitted_at IS NULL OR org_blocked_episodes.emitted_at <= ?`,
+		subject, stamp, stamp, stamp, now.Add(-interval).UTC().Format(BlockedEpisodeTimeLayout))
+	if err != nil {
+		return false, err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed == 0 {
+		return false, err
+	}
+	message := Message{Sender: MessageSystemSender, Recipient: recipient, Body: body, Kind: "message", SourceKind: WakeOutboxSourceWorkflowNote}
+	if _, err := insertWorkflowNoteTx(ctx, tx, WorkflowNote{
+		Author:          MessageSystemSender,
+		Body:            fmt.Sprintf("[message from=%s to=%s]\n%s", MessageSystemSender, recipient, body),
+		AddressedTarget: recipient, Inbox: &message,
+	}); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // ListBlockedEpisodes returns every open episode in stable subject order.

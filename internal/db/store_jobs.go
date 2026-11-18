@@ -1944,6 +1944,34 @@ func (s *Store) JobHasEventWithPrefix(ctx context.Context, jobID, kind, prefix s
 	return found == 1, err
 }
 
+// jobEventCreatedAtLayout is the form SQLite's CURRENT_TIMESTAMP writes to
+// job_events.created_at, so a time bound formatted with it compares as text.
+const jobEventCreatedAtLayout = "2006-01-02 15:04:05"
+
+// ListJobEventsOfKindSince returns, newest first, up to limit events of one
+// kind and provider created at or after since, across every job.
+func (s *Store) ListJobEventsOfKindSince(ctx context.Context, kind, provider string, since time.Time, limit int) ([]JobEvent, error) {
+	if limit < 1 {
+		return nil, errors.New("job event list limit must be positive")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message, created_at, runtime, provider FROM job_events
+		WHERE kind = ? AND provider = ? AND created_at >= ? ORDER BY id DESC LIMIT ?`,
+		kind, provider, since.UTC().Format(jobEventCreatedAtLayout), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []JobEvent
+	for rows.Next() {
+		var event JobEvent
+		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt, &event.Runtime, &event.Provider); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
 func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message, created_at, runtime, provider FROM job_events WHERE job_id = ? ORDER BY id`, jobID)
 	if err != nil {
