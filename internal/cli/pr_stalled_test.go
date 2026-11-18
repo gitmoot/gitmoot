@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/reviewlevel"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -379,6 +380,53 @@ func TestPRStalledJSONAndHold(t *testing.T) {
 	hold("--clear", "gitmoot/gitmoot#7")
 	if report = stalled()[0]; len(report.Stalled) != 1 || len(report.Held) != 0 {
 		t.Fatalf("report after --clear = %+v, want #7 stalled", report)
+	}
+}
+
+// TestPRHoldWithoutRepoColumnIsHonoured covers #2679 review round 2 P3: the
+// journal's repo column is optional, so the hold note's body names the repo.
+func TestPRHoldWithoutRepoColumnIsHonoured(t *testing.T) {
+	home, store, gh := stalledSweepFixture(t)
+	ctx := context.Background()
+	const repo = "gitmoot/gitmoot"
+	gh.pulls = []github.PullRequestFacts{noCIPull(7, stallHeadA, stallNow.Add(-time.Hour))}
+	for _, note := range []db.WorkflowNote{
+		{Author: "owner", Body: formatPRHoldNote(repo, 7, stallHeadA, "owner", "waiting on the vendor")},
+		// A repo-less note naming another repo must not apply.
+		{Author: "owner", Body: formatPRHoldClearNote("other/repo", 7, "owner")},
+	} {
+		if _, err := store.InsertWorkflowNote(ctx, note); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report, err := evaluateStalledPullRequests(ctx, store, newPRStalledEnv(ctx, store, home, gh), repo, config.DefaultPRStalledPolicy(), stallNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Held) != 1 || report.Held[0].PullRequest != 7 || len(report.Stalled) != 0 {
+		t.Fatalf("report = %+v, want #7 held", report)
+	}
+}
+
+// TestPRStalledNullRulesetsLeaveRequiredUnknown covers #2679 review round 2
+// P2: `rules: null` means the rulesets were not read, so a check outside the
+// classic set may still be required and its failure is ci_red.
+func TestPRStalledNullRulesetsLeaveRequiredUnknown(t *testing.T) {
+	at := stallNow.Add(-7 * time.Hour).Format(time.RFC3339)
+	body := `{"data":{"rateLimit":{"cost":3},"repository":{"pullRequests":{"totalCount":1,"nodes":[{"number":7,"mergeable":"MERGEABLE","headRefOid":"` + stallHeadA + `","baseRefName":"main","createdAt":"` + at + `",
+"baseRef":{"branchProtectionRule":{"requiredStatusCheckContexts":["ci"],"requiredStatusChecks":[{"context":"ci"}]},"rules":null},
+"commits":{"nodes":[{"commit":{"oid":"` + stallHeadA + `","committedDate":"` + at + `","statusCheckRollup":{"state":"FAILURE","contexts":{"totalCount":2,"nodes":[
+{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"` + at + `","completedAt":"` + at + `"},
+{"__typename":"CheckRun","name":"ruleset-check","status":"COMPLETED","conclusion":"FAILURE","startedAt":"` + at + `","completedAt":"` + at + `"}]}}}}]}}]}}}}`
+	client := github.NewClientWithRunner(t.TempDir(), fixedResultRunner{result: subprocess.Result{Stdout: body}})
+	facts, err := client.OpenPullRequestFacts(context.Background(), github.Repository{Owner: "owner", Name: "repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := prStallFacts{Repo: "owner/repo", PR: facts.PullRequests[0], Level: reviewlevel.LevelBackground}
+	stall, ok := classifyStalledPR(f, config.DefaultPRStalledPolicy(), stallNow)
+	if !ok || stall.State != prStallCIRed {
+		t.Fatalf("classified %+v (stalled=%v), want ci_red", stall, ok)
 	}
 }
 

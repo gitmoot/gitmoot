@@ -123,7 +123,8 @@ type graphQLBaseRef struct {
 		RequiredStatusCheckContexts []string             `json:"requiredStatusCheckContexts"`
 		RequiredStatusChecks        []graphQLContextName `json:"requiredStatusChecks"`
 	} `json:"branchProtectionRule"`
-	Rules struct {
+	// Rules is nullable: null means the rulesets were not read, not "none".
+	Rules *struct {
 		PageInfo struct {
 			HasNextPage bool `json:"hasNextPage"`
 		} `json:"pageInfo"`
@@ -138,7 +139,7 @@ type graphQLBaseRef struct {
 
 // requiredChecks unions the classic and ruleset required contexts. The set is
 // known only when the classic protection is readable (a null rule is either
-// unprotected or unreadable) and every ruleset rule was read.
+// unprotected or unreadable) and the rulesets were read (non-null) in full.
 func (ref *graphQLBaseRef) requiredChecks() ([]string, bool) {
 	if ref == nil {
 		return nil, false
@@ -150,14 +151,16 @@ func (ref *graphQLBaseRef) requiredChecks() ([]string, bool) {
 			contexts = append(contexts, check.Context)
 		}
 	}
-	for _, node := range ref.Rules.Nodes {
-		if node.Type == "REQUIRED_STATUS_CHECKS" && node.Parameters != nil {
-			for _, check := range node.Parameters.RequiredStatusChecks {
-				contexts = append(contexts, check.Context)
+	if ref.Rules != nil {
+		for _, node := range ref.Rules.Nodes {
+			if node.Type == "REQUIRED_STATUS_CHECKS" && node.Parameters != nil {
+				for _, check := range node.Parameters.RequiredStatusChecks {
+					contexts = append(contexts, check.Context)
+				}
 			}
 		}
 	}
-	known := ref.BranchProtectionRule != nil && !ref.Rules.PageInfo.HasNextPage
+	known := ref.BranchProtectionRule != nil && ref.Rules != nil && !ref.Rules.PageInfo.HasNextPage
 	return compactUniqueStrings(contexts), known
 }
 
