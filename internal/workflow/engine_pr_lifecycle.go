@@ -508,15 +508,19 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 // merge gate for them changes nothing, so it repeated every poll forever. A
 // review record with no live job is dismissed (review_retired_pr_closed, as in
 // #2668); any other task is parked blocked with pr_closed_unmerged. Either way
-// the task leaves ready_to_merge, so the next poll does not see it again.
+// the task leaves ready_to_merge, so the next poll does not see it again. A
+// task the retry already moved to blocked while recovering its retained merge
+// claim is accepted too, so the PR mirror still records the close: no later
+// pass repairs a branch-bearing blocked implementation task's mirror.
 func (e Engine) HandleReadyToMergePullRequestClosedUnmerged(ctx context.Context, event PullRequestEvent) error {
 	return e.handlePullRequestClosed(ctx, event, false, true)
 }
 
-// handlePullRequestClosed is HandleReviewPullRequestClosed's body.
-// settleBranchedReady admits a closed-unmerged branch-bearing ready_to_merge
-// task, which only the closed ready-to-merge retry may settle.
-func (e Engine) handlePullRequestClosed(ctx context.Context, event PullRequestEvent, merged, settleBranchedReady bool) error {
+// handlePullRequestClosed is HandleReviewPullRequestClosed's body. readyRetry
+// marks the closed ready-to-merge retry, which alone may settle a
+// closed-unmerged branch-bearing ready_to_merge task, or record the close for
+// one it has just parked blocked.
+func (e Engine) handlePullRequestClosed(ctx context.Context, event PullRequestEvent, merged, readyRetry bool) error {
 	if err := e.validate(); err != nil {
 		return err
 	}
@@ -548,11 +552,11 @@ func (e Engine) handlePullRequestClosed(ctx context.Context, event PullRequestEv
 		switch taskState {
 		case TaskPullRequestOpen, TaskReviewing, TaskChangesRequested, TaskAwaitingHumanMerge:
 		case TaskReadyToMerge:
-			if strings.TrimSpace(task.Branch) != "" && !settleBranchedReady {
+			if strings.TrimSpace(task.Branch) != "" && !readyRetry {
 				return nil
 			}
 		case TaskBlocked:
-			if strings.TrimSpace(task.Branch) != "" && !IsReviewRecordTask(task) {
+			if strings.TrimSpace(task.Branch) != "" && !IsReviewRecordTask(task) && !readyRetry {
 				return nil
 			}
 			alreadyBlocked = true
