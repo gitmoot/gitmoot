@@ -199,6 +199,13 @@ func printPRStalled(w io.Writer, reports []prStalledReport) {
 			}
 			fmt.Fprintf(w, "%s: checks truncated (more than 100 contexts), not judged green: %s\n", report.Repo, strings.Join(numbers, ", "))
 		}
+		if len(report.NoCIConfigured) > 0 {
+			numbers := make([]string, len(report.NoCIConfigured))
+			for i, number := range report.NoCIConfigured {
+				numbers[i] = "#" + strconv.Itoa(number)
+			}
+			fmt.Fprintf(w, "%s: no CI configured (no workflow files, no required checks), not flagged no_ci_on_head: %s\n", report.Repo, strings.Join(numbers, ", "))
+		}
 	}
 	fmt.Fprintf(w, "%d stalled of %d open pull requests in %d repositories\n", len(stalled), open, len(reports))
 	if len(stalled) > 0 {
@@ -209,8 +216,13 @@ func printPRStalled(w io.Writer, reports []prStalledReport) {
 			switch {
 			case owner == "":
 				owner = "(unowned)"
-			case row.OwnerSource == "repo_owner":
+			case row.OwnerSource == ownerSourceRepoOwner:
 				owner += " (repo owner)"
+			case row.OwnerSource == ownerSourceCoordinator:
+				owner += " (coordinator)"
+			}
+			if row.OwnerGone != "" {
+				owner += " (owner gone: " + row.OwnerGone + ")"
 			}
 			fmt.Fprintf(table, "%s#%d\t%s\t%s\t%s\t%s\t%s\n", row.Repo, row.PullRequest, row.State, row.Age, owner, row.Cause, row.Next)
 		}

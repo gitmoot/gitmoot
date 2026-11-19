@@ -16,7 +16,10 @@ const OpenPullRequestFactsLimit = 100
 // needs from GitHub for one repository in ONE GraphQL request: the open pull
 // requests, each with its head, draft and mergeable state, the head commit's
 // time and check rollup, and the base branch's required checks (classic
-// protection and rulesets), so no REST lookup is needed.
+// protection and rulesets) and workflow files, so no REST lookup is needed.
+// The base branch's .github/workflows tree is read through its tip commit
+// (Commit.file): GraphQL cannot alias object(expression:) per base before the
+// bases are known, and the field is not a connection, so it adds no cost.
 const openPullRequestFactsQuery = `query($owner: String!, $name: String!) {
   rateLimit { cost }
   repository(owner: $owner, name: $name) {
@@ -25,6 +28,7 @@ const openPullRequestFactsQuery = `query($owner: String!, $name: String!) {
       nodes {
         number title isDraft mergeable headRefOid baseRefName createdAt
         baseRef {
+          target { ... on Commit { file(path: ".github/workflows") { object { ... on Tree { entries { name } } } } } }
           branchProtectionRule { requiredStatusCheckContexts requiredStatusChecks { context } }
           rules(first: 50) { pageInfo { hasNextPage } nodes { type parameters {
             ... on RequiredStatusChecksParameters { requiredStatusChecks { context } }
@@ -74,6 +78,25 @@ type PullRequestFacts struct {
 	// and unreadable look alike) or more ruleset rules than one page.
 	Required      []string
 	RequiredKnown bool
+	// Workflows is the number of workflow files (.yml/.yaml) under the base
+	// branch's .github/workflows; WorkflowsKnown is false when the base
+	// branch could not be read.
+	Workflows      int
+	WorkflowsKnown bool
+}
+
+// NoCIConfigured reports a base branch with no workflow files and no known
+// required check: nothing will ever report a check at the head.
+func (f PullRequestFacts) NoCIConfigured() bool {
+	if !f.WorkflowsKnown || f.Workflows > 0 {
+		return false
+	}
+	for _, name := range f.Required {
+		if name = strings.TrimSpace(name); name != "" && !strings.HasPrefix(strings.ToLower(name), "gitmoot/") {
+			return false
+		}
+	}
+	return true
 }
 
 // PullRequestCheckFact is one check run or commit status on a head. Bucket is
@@ -135,6 +158,34 @@ type graphQLBaseRef struct {
 			} `json:"parameters"`
 		} `json:"nodes"`
 	} `json:"rules"`
+	Target *struct {
+		// File is null when the path does not exist on the branch.
+		File *struct {
+			Object *struct {
+				Entries []struct {
+					Name string `json:"name"`
+				} `json:"entries"`
+			} `json:"object"`
+		} `json:"file"`
+	} `json:"target"`
+}
+
+// workflowFiles counts the base branch's workflow files; known is false when
+// the branch's tip commit was not read.
+func (ref *graphQLBaseRef) workflowFiles() (count int, known bool) {
+	if ref == nil || ref.Target == nil {
+		return 0, false
+	}
+	if ref.Target.File == nil || ref.Target.File.Object == nil {
+		return 0, true
+	}
+	for _, entry := range ref.Target.File.Object.Entries {
+		name := strings.ToLower(entry.Name)
+		if strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".yaml") {
+			count++
+		}
+	}
+	return count, true
 }
 
 // requiredChecks unions the classic and ruleset required contexts. The set is
@@ -227,6 +278,7 @@ func decodeOpenPullRequestFacts(body []byte) (OpenPullRequestFacts, error) {
 			CreatedAt: parseGraphQLTime(node.CreatedAt),
 		}
 		facts.Required, facts.RequiredKnown = node.BaseRef.requiredChecks()
+		facts.Workflows, facts.WorkflowsKnown = node.BaseRef.workflowFiles()
 		if len(node.Commits.Nodes) > 0 {
 			commit := node.Commits.Nodes[0].Commit
 			facts.HeadCommittedAt = parseGraphQLTime(commit.CommittedDate)

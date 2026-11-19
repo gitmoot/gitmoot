@@ -509,6 +509,73 @@ func resolveRepoOrgOwner(roster orgRoster, cfg config.OrgConfig, repo string) re
 	return repoOwnerResolution{Tied: tied}
 }
 
+// resolveRepoOrgCoordinator picks the SHALLOWEST live role whose scope
+// matches repo (#2685): the seat with authority over every seat working on
+// it. A more specific scope breaks an equal-depth tie; roles still tied after
+// that resolve to no coordinator, as resolveRepoOrgOwner does.
+func resolveRepoOrgCoordinator(roster orgRoster, cfg config.OrgConfig, repo string) repoOwnerResolution {
+	var tied []string
+	bestSpecificity, bestDepth := -1, -1
+	for _, role := range roster.Members() {
+		specificity := repoScopeSpecificity(role.Scope, repo)
+		if specificity < 0 {
+			continue
+		}
+		depth := len(cfg.Path(role.Name))
+		switch {
+		case bestDepth < 0 || depth < bestDepth || (depth == bestDepth && specificity > bestSpecificity):
+			tied = []string{role.Name}
+			bestSpecificity, bestDepth = specificity, depth
+		case depth == bestDepth && specificity == bestSpecificity:
+			tied = append(tied, role.Name)
+		}
+	}
+	if len(tied) == 1 {
+		return repoOwnerResolution{Owner: tied[0]}
+	}
+	return repoOwnerResolution{Tied: tied}
+}
+
+// Owner sources of resolveAttributedOrgOwner.
+const (
+	ownerSourceAttributed  = "attributed"
+	ownerSourceRepoOwner   = "repo_owner"
+	ownerSourceCoordinator = "coordinator"
+	ownerSourceUnowned     = "unowned"
+)
+
+// attributedOwnerResolution is where an alert attributed to a role goes.
+// Gone is the attributed role when it is no longer live (orphaned).
+type attributedOwnerResolution struct {
+	repoOwnerResolution
+	Source string
+	Gone   string
+}
+
+// resolveAttributedOrgOwner routes an alert whose records name attributed
+// (#2671, #2677). A live attributed role keeps it. An orphaned one (recorded,
+// no longer live) goes to the repo's coordinator (#2685): a child seat has no
+// authority over another seat's abandoned work. No attribution at all keeps
+// the most-specific repo owner. `pr stalled`, its alerts and the blocked-since
+// task digest route through here (the blocked-event sink, for those causes).
+func resolveAttributedOrgOwner(roster orgRoster, cfg config.OrgConfig, attributed, repo string) attributedOwnerResolution {
+	attributed = workflow.NormalizeActingOrgRole(attributed)
+	if attributed != "" && orgRosterHasMember(roster, attributed) {
+		return attributedOwnerResolution{repoOwnerResolution: repoOwnerResolution{Owner: attributed}, Source: ownerSourceAttributed}
+	}
+	out := attributedOwnerResolution{Source: ownerSourceRepoOwner}
+	if attributed != "" {
+		out.Source, out.Gone = ownerSourceCoordinator, attributed
+		out.repoOwnerResolution = resolveRepoOrgCoordinator(roster, cfg, repo)
+	} else {
+		out.repoOwnerResolution = resolveRepoOrgOwner(roster, cfg, repo)
+	}
+	if out.Owner == "" {
+		out.Source = ownerSourceUnowned
+	}
+	return out
+}
+
 // repoOrgOwner returns the single live role that owns repo, or false when no
 // role matches or the best matches are tied. See resolveRepoOrgOwner.
 func repoOrgOwner(roster orgRoster, cfg config.OrgConfig, repo string) (string, bool) {

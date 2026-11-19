@@ -278,7 +278,7 @@ func sendPRStalledDigests(ctx context.Context, store *db.Store, env *prStalledEn
 		if err != nil {
 			return err
 		}
-		owner, _ := env.resolveOwner(attributed, key.repo)
+		owner, _, _ := env.resolveOwner(attributed, key.repo)
 		role, ok := env.org.Role(owner)
 		if !ok || strings.TrimSpace(role.Parent) == "" {
 			continue

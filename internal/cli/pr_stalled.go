@@ -75,7 +75,9 @@ func classifyStalledPR(f prStallFacts, policy config.PRStalledPolicy, now time.T
 	}
 	ref := fmt.Sprintf("%d --repo %s", pr.Number, f.Repo)
 	checks := prCIChecks(pr.Checks)
-	if len(checks) == 0 {
+	// A base branch with no workflow file and no required check runs no CI:
+	// no check will ever report, so the head is judged on the later states.
+	if len(checks) == 0 && !pr.NoCIConfigured() {
 		since := firstNonZeroTime(pr.HeadCommittedAt, pr.CreatedAt)
 		if now.Sub(since) < policy.NoCIAfter {
 			return prStall{}, false
@@ -284,6 +286,12 @@ type prStalledRow struct {
 	Next        string    `json:"next"`
 	// ChecksTruncated: the head has more check contexts than one page read.
 	ChecksTruncated bool `json:"checks_truncated,omitempty"`
+	// NoCIConfigured: the base branch has no workflow file and no required
+	// check, so the PR is judged without CI.
+	NoCIConfigured bool `json:"no_ci_configured,omitempty"`
+	// OwnerGone is the attributed role when it is no longer a live role; the
+	// alert then goes to the repo's coordinator.
+	OwnerGone string `json:"owner_gone,omitempty"`
 	// attributed is the role the PR's own records name, before any roster
 	// check; the alert carries it and the sink validates it.
 	attributed string
@@ -309,6 +317,9 @@ type prStalledReport struct {
 	// ChecksTruncated lists the open pull requests whose head has more check
 	// contexts than one page read; none of them is judged green.
 	ChecksTruncated []int `json:"checks_truncated"`
+	// NoCIConfigured lists the open pull requests whose base branch has no
+	// workflow file and no required check: none is flagged no_ci_on_head.
+	NoCIConfigured []int `json:"no_ci_configured"`
 	// open maps every open pull request read to its head.
 	open map[int]string
 }
@@ -342,7 +353,7 @@ func newPRStalledEnv(ctx context.Context, store *db.Store, home string, gh prSta
 // evaluateStalledPullRequests evaluates every open pull request of repo: one
 // GraphQL query, then store reads only.
 func evaluateStalledPullRequests(ctx context.Context, store *db.Store, env *prStalledEnv, repo string, policy config.PRStalledPolicy, now time.Time) (prStalledReport, error) {
-	report := prStalledReport{Repo: repo, Stalled: []prStalledRow{}, Held: []prHeldRow{}, ChecksTruncated: []int{}, open: map[int]string{}}
+	report := prStalledReport{Repo: repo, Stalled: []prStalledRow{}, Held: []prHeldRow{}, ChecksTruncated: []int{}, NoCIConfigured: []int{}, open: map[int]string{}}
 	ghRepo, err := github.ParseRepository(repo)
 	if err != nil {
 		return report, err
@@ -384,6 +395,9 @@ func evaluateStalledPullRequests(ctx context.Context, store *db.Store, env *prSt
 		if pr.ChecksTruncated {
 			report.ChecksTruncated = append(report.ChecksTruncated, pr.Number)
 		}
+		if pr.NoCIConfigured() {
+			report.NoCIConfigured = append(report.NoCIConfigured, pr.Number)
+		}
 		f.ReviewRunning, f.Verdict, f.VerdictAt = review.running, review.verdict, review.verdictAt
 		if gate, ok := gates[int64(pr.Number)]; ok {
 			f.MergeGate = &gate
@@ -401,35 +415,35 @@ func evaluateStalledPullRequests(ctx context.Context, store *db.Store, env *prSt
 		}
 		row := prStalledRow{Repo: repo, PullRequest: pr.Number, Title: pr.Title, Head: pr.HeadSHA, State: stall.State,
 			Since: stall.Since, Age: formatStallAge(now.Sub(stall.Since)), Level: prStallLevelLabel(f.Level),
-			Cause: stall.Cause, Next: stall.Next, ChecksTruncated: pr.ChecksTruncated}
+			Cause: stall.Cause, Next: stall.Next, ChecksTruncated: pr.ChecksTruncated, NoCIConfigured: pr.NoCIConfigured()}
+		if row.NoCIConfigured {
+			row.Cause += " (no CI configured)"
+		}
 		attributed, err := pullRequestAttributedRole(ctx, store, repo, pr.Number)
 		if err != nil {
 			return report, err
 		}
 		row.attributed = attributed
-		row.Owner, row.OwnerSource = env.resolveOwner(attributed, repo)
+		row.Owner, row.OwnerSource, row.OwnerGone = env.resolveOwner(attributed, repo)
 		report.Stalled = append(report.Stalled, row)
 	}
 	sort.SliceStable(report.Stalled, func(i, j int) bool { return report.Stalled[i].Since.Before(report.Stalled[j].Since) })
 	return report, nil
 }
 
-// resolveOwner mirrors the blocked-event sink: the attributed role while it is
-// a live roster member, else the repo's single owner, else unowned.
-func (env *prStalledEnv) resolveOwner(attributed, repo string) (string, string) {
+// resolveOwner mirrors the blocked-event sink (resolveAttributedOrgOwner): the
+// attributed role while it is live, the repo's coordinator when it is gone,
+// the repo's owner when nothing was attributed, else unowned. gone names an
+// orphaned attributed role.
+func (env *prStalledEnv) resolveOwner(attributed, repo string) (owner, source, gone string) {
 	if !env.orgOK {
 		if attributed != "" {
-			return attributed, "attributed"
+			return attributed, ownerSourceAttributed, ""
 		}
-		return "", "unowned"
+		return "", ownerSourceUnowned, ""
 	}
-	if orgRosterHasMember(env.roster, attributed) {
-		return attributed, "attributed"
-	}
-	if owner := resolveRepoOrgOwner(env.roster, env.org, repo).Owner; owner != "" {
-		return owner, "repo_owner"
-	}
-	return "", "unowned"
+	resolution := resolveAttributedOrgOwner(env.roster, env.org, attributed, repo)
+	return resolution.Owner, resolution.Source, resolution.Gone
 }
 
 // pullRequestAttributedRole is #2671's blocked-task attribution keyed by pull

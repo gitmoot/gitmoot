@@ -145,6 +145,8 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 		return runPRStalled(args[1:], stdout, stderr)
 	case "hold":
 		return runPRHold(args[1:], stdout, stderr)
+	case "dismiss":
+		return runPRDismiss(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown pr command %q\n\n", args[0])
 		printTaskUsage(stderr)
@@ -154,6 +156,7 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 
 func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot pr dismiss <pr> --reason TEXT [--repo owner/repo] [--role role] [--json]")
 	fmt.Fprintln(w, "  gitmoot pr events <pr> [--repo owner/repo] [--json]")
 	fmt.Fprintln(w, "  gitmoot pr hold owner/repo#N --reason TEXT [--role role] [--json]")
 	fmt.Fprintln(w, "  gitmoot pr hold --clear owner/repo#N [--role role] [--json]")
@@ -167,7 +170,8 @@ func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "pr stalled lists open pull requests stuck between steps (no_ci_on_head, ci_red,")
 	fmt.Fprintln(w, "awaiting_review, green_not_merged, draft_stale) with the owning seat and a next")
 	fmt.Fprintln(w, "command; it reads GitHub once per repository. pr hold silences one pull request")
-	fmt.Fprintln(w, "until its head moves.")
+	fmt.Fprintln(w, "until its head moves. pr dismiss retires a pr nothing can move forward (its")
+	fmt.Fprintln(w, "owner, the owner's coordinators or the repo owner; refused while a job is live).")
 }
 
 // runTaskSuccessor creates the successor of a disposed (stranded, superseded,

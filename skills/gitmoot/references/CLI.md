@@ -75,6 +75,7 @@ disagrees, trust its live `--help`.
 - [gitmoot plugin path](#gitmoot-plugin-path)
 - [gitmoot plugin path omp](#gitmoot-plugin-path-omp)
 - [gitmoot pr](#gitmoot-pr)
+- [gitmoot pr dismiss](#gitmoot-pr-dismiss)
 - [gitmoot pr events](#gitmoot-pr-events)
 - [gitmoot pr hold](#gitmoot-pr-hold)
 - [gitmoot pr list](#gitmoot-pr-list)
@@ -968,6 +969,7 @@ Usage of plugin path omp:
 
 ```text
 Usage:
+  gitmoot pr dismiss <pr> --reason TEXT [--repo owner/repo] [--role role] [--json]
   gitmoot pr events <pr> [--repo owner/repo] [--json]
   gitmoot pr hold owner/repo#N --reason TEXT [--role role] [--json]
   gitmoot pr hold --clear owner/repo#N [--role role] [--json]
@@ -981,7 +983,24 @@ pr list puts rows that have no pull request (old adhoc-/task- rows) last.
 pr stalled lists open pull requests stuck between steps (no_ci_on_head, ci_red,
 awaiting_review, green_not_merged, draft_stale) with the owning seat and a next
 command; it reads GitHub once per repository. pr hold silences one pull request
-until its head moves.
+until its head moves. pr dismiss retires a pr nothing can move forward (its
+owner, the owner's coordinators or the repo owner; refused while a job is live).
+```
+
+## gitmoot pr dismiss
+
+```text
+Usage of pr dismiss:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the dismissal as JSON
+  -reason string
+    	why the pr is retired (required; recorded on the task_dismissed_manual event)
+  -repo string
+    	repository for a bare pull request number
+  -role string
+    	acting organization role (defaults to GITMOOT_ORG_ROLE, then the calling seat's pane)
 ```
 
 ## gitmoot pr events

@@ -171,14 +171,15 @@ func TestClosedUnmergedReviewTaskIsRetiredAndRebindsOnReopen(t *testing.T) {
 
 // TestBlockedTaskAlertRoleIsValidatedNotRederived covers #2668's routing
 // contract: the sink honours a blocked-since digest's producer-resolved role
-// only while it is on the live roster, otherwise the repo owner gets it.
+// only while it is on the live roster, otherwise the repo's coordinator gets it.
 func TestBlockedTaskAlertRoleIsValidatedNotRederived(t *testing.T) {
 	home, store := blockedTaskRoutingFixture(t)
 	ctx := context.Background()
 	sink := &eventRuleSink{store: store, home: home}
 	sink.Emit(ctx, events.Event{Type: events.EventJobBlocked, Cause: "blocked_since", JobID: "task-1",
 		Repo: "gitmoot/gitmoot", WakeTargetRole: "retired"})
-	if got, want := pendingWakeTargetRoles(t, store), []string{"jarvis", "lane"}; !reflect.DeepEqual(got, want) {
+	// retired is gone, so its alert goes to the coordinator (#2685), not lane.
+	if got, want := pendingWakeTargetRoles(t, store), []string{"jarvis", "owner"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("blocked task wake targets = %v, want %v", got, want)
 	}
 }

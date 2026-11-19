@@ -187,6 +187,15 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 	}
 	blockedSubjects := make(map[string]db.Task, len(blockedTasks))
 	for _, task := range blockedTasks {
+		// A task parked because its PR closed unmerged cannot be unblocked
+		// while the PR stays closed, so it is not alerted (#2696). Leaving it
+		// out of the blocked set clears its episode: a reopened PR or a new
+		// blocking reason opens a fresh one, which alerts again.
+		if closed, err := blockedTaskPRStillClosed(ctx, store, task); err != nil {
+			writeLine(stdout, "blocked_since task %s closed-PR check failed, alerting: %v", task.ID, err)
+		} else if closed {
+			continue
+		}
 		blockedSubjects[taskEpisodeSubject(repo, task.ID)] = task
 	}
 	var candidates []db.StaleTaskCandidate
@@ -343,6 +352,45 @@ func blockedTaskAttributedRole(ctx context.Context, store *db.Store, task db.Tas
 		return "", err
 	}
 	return workflow.NormalizeActingOrgRole(owner), nil
+}
+
+// blockedTaskPRStillClosed reports a blocked task whose newest state change
+// is the closed-unmerged block (workflow.TaskEventPullRequestClosedUnmerged)
+// and whose pull request is still recorded closed (#2696). Any later state
+// change, or the PR reopening (the daemon's poll records it open again),
+// makes it false, so the task alerts again.
+func blockedTaskPRStillClosed(ctx context.Context, store *db.Store, task db.Task) (bool, error) {
+	if task.State != string(workflow.TaskBlocked) {
+		return false, nil
+	}
+	taskEvents, err := store.ListTaskEvents(ctx, task.ID)
+	if err != nil {
+		return false, err
+	}
+	var last db.TaskEvent
+	for _, event := range taskEvents {
+		if strings.TrimSpace(event.ToState) != "" {
+			last = event
+		}
+	}
+	if last.Kind != workflow.TaskEventPullRequestClosedUnmerged || last.ToState != string(workflow.TaskBlocked) {
+		return false, nil
+	}
+	var pr db.PullRequest
+	if number, ok := workflow.ReviewRecordPRNumber(task.ID); ok {
+		pr, err = store.GetPullRequest(ctx, task.RepoFullName, number)
+	} else if strings.TrimSpace(task.Branch) != "" {
+		pr, err = store.GetPullRequestByRepoBranch(ctx, task.RepoFullName, task.Branch)
+	} else {
+		return false, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(strings.TrimSpace(pr.State), "closed"), nil
 }
 
 // startBlockedRoleWakeLoop owns the single host-global Herdr blocked-role lane.

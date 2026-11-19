@@ -289,7 +289,15 @@ suggested next command:
 "Green" means every required check of the base branch passed (every reported
 check, when the required set cannot be read). Gitmoot's own `gitmoot/*`
 statuses are not CI, and a head with more than 100 checks is listed as
-"checks truncated" and never judged green.
+"checks truncated" and never judged green. A base branch with no workflow file
+and no required check runs no CI: its pull requests are listed as "no CI
+configured" and never flagged `no_ci_on_head`; the other states still apply.
+
+The owning seat is the role the pull request's records name (review requester,
+implement run, PR owner) while it is live. When that seat is gone the row says
+"owner gone: <role>" and the alert goes to the repo's coordinator, the
+shallowest live seat scoping the repo; with no recorded seat at all it goes to
+the repo's most specific seat. Blocked-task alerts route the same way.
 
 With `[pr_stalled] enabled = true` the daemon runs the same check every
 `interval` (30 min) per repository and sends each stalled pull request's seat
@@ -297,6 +305,14 @@ at most three alerts per head and state; the seat's parent gets one digest a
 day. To silence a pull request that is stuck on purpose, until its head moves:
 `gitmoot pr hold owner/repo#N --reason TEXT` (`--clear` removes it). The hold
 records your role.
+
+A task blocked because its pull request closed unmerged is not alerted while
+the pull request stays closed (it alerts again if the pull request reopens).
+To retire a pr record nothing can move forward:
+`gitmoot pr dismiss <pr> --reason TEXT [--json]`. Only its owning seat, that
+seat's coordinators or the repo owner may; it refuses while a job is live or
+when the record is already final, and records your role and the reason as a
+`task_dismissed_manual` event.
 
 ## 4. Messages
 
