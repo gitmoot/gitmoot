@@ -191,24 +191,37 @@ func shortenJSONString(v string, keep int) string {
 }
 
 // envelope is the last resort: the top-level scalars, in order, with strings
-// at the shortest keep, and "gitmoot_truncated":true. Scalars are dropped from
-// the end until it fits, so even an object of a million keys yields a valid
-// line that still opens with its type.
+// at the shortest keep, and "gitmoot_truncated":true. It is built in ONE pass
+// with room for the marker reserved, keeping the longest prefix of scalars
+// that fits, so even an object of a million keys costs one encoding and still
+// opens with its type.
 func (s *jsonShortener) envelope(root *jsonNode) []byte {
-	var keys []string
-	var vals []*jsonNode
-	for i, val := range root.vals {
-		if val.kind != '{' && val.kind != '[' {
-			keys, vals = append(keys, root.keys[i]), append(vals, val)
-		}
-	}
+	const marker = `"gitmoot_truncated":true}`
 	s.keep, s.arrayKeep = jobLogStringKeeps[len(jobLogStringKeeps)-1], 0
-	for n := len(keys); ; n-- {
-		node := &jsonNode{kind: '{', keys: append(keys[:n:n], "gitmoot_truncated"), vals: append(vals[:n:n], &jsonNode{text: "true"})}
-		if out, ok := s.encode(node); ok || n == 0 {
-			return out
+	s.out = append(s.out[:0], '{')
+	kept := 0
+	for i, val := range root.vals {
+		if val.kind == '{' || val.kind == '[' {
+			continue
 		}
+		mark := len(s.out)
+		if kept > 0 {
+			s.out = append(s.out, ',')
+		}
+		s.out = s.appendString(s.out, root.keys[i])
+		s.out = append(s.out, ':')
+		s.value(val)
+		// The marker needs its own separating comma after this pair.
+		if len(s.out)+1+len(marker) > s.limit {
+			s.out = s.out[:mark]
+			break
+		}
+		kept++
 	}
+	if kept > 0 {
+		s.out = append(s.out, ',')
+	}
+	return append(s.out, marker...)
 }
 
 func (s *jsonShortener) appendString(dst []byte, v string) []byte {

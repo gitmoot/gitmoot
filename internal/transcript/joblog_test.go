@@ -656,3 +656,45 @@ func TestJobLogWriterCloseKeepsUnterminatedLine(t *testing.T) {
 		t.Fatalf("log = %q", got)
 	}
 }
+
+// Review on #2708 round 3: a flat object of 40,000 top-level scalars reaches
+// the envelope with 40,000 candidates. The envelope keeps the longest prefix
+// that fits in one pass: valid JSON within the line cap, type first, a prefix
+// of the original fields in order, the marker last. Before, it re-encoded
+// every shorter prefix in turn (about 21,800 encodings here).
+func TestJobLogEnvelopeOfManyTopLevelScalarsIsOnePassPrefix(t *testing.T) {
+	fields := []string{`"type":"tool_execution_end"`}
+	for i := range 40000 {
+		fields = append(fields, fmt.Sprintf(`"k%05d":%d`, i, i))
+	}
+	line := []byte("{" + strings.Join(fields, ",") + "}")
+	out, ok := shortenJSONLine(line, JobLogMaxLineBytes)
+	if !ok {
+		t.Fatal("a JSON object was not shortened")
+	}
+	if len(out) > JobLogMaxLineBytes {
+		t.Fatalf("envelope is %d bytes, over the %d cap", len(out), JobLogMaxLineBytes)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("envelope is not valid JSON: %v", err)
+	}
+	if decoded["gitmoot_truncated"] != true || decoded["type"] != "tool_execution_end" {
+		t.Fatalf("envelope lost its type or marker: %.200s", out)
+	}
+	kept := len(decoded) - 2
+	want := "{" + strings.Join(fields[:kept+1], ",") + `,"gitmoot_truncated":true}`
+	if string(out) != want {
+		t.Fatalf("envelope is not the longest in-order prefix plus the marker: kept %d fields, got %.120s…", kept, out)
+	}
+	// The longest prefix: one more field would not have fit.
+	if next := len(want) + 1 + len(fields[kept+1]); next <= JobLogMaxLineBytes {
+		t.Fatalf("kept %d fields, but %d would fit (%d bytes)", kept, kept+1, next)
+	}
+	allocs := testing.AllocsPerRun(1, func() { shortenJSONLine(line, JobLogMaxLineBytes) })
+	// About 1.2M here (decoding 40,000 nodes and the 30 shortening passes); the
+	// per-prefix envelope needed hundreds of millions.
+	if allocs > 5_000_000 {
+		t.Fatalf("shortening took %.0f allocations; the envelope must be built in one pass", allocs)
+	}
+}
