@@ -568,6 +568,10 @@ func TestWorkspacePullPushFilesRoundTrip(t *testing.T) {
 			{name: "up", typeflag: tar.TypeSymlink, linkname: "../outside"},
 			{name: "deep/up", typeflag: tar.TypeSymlink, linkname: "../../x"},
 			{name: "abs", typeflag: tar.TypeSymlink, linkname: outside},
+			// A leading // is refused on the host, as in the VM, not cleaned
+			// into a path under the root (review P3).
+			{name: "dbl", typeflag: tar.TypeSymlink, linkname: "/" + root + "/nope"},
+			{name: "dotdot", typeflag: tar.TypeSymlink, linkname: root + "/../" + filepath.Base(root) + "/x"},
 		} {
 			stream := workspaceTar(t, workspaceTarEntry{name: "first.txt", typeflag: tar.TypeReg, mode: 0o644, body: "first"}, bad)
 			env.expectFailure(workspaceCLIFailure, wsErrCwdOutsideRoot, stream, "workspace", "push", id, "--files")
@@ -611,9 +615,68 @@ func TestWorkspaceFilesScriptPushRefusesEscapes(t *testing.T) {
 			t.Fatalf("VM push of %s = %d %s", bad.name, code, stderr)
 		}
 	}
+	// The VM checks the whole stream before applying any entry, so an
+	// earlier good entry is not applied either.
+	for _, bad := range []workspaceTarEntry{
+		{name: ".git/config", typeflag: tar.TypeReg, mode: 0o644, body: "x"},
+		{name: "sub/.Git/x", typeflag: tar.TypeReg, mode: 0o644, body: "x"},
+		{name: "dbl", typeflag: tar.TypeSymlink, linkname: "/" + root + "/nope"},
+	} {
+		stream := workspaceTar(t, workspaceTarEntry{name: "first.txt", typeflag: tar.TypeReg, mode: 0o644, body: "first"}, bad)
+		code, stderr := runWorkspaceFilesScript(t, root, map[string]any{"op": "push", "input_b64": base64.StdEncoding.EncodeToString(stream.Bytes())}, io.Discard)
+		if code != 2 || (!strings.Contains(stderr, `"cwd_outside_root"`) && !strings.Contains(stderr, `"invalid_args"`)) {
+			t.Fatalf("VM push of first.txt + %s = %d %s", bad.name, code, stderr)
+		}
+	}
+	for _, rel := range []string{".git/HEAD", "sub/.git/x", ".GIT"} {
+		code, stderr := runWorkspaceFilesScript(t, root, map[string]any{"op": "write", "path": rel, "mode": nil, "input_b64": base64.StdEncoding.EncodeToString([]byte("x"))}, io.Discard)
+		if code != 2 || !strings.Contains(stderr, `"invalid_args"`) {
+			t.Fatalf("VM write of %s = %d %s", rel, code, stderr)
+		}
+	}
 	if entries, _ := os.ReadDir(root); len(entries) != 0 {
 		t.Fatalf("refused pushes left %v", entries)
 	}
+}
+
+// No file command writes, pushes, pulls or removes a path in a .git
+// directory, at any depth, in any letter case (review P2).
+func TestWorkspaceFilesRefuseGitPaths(t *testing.T) {
+	forEachWorkspaceProvider(t, func(t *testing.T, env *workspaceTestEnv, opened workspaceJSON) {
+		id, root := opened.ID, opened.Root
+		head, err := os.ReadFile(filepath.Join(root, ".git", "HEAD"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		config, err := os.ReadFile(filepath.Join(root, ".git", "config"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, bad := range []string{".git/config", "sub/.git/x", ".GIT/config"} {
+			stream := workspaceTar(t,
+				workspaceTarEntry{name: "ok.txt", typeflag: tar.TypeReg, mode: 0o644, body: "ok"},
+				workspaceTarEntry{name: bad, typeflag: tar.TypeReg, mode: 0o644, body: "[core]\n\tpwned = true\n"},
+			)
+			env.expectFailure(workspaceCLIFailure, wsErrInvalidArgs, stream, "workspace", "push", id, "--files")
+			if _, err := os.Lstat(filepath.Join(root, "ok.txt")); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("a refused stream with %s applied ok.txt", bad)
+			}
+		}
+		for _, rel := range []string{".git/HEAD", "sub/.git/x", ".Git/HEAD", ".git"} {
+			env.expectFailure(workspaceCLIFailure, wsErrInvalidArgs, strings.NewReader("pwned"), "workspace", "write", id, rel)
+			env.expectFailure(workspaceCLIFailure, wsErrInvalidArgs, nil, "workspace", "pull", id, "--", rel)
+			env.expectFailure(workspaceCLIFailure, wsErrInvalidArgs, nil, "workspace", "remove", id, "--", rel)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "sub")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatal("a refused write created sub/")
+		}
+		if got, _ := os.ReadFile(filepath.Join(root, ".git", "HEAD")); string(got) != string(head) {
+			t.Fatalf(".git/HEAD changed to %q", got)
+		}
+		if got, _ := os.ReadFile(filepath.Join(root, ".git", "config")); string(got) != string(config) {
+			t.Fatalf(".git/config changed to %q", got)
+		}
+	})
 }
 
 // workspaceTreeSnapshot describes every entry under dir except the top-level .git:
@@ -898,5 +961,105 @@ func TestWorkspaceRemove(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(root, ".git", "HEAD")); err != nil {
 			t.Fatalf(".git/HEAD: %v", err)
 		}
+	})
+}
+
+// openWorkspaceWithBaseFiles adds keep.txt, shared/inner.txt and
+// smudged.txt ("aa\n") to origin's main, then opens an issue workspace on it.
+func openWorkspaceWithBaseFiles(t *testing.T, local bool) (*workspaceTestEnv, workspaceJSON) {
+	t.Helper()
+	env := newWorkspaceTestEnv(t, workspaceTestConfig{local: local})
+	work := filepath.Join(t.TempDir(), "base")
+	runWorkspaceTestGit(t, filepath.Dir(work), "clone", "--quiet", env.origin, work)
+	if err := os.MkdirAll(filepath.Join(work, "shared"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for rel, body := range map[string]string{"keep.txt": "keep\n", "shared/inner.txt": "inner\n", "smudged.txt": "aa\n"} {
+		if err := os.WriteFile(filepath.Join(work, rel), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runWorkspaceTestGit(t, work, "add", ".")
+	runWorkspaceTestGit(t, work, "commit", "--quiet", "-m", "base files")
+	runWorkspaceTestGit(t, work, "push", "--quiet", "origin", "main")
+	return env, env.open("--issue", "12")
+}
+
+func forEachWorkspaceProviderWithBaseFiles(t *testing.T, test func(t *testing.T, env *workspaceTestEnv, opened workspaceJSON)) {
+	for _, local := range []bool{false, true} {
+		name := "e2b-fake"
+		if local {
+			name = "local"
+		}
+		t.Run(name, func(t *testing.T) {
+			env, opened := openWorkspaceWithBaseFiles(t, local)
+			test(t, env, opened)
+		})
+	}
+}
+
+func assertMirrorEqualsWorkTree(t *testing.T, root, mirror string) {
+	t.Helper()
+	want, got := workspaceTreeSnapshot(t, root), workspaceTreeSnapshot(t, mirror)
+	if len(want) != len(got) {
+		t.Fatalf("mirror entries %v, work tree %v", workspaceKeys(got), workspaceKeys(want))
+	}
+	for rel, entry := range want {
+		if got[rel] != entry {
+			t.Fatalf("mirror %s = %q, work tree %q", rel, got[rel], entry)
+		}
+	}
+}
+
+// The mirror compares content, not size: a same-size checkout conversion
+// that git diff does not report ends up with the VM's bytes (review P2).
+func TestWorkspaceMirrorComparesContent(t *testing.T) {
+	forEachWorkspaceProviderWithBaseFiles(t, func(t *testing.T, env *workspaceTestEnv, opened workspaceJSON) {
+		root := opened.Root
+		// A reversible same-size smudge: the blob holds "aa\n", the work
+		// tree "Aa\n", and git diff (which compares cleaned content) sees
+		// nothing.
+		env.mustRun(nil, "workspace", "exec", opened.ID, "--", "git", "config", "filter.upper.clean", "tr A a")
+		if err := os.MkdirAll(filepath.Join(root, ".git", "info"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, ".git", "info", "attributes"), []byte("smudged.txt filter=upper\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "smudged.txt"), []byte("Aa\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if diff := env.mustRun(nil, "workspace", "exec", opened.ID, "--", "git", "diff", "--name-only", "HEAD"); strings.TrimSpace(diff) != "" {
+			t.Fatalf("fixture: git diff reports %q; the smudge must be invisible to it", diff)
+		}
+		mirror := filepath.Join(t.TempDir(), "mirror")
+		env.mustRun(nil, "workspace", "mirror", opened.ID, mirror)
+		if data, err := os.ReadFile(filepath.Join(mirror, "smudged.txt")); err != nil || string(data) != "Aa\n" {
+			t.Fatalf("mirror smudged.txt = %q, %v; want the VM's bytes", data, err)
+		}
+		assertMirrorEqualsWorkTree(t, root, mirror)
+	})
+}
+
+// Mirror modes keep setuid, setgid and sticky, also on files and
+// directories it does not pull (review P2).
+func TestWorkspaceMirrorKeepsSpecialModes(t *testing.T) {
+	forEachWorkspaceProviderWithBaseFiles(t, func(t *testing.T, env *workspaceTestEnv, opened workspaceJSON) {
+		root := opened.Root
+		if err := os.Chmod(filepath.Join(root, "keep.txt"), 0o644|fs.ModeSetuid); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Join(root, "shared"), 0o755|fs.ModeSetgid); err != nil {
+			t.Fatal(err)
+		}
+		mirror := filepath.Join(t.TempDir(), "mirror")
+		env.mustRun(nil, "workspace", "mirror", opened.ID, mirror)
+		if info, err := os.Lstat(filepath.Join(mirror, "keep.txt")); err != nil || info.Mode()&fs.ModeSetuid == 0 || info.Mode().Perm() != 0o644 {
+			t.Fatalf("mirror keep.txt mode = %v, %v; want setuid 0644", info.Mode(), err)
+		}
+		if info, err := os.Lstat(filepath.Join(mirror, "shared")); err != nil || info.Mode()&fs.ModeSetgid == 0 || info.Mode().Perm() != 0o755 {
+			t.Fatalf("mirror shared/ mode = %v, %v; want setgid 0755", info.Mode(), err)
+		}
+		assertMirrorEqualsWorkTree(t, root, mirror)
 	})
 }

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -58,8 +59,8 @@ func runWorkspaceMirror(args []string, stdout, stderr io.Writer) int {
 
 // mirrorWorkspace fills dir (absent or empty) with the work tree: the
 // workspace's base commit from the host clone, then whatever `changes
-// --since start` and git report as different, pulled from the VM. Only the
-// differences cross the network. It returns the changes token the mirror
+// --since start`, git, a size or a content hash report as different, pulled
+// from the VM. Only the differences (and hashes) cross the network. It returns the changes token the mirror
 // is current at.
 func mirrorWorkspace(ctx context.Context, store *db.Store, workspace db.Workspace, sandbox workspaceSandbox, dir string) (string, *workspaceError) {
 	record, err := store.GetRepo(ctx, workspace.Repo)
@@ -107,6 +108,10 @@ func mirrorWorkspace(ctx context.Context, store *db.Store, workspace db.Workspac
 	}
 	var pull []string
 	var dirModes []workspaceChangeEntry
+	// Files git does not report and whose size matches still get a content
+	// compare: git diff compares cleaned content, so a same-size smudge or
+	// eol conversion leaves work-tree bytes that differ from the blob.
+	var compare []workspaceChangeEntry
 	for _, entry := range changes.Changed {
 		host := filepath.Join(dir, filepath.FromSlash(entry.Path))
 		info, statErr := os.Lstat(host)
@@ -119,9 +124,7 @@ func mirrorWorkspace(ctx context.Context, store *db.Store, workspace db.Workspac
 			}
 		case "file":
 			if same && info.Mode().IsRegular() && info.Size() == entry.Size {
-				if err := os.Chmod(host, fs.FileMode(entry.Mode&0o7777)); err != nil {
-					return "", asWorkspaceError(err, wsErrInternal)
-				}
+				compare = append(compare, entry)
 				continue
 			}
 			pull = append(pull, entry.Path)
@@ -131,6 +134,11 @@ func mirrorWorkspace(ctx context.Context, store *db.Store, workspace db.Workspac
 			}
 		}
 	}
+	differing, failure := workspaceMirrorContentDiffers(ctx, sandbox, workspace, dir, compare)
+	if failure != nil {
+		return "", failure
+	}
+	pull = append(pull, differing...)
 	for start := 0; start < len(pull); start += workspaceMirrorBatch {
 		batch := pull[start:min(start+workspaceMirrorBatch, len(pull))]
 		if failure := pullIntoWorkspaceMirror(ctx, sandbox, workspace, dir, batch); failure != nil {
@@ -141,11 +149,63 @@ func mirrorWorkspace(ctx context.Context, store *db.Store, workspace db.Workspac
 	// filled before it is closed.
 	for i := len(dirModes) - 1; i >= 0; i-- {
 		host := filepath.Join(dir, filepath.FromSlash(dirModes[i].Path))
-		if err := os.Chmod(host, fs.FileMode(dirModes[i].Mode&0o7777)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := os.Chmod(host, workspaceGoMode(int64(dirModes[i].Mode&0o7777))); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return "", asWorkspaceError(err, wsErrInternal)
 		}
 	}
 	return changes.Token, nil
+}
+
+// workspaceMirrorContentDiffers hashes candidates in the VM (one call per
+// batch) and on the host. A file whose bytes match gets the VM's mode,
+// setuid, setgid and sticky included; the paths of the others are returned
+// to be pulled.
+func workspaceMirrorContentDiffers(ctx context.Context, sandbox workspaceSandbox, workspace db.Workspace, dir string, candidates []workspaceChangeEntry) ([]string, *workspaceError) {
+	var differing []string
+	for start := 0; start < len(candidates); start += workspaceMirrorBatch {
+		batch := candidates[start:min(start+workspaceMirrorBatch, len(candidates))]
+		paths := make([]string, len(batch))
+		for i, entry := range batch {
+			paths[i] = entry.Path
+		}
+		var output bytes.Buffer
+		if failure := runWorkspaceFileOp(ctx, sandbox, workspace, map[string]any{"op": "hash", "paths": paths}, nil, &output); failure != nil {
+			return nil, failure
+		}
+		var vmHashes map[string]*string
+		if err := json.Unmarshal(output.Bytes(), &vmHashes); err != nil {
+			return nil, wsErrorf(wsErrInternal, "workspace hash printed invalid JSON: %v", err)
+		}
+		for _, entry := range batch {
+			host := filepath.Join(dir, filepath.FromSlash(entry.Path))
+			vmHash := vmHashes[entry.Path]
+			hostHash, err := workspaceFileSHA256(host)
+			if err != nil {
+				return nil, asWorkspaceError(err, wsErrInternal)
+			}
+			if vmHash == nil || *vmHash != hostHash {
+				differing = append(differing, entry.Path)
+				continue
+			}
+			if err := os.Chmod(host, workspaceGoMode(int64(entry.Mode&0o7777))); err != nil {
+				return nil, asWorkspaceError(err, wsErrInternal)
+			}
+		}
+	}
+	return differing, nil
+}
+
+func workspaceFileSHA256(file string) (string, error) {
+	handle, err := os.Open(file)
+	if err != nil {
+		return "", err
+	}
+	defer handle.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, handle); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func prepareWorkspaceMirrorDir(dir string) *workspaceError {
@@ -377,9 +437,9 @@ func placeWorkspaceMirrorSymlink(parent, target, linkname string) error {
 // workspaceMirrorBase writes the tree of commit base from the registered
 // host clone into dir: every blob exactly as stored (no export, eol or
 // filter attribute applied, so nothing differs from the object the VM
-// checked out but its checkout conversions, which the size check and git's
-// diff catch), with its mode, and symlinks as symlinks. Gitlinks are left
-// to the VM listing.
+// checked out but its checkout conversions, which mirrorWorkspace catches by
+// size, git diff, or a content hash compare), with its mode, and symlinks as
+// symlinks. Gitlinks are left to the VM listing.
 func workspaceMirrorBase(ctx context.Context, checkout, base, dir string) error {
 	if !workspaceCommitSHA.MatchString(base) {
 		return fmt.Errorf("workspace base %q is not a commit id", base)

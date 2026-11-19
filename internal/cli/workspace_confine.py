@@ -101,6 +101,44 @@ def relative_parts(relative, what):
     return parts
 
 
+def refuses_git_path(parts):
+    """Whether a path (its components) is in a git directory: any component
+    named .git, compared case-insensitively, so a nested repository's or a
+    submodule's .git is covered too. The file commands never read, write or
+    remove such a path, and changes never lists one. The host applies the
+    same rule (workspaceRefusesGitPath in workspace_files.go)."""
+    return any(part.lower() == ".git" for part in parts)
+
+
+def symlink_target_inside(root, rel_parts, target):
+    """Whether a symlink at rel_parts pointing to target stays under root.
+
+    An absolute target must not start with // nor contain a .. component
+    (both are refused rather than normalized, so every implementation agrees)
+    and must name root or a path below it. A relative target must never climb
+    above the root from the link's directory. The host applies the same rule
+    (workspaceSymlinkInside in workspace_files.go)."""
+    if not target or "\0" in target:
+        return False
+    if target.startswith("/"):
+        if target.startswith("//") or ".." in target.split("/"):
+            return False
+        root = os.path.normpath(root)
+        target = os.path.normpath(target)
+        return target == root or target.startswith(root + "/")
+    depth = len(rel_parts) - 1
+    for part in target.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            depth -= 1
+            if depth < 0:
+                return False
+        else:
+            depth += 1
+    return True
+
+
 def open_dirs(root_fd, parts, what, create=False):
     """Open the directory parts name below root_fd, one component at a time
     without following a symlink. root_fd is consumed (closed or returned).

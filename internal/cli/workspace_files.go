@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -274,6 +275,9 @@ func runWorkspaceWrite(args []string, stdin io.Reader, stdout, stderr io.Writer)
 	if failure != nil {
 		return reportWorkspaceError(stdout, stderr, jsonOutput, failure)
 	}
+	if failure := workspaceGitPathRefusal("write", rel); failure != nil {
+		return reportWorkspaceError(stdout, stderr, jsonOutput, failure)
+	}
 	fields := map[string]any{"op": "write", "path": rel, "mode": nil}
 	if *modeFlag != "" {
 		mode, err := strconv.ParseUint(*modeFlag, 8, 32)
@@ -390,6 +394,9 @@ func runWorkspacePull(args []string, stdout, stderr io.Writer) int {
 		if failure != nil {
 			return reportWorkspaceError(stdout, stderr, jsonOutput, failure)
 		}
+		if failure := workspaceGitPathRefusal("pull", rel); failure != nil {
+			return reportWorkspaceError(stdout, stderr, jsonOutput, failure)
+		}
 		paths = append(paths, rel)
 	}
 	err := withReadyWorkspace(home, positionals[0], func(ctx context.Context, _ *db.Store, _ config.Paths, workspace db.Workspace, sandbox workspaceSandbox) *workspaceError {
@@ -421,8 +428,8 @@ func runWorkspaceRemove(args []string, stdout, stderr io.Writer) int {
 		if rel == "." {
 			return reportWorkspaceError(stdout, stderr, jsonOutput, wsErrorf(wsErrInvalidArgs, "path %q names the workspace root", raw))
 		}
-		if rel == ".git" || strings.HasPrefix(rel, ".git/") {
-			return reportWorkspaceError(stdout, stderr, jsonOutput, wsErrorf(wsErrInvalidArgs, "path %q is in .git, which workspace remove never touches", raw))
+		if failure := workspaceGitPathRefusal("remove", rel); failure != nil {
+			return reportWorkspaceError(stdout, stderr, jsonOutput, failure)
 		}
 		paths = append(paths, rel)
 	}
@@ -542,14 +549,41 @@ func workspaceTarParts(name string) ([]string, *workspaceError) {
 	return parts, nil
 }
 
-// workspaceSymlinkInside reports whether a symlink at parts pointing to
-// target stays under root: a relative target never climbs above the root
-// from the link's directory, an absolute one names root or a path below it.
+// workspaceRefusesGitPath is refuses_git_path of workspace_confine.py, the
+// one rule both sides apply: a path with any component named .git (compared
+// case-insensitively, so nested repositories and submodules too) is never
+// written, pushed, pulled or removed.
+func workspaceRefusesGitPath(parts []string) bool {
+	for _, part := range parts {
+		if strings.EqualFold(part, ".git") {
+			return true
+		}
+	}
+	return false
+}
+
+// workspaceGitPathRefusal refuses a cleaned relative path in a .git
+// directory (invalid_args).
+func workspaceGitPathRefusal(command, rel string) *workspaceError {
+	if workspaceRefusesGitPath(strings.Split(rel, "/")) {
+		return wsErrorf(wsErrInvalidArgs, "path %q is in a .git directory, which workspace %s never touches", rel, command)
+	}
+	return nil
+}
+
+// workspaceSymlinkInside is symlink_target_inside of workspace_confine.py,
+// the rule the VM applies again: a relative target never climbs above the
+// root from the link's directory; an absolute one must not start with // or
+// contain a .. component (refused, never normalized, so Go's path.Clean and
+// Python's normpath cannot disagree) and names root or a path below it.
 func workspaceSymlinkInside(parts []string, target, root string) bool {
 	if target == "" || strings.ContainsRune(target, 0) {
 		return false
 	}
 	if path.IsAbs(target) {
+		if strings.HasPrefix(target, "//") || slices.Contains(strings.Split(target, "/"), "..") {
+			return false
+		}
 		root = path.Clean(root)
 		cleaned := path.Clean(target)
 		return cleaned == root || strings.HasPrefix(cleaned, root+"/")
@@ -594,6 +628,9 @@ func spoolWorkspacePushTar(input io.Reader, spool io.Writer, root string) *works
 		parts, failure := workspaceTarParts(header.Name)
 		if failure != nil {
 			return failure
+		}
+		if workspaceRefusesGitPath(parts) {
+			return wsErrorf(wsErrInvalidArgs, "tar entry %q is in a .git directory, which workspace push --files never touches", header.Name)
 		}
 		if header.Typeflag == tar.TypeSymlink && !workspaceSymlinkInside(parts, header.Linkname, root) {
 			return wsErrorf(wsErrCwdOutsideRoot, "tar entry %q is a symlink to %q, outside the workspace root", header.Name, header.Linkname)

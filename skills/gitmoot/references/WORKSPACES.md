@@ -160,6 +160,17 @@ absolute path, a `..` out of the root, or a symlink anywhere on the way is
 refused with `cwd_outside_root` (a final symlink too, except for `stat`,
 which reports it as `symlink`).
 
+**.git:** `write`, `push --files`, `pull` and `remove` refuse (`invalid_args`)
+any path with a component named `.git`, in any letter case and at any depth
+(`.git/config`, `sub/.git/x`: nested repositories and submodules too), on
+the host and again in the VM, before anything is applied. `changes` never
+lists such a path.
+
+**Symlink targets** (`push --files`): a relative target must not climb above
+the root from the link's directory; an absolute one must not start with `//`
+or contain a `..` component (refused rather than normalized, so the host's
+check and the VM's agree) and must name the root or a path below it.
+
 | Command | Contract |
 |---|---|
 | `gitmoot workspace read <id> <rel>` | The file's bytes on stdout. Exit 3 if missing, 4 if a directory. |
@@ -167,8 +178,8 @@ which reports it as `symlink`).
 | `gitmoot workspace stat <id> <rel> --json` | `{"type":"file\|dir\|symlink\|other","size":N,"mtime":<unix seconds, fractional>}`, without following a final symlink. Exit 3 if missing. |
 | `gitmoot workspace changes <id> --since <token\|start> --json` | `{"reset":bool,"token":"ws1.…","changed":[{"path","type","size","mtime","mode"}],"deleted":[path]}` (below). |
 | `gitmoot workspace pull <id> -- <paths...>` | A tar stream of those paths on stdout: regular files with their permission bits, directories (the entry only) and symlinks (never followed). A path that is missing, special or behind a symlink is left out. |
-| `gitmoot workspace push <id> --files` | A tar stream on stdin (files, directories, symlinks), each entry applied atomically with its permission bits, parents created. The whole stream is checked first: an absolute name, a `..` component, or a symlink whose target leaves the root refuses it (`cwd_outside_root`) before anything is applied. Prints `applied N entries` (`--json`: `{"applied":N}`). |
-| `gitmoot workspace remove <id> -- <paths...>` | Unlinks files and symlinks (a symlink itself, never its target) and removes empty directories; a non-empty directory is refused with `not_empty`. A missing path is not an error (it counts 0); `.git` and anything under it are refused (`invalid_args`). remove checks every path before removing any; on an error nothing is removed, and the error names the first failing path (like `push --files`). A directory counts as empty when every entry in it is listed before it in the same batch, so `-- dir/a dir` removes both. Prints `{"removed":N}`, what was actually removed. The next `changes` reports them in `deleted`. |
+| `gitmoot workspace push <id> --files` | A tar stream on stdin (files, directories, symlinks), each entry applied atomically with its permission bits, parents created. The whole stream is checked first, on the host and again in the VM: an absolute name, a `..` component or a symlink whose target leaves the root (`cwd_outside_root`), or a `.git` path (`invalid_args`), refuses it before anything is applied. Prints `applied N entries` (`--json`: `{"applied":N}`). |
+| `gitmoot workspace remove <id> -- <paths...>` | Unlinks files and symlinks (a symlink itself, never its target) and removes empty directories; a non-empty directory is refused with `not_empty`. A missing path is not an error (it counts 0); `.git` paths are refused (`invalid_args`, above). remove checks every path before removing any; on an error nothing is removed, and the error names the first failing path (like `push --files`). A directory counts as empty when every entry in it is listed before it in the same batch, so `-- dir/a dir` removes both. Prints `{"removed":N}`, what was actually removed. The next `changes` reports them in `deleted`. |
 | `gitmoot workspace mirror <id> <dir>` | Fills `<dir>` (absent or empty) with the work tree and prints the `changes` token it is current at (`--json`: `{"token","dir"}`). |
 
 ### changes
@@ -191,7 +202,8 @@ which reports it as `symlink`).
 - **Reset:** a malformed token, one from another workspace or generation, or
   any token but the last issued (its manifest is replaced) returns
   `"reset":true` with every entry in `changed`: a full resync.
-- **Scope:** untracked and ignored files are included; the top-level `.git/`
+- **Scope:** untracked and ignored files are included; every `.git`
+  (the repository's, a nested repository's or a submodule's, any letter case)
   is excluded. Names that are not valid UTF-8 are left out.
 
 ### mirror
@@ -200,9 +212,13 @@ which reports it as `symlink`).
 registered clone (raw blobs, modes and symlinks, `git ls-tree` +
 `git cat-file --batch`), so nothing that is already on the host crosses the
 network. It then runs `changes --since start` and `git diff --name-only
-<base>` in the VM, removes what the VM does not have, pulls (in batches of
-256) every entry that git reports as changed, that is new, or whose type or
-size differs, and sets every mode to the VM's. It prints the token of that
+<base>` in the VM, and removes what the VM does not have. It pulls (in
+batches of 256) every entry that git reports as changed, that is new, or
+whose type or size differs. Every other file is compared by content: one
+batched call hashes the VM's work-tree bytes (sha256), and a file whose hash
+differs from the host copy is pulled too, since git diff compares cleaned
+content and misses a same-size smudge or eol conversion. Every mode is set to
+the VM's, setuid, setgid and sticky included. It prints the token of that
 `changes` call: what changes after it, the next `changes --since <token>`
 reports.
 

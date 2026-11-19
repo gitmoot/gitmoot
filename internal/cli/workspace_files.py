@@ -18,6 +18,7 @@
 #   changes  since, state_dir, workspace
 #                           {"reset","token","changed","deleted"}
 #   pull     paths          a tar stream (files, directories, symlinks)
+#   hash     paths          {path: sha256 of a regular file's bytes | null}
 #   push     (input tar)    each entry applied atomically, modes kept
 #   basediff base           NUL-separated paths whose content or mode differs
 #                           from commit base (git diff), for mirror
@@ -26,6 +27,7 @@
 #                           empty directories; {"removed": N}
 import base64
 import errno
+import hashlib
 import io
 import json
 import os
@@ -206,6 +208,8 @@ def place_file(dir_fd, name, source, mode, what):
 
 def op_write():
     what = "path %s" % cfg["path"]
+    if refuses_git_path(relative_parts(cfg["path"], what)):
+        fail(EXIT_FAILED, "invalid_args", "%s is in a .git directory, which workspace write never touches" % what)
     dir_fd, name = parent_and_name(cfg["path"], what, create=True)
     if name is None:
         fail(EXIT_IS_DIR, "is_directory", "%s is the workspace root, a directory" % what)
@@ -259,7 +263,7 @@ def read_generation(state_dir):
 
 
 def walk_tree(top_fd):
-    """Every entry below the root except the top-level .git, without
+    """Every entry below the root except .git directories (any depth), without
     following a symlink: rel -> [type, size, mtime_ns, ctime_ns, ino, mode]."""
     entries = {}
     stack = [("", top_fd)]
@@ -269,8 +273,8 @@ def walk_tree(top_fd):
             with os.scandir(fd) as listing:
                 items = list(listing)
             for item in items:
-                if prefix == "" and item.name == ".git":
-                    continue
+                if refuses_git_path([item.name]):
+                    continue  # any .git: the repository's, a nested one's, a submodule's
                 try:
                     item.name.encode("utf-8")
                 except UnicodeEncodeError:
@@ -397,6 +401,40 @@ class Padded:
         return data
 
 
+def op_hash():
+    """{path: sha256 hex of the regular file's bytes, or null} for paths, for
+    mirror's content compare. A missing, special or confined-out path is null."""
+    hashes = {}
+    for rel in cfg["paths"]:
+        what = "path %s" % rel
+        parts = relative_parts(rel, what)
+        hashes[rel] = None
+        if not parts or refuses_git_path(parts):
+            continue
+        try:
+            dir_fd = open_dirs(root_fd(), parts[:-1], what)
+        except Refused:
+            continue
+        try:
+            try:
+                fd, _ = open_regular(dir_fd, parts[-1], what)
+            except Failure:
+                continue
+            try:
+                digest = hashlib.sha256()
+                while True:
+                    chunk = os.read(fd, 1 << 20)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                hashes[rel] = digest.hexdigest()
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dir_fd)
+    write_all(1, json.dumps(hashes).encode())
+
+
 def op_pull():
     out = tarfile.open(fileobj=sys.stdout.buffer, mode="w|", format=tarfile.PAX_FORMAT)
     for rel in cfg["paths"]:
@@ -404,6 +442,8 @@ def op_pull():
         parts = relative_parts(rel, what)
         if not parts:
             continue
+        if refuses_git_path(parts):
+            fail(EXIT_FAILED, "invalid_args", "%s is in a .git directory, which workspace pull never reads" % what)
         try:
             dir_fd = open_dirs(root_fd(), parts[:-1], what)
         except Refused:
@@ -441,27 +481,6 @@ def op_pull():
     out.close()
 
 
-def symlink_stays_inside(rel_parts, target):
-    """A symlink at rel_parts may point only somewhere under the root."""
-    if not target or "\0" in target:
-        return False
-    if os.path.isabs(target):
-        root = os.path.normpath(cfg["root"])
-        target = os.path.normpath(target)
-        return target == root or target.startswith(root + "/")
-    depth = len(rel_parts) - 1
-    for part in target.split("/"):
-        if part in ("", "."):
-            continue
-        if part == "..":
-            depth -= 1
-            if depth < 0:
-                return False
-        else:
-            depth += 1
-    return True
-
-
 def push_parts(name):
     what = "entry %s" % name
     if "\0" in name or os.path.isabs(name):
@@ -471,19 +490,31 @@ def push_parts(name):
         fail(EXIT_FAILED, "cwd_outside_root", "%s contains .." % what)
     if not parts:
         fail(EXIT_FAILED, "invalid_args", "%s names the workspace root" % what)
+    if refuses_git_path(parts):
+        fail(EXIT_FAILED, "invalid_args", "%s is in a .git directory, which workspace file commands never touch" % what)
+    return parts, what
+
+
+def check_push_member(member):
+    parts, what = push_parts(member.name)
+    if not (member.isreg() or member.isdir() or member.issym()):
+        fail(EXIT_FAILED, "invalid_args", "%s is not a file, directory or symlink" % what)
+    if member.issym() and not symlink_target_inside(cfg["root"], parts, member.linkname):
+        fail(EXIT_FAILED, "cwd_outside_root", "%s points outside the workspace root (%s)" % (what, member.linkname))
     return parts, what
 
 
 def op_push():
     applied = 0
     with open_input() as source:
+        # The whole stream is checked before any entry is applied: a refused
+        # entry applies nothing.
+        for member in tarfile.open(fileobj=source, mode="r|"):
+            check_push_member(member)
+        source.seek(0)
         archive = tarfile.open(fileobj=source, mode="r|")
         for member in archive:
-            parts, what = push_parts(member.name)
-            if not (member.isreg() or member.isdir() or member.issym()):
-                fail(EXIT_FAILED, "invalid_args", "%s is not a file, directory or symlink" % what)
-            if member.issym() and not symlink_stays_inside(parts, member.linkname):
-                fail(EXIT_FAILED, "cwd_outside_root", "%s points outside the workspace root (%s)" % (what, member.linkname))
+            parts, what = check_push_member(member)
             dir_fd = open_dirs(root_fd(), parts[:-1], what, create=True)
             name = parts[-1]
             mode = member.mode & 0o7777
@@ -525,8 +556,8 @@ def remove_parts(rel):
     parts = relative_parts(rel, what)
     if not parts:
         fail(EXIT_FAILED, "invalid_args", "%s names the workspace root" % what)
-    if parts[0] == ".git":
-        fail(EXIT_FAILED, "invalid_args", "%s is in .git, which workspace remove never touches" % what)
+    if refuses_git_path(parts):
+        fail(EXIT_FAILED, "invalid_args", "%s is in a .git directory, which workspace remove never touches" % what)
     return parts, what
 
 
@@ -638,6 +669,7 @@ OPS = {
     "stat": op_stat,
     "changes": op_changes,
     "pull": op_pull,
+    "hash": op_hash,
     "push": op_push,
     "basediff": op_basediff,
     "remove": op_remove,
