@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
@@ -29,6 +30,9 @@ type Store struct {
 	// that never resolves review facts, and every test store) fails closed to
 	// block-all, under which the effective decision equals the raw one.
 	reviewBlockingSeverity func(repo string) string
+	// worktreeRefScans counts full ListJobWorktreeRefs reads (#2691); see
+	// WorktreeRefScansForTest.
+	worktreeRefScans atomic.Int64
 }
 
 // SetReviewBlockingSeverity installs the repository review-severity policy

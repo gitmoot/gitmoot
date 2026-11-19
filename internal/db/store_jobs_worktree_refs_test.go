@@ -17,7 +17,7 @@ func insertWorktreeRefJob(t *testing.T, store *Store, id, state, payload string)
 
 func refsByID(t *testing.T, store *Store) map[string]JobWorktreeRef {
 	t.Helper()
-	refs, err := store.ListJobWorktreeRefs(context.Background())
+	refs, _, err := store.ListJobWorktreeRefs(context.Background())
 	if err != nil {
 		t.Fatalf("ListJobWorktreeRefs: %v", err)
 	}

@@ -96,7 +96,11 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 	if handled || reconcileErr != nil {
 		return reconciled, reconcileErr
 	}
-	decision, payload, err := e.inspectProducerCleanup(ctx, jobID, policy, nil)
+	// One index serves every inspection below: at most one full scan of the
+	// jobs table per cleanup (later reads cover only newer rows), and none
+	// when a reclaim pass's index was already built.
+	refs := e.worktreeRefIndex()
+	decision, payload, err := e.inspectProducerCleanup(ctx, jobID, policy, nil, refs)
 	result.Decision = decision
 	if err != nil || !decision.Eligible {
 		if err == nil && decision.Receipt != nil && decision.Receipt.RemovedAt != "" {
@@ -119,7 +123,7 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 	}()
 	// The checkout lock is additional serialization, never a substitute for the
 	// lifecycle fence. Recheck physical identity after obtaining both.
-	current, payload, err := e.inspectProducerCleanup(ctx, jobID, policy, nil)
+	current, payload, err := e.inspectProducerCleanup(ctx, jobID, policy, nil, refs)
 	if err != nil || !current.Eligible || current.EligibilityToken != decision.EligibilityToken {
 		if err == nil && current.Eligible {
 			current = current.refuse("eligibility_changed")
@@ -150,7 +154,7 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 		}
 		// Collectors may enrich the payload. Their durable output is included in
 		// the immutable receipt; changed generation/path/dependencies still refuse.
-		preserved, refreshed, err := e.inspectProducerCleanup(ctx, jobID, policy, &current.evidence)
+		preserved, refreshed, err := e.inspectProducerCleanup(ctx, jobID, policy, &current.evidence, refs)
 		if err != nil || !preserved.Eligible {
 			result.State, result.Decision = "refused", preserved
 			return result, err

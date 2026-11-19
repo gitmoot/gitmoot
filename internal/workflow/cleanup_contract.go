@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -124,7 +123,7 @@ func (e Engine) InspectProducerCleanup(ctx context.Context, jobID string, policy
 		return CleanupInspection{}, err
 	}
 	defer release()
-	decision, _, err := e.inspectProducerCleanup(ctx, jobID, policy, nil)
+	decision, _, err := e.inspectProducerCleanup(ctx, jobID, policy, nil, e.worktreeRefIndex())
 	return decision, err
 }
 
@@ -178,7 +177,7 @@ func CleanupTerminalTime(job db.Job, obligation *db.CleanupObligation) (time.Tim
 	return parseStoredJobTime(job.CreatedAt)
 }
 
-func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy CleanupPolicy, collected *cleanupEvidence) (CleanupInspection, JobPayload, error) {
+func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy CleanupPolicy, collected *cleanupEvidence, refs *WorktreeRefIndex) (CleanupInspection, JobPayload, error) {
 	d := CleanupInspection{SchemaVersion: CleanupSchemaVersion, Producer: "gitmoot", DecisionOwner: "gitmoot",
 		OwnerJobID: jobID, ResourceKind: "delegation_worktree", ObservedAt: e.now().UTC().Format(time.RFC3339Nano),
 		ReasonCodes: []string{}, Consumers: []CleanupConsumer{}}
@@ -346,14 +345,10 @@ func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy
 	if job.State == string(JobSucceeded) && payload.Result == nil {
 		return d.refuse("terminal_result_missing"), payload, nil
 	}
-	refs, err := e.Store.ListJobWorktreeRefs(ctx)
-	if err != nil {
+	if referenced, err := refs.referencedByOther(ctx, e.Store, jobID, d.ExpectedPath); err != nil {
 		return d, payload, err
-	}
-	for _, other := range refs {
-		if other.ID != jobID && filepath.Clean(strings.TrimSpace(other.WorktreePath)) == filepath.Clean(d.ExpectedPath) {
-			return d.refuse("path_referenced"), payload, nil
-		}
+	} else if referenced {
+		return d.refuse("path_referenced"), payload, nil
 	}
 	if reason, err := e.inspectCleanupConsumers(ctx, payload, &d); err != nil {
 		return d, payload, err

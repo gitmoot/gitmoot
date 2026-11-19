@@ -1157,6 +1157,10 @@ type tickCandidates struct {
 	blockedSince blockedSinceSinkMemo
 	// prStalled memoizes the tick's [pr_stalled] policy and sweep state.
 	prStalled prStalledTickMemo
+	// worktreeRefs is the reclaim attempts' shared path_referenced index
+	// (#2691), so a pass reads every job's worktree_path once instead of once
+	// per candidate. See worktreeRefIndex.
+	worktreeRefs *workflow.WorktreeRefIndex
 }
 
 type blockedSinceSinkMemo struct {
@@ -1407,6 +1411,19 @@ func (c *tickCandidates) finishReclaimTick() {
 // never reassigns it.
 var newTickCandidates = func(store tickCandidateStore) *tickCandidates {
 	return &tickCandidates{store: store}
+}
+
+// worktreeRefIndex returns the carrier's path_referenced index, created on
+// first use; the index itself reads the jobs table only when first asked.
+// A nil carrier returns nil, which leaves each cleanup its own index.
+func (c *tickCandidates) worktreeRefIndex() *workflow.WorktreeRefIndex {
+	if c == nil {
+		return nil
+	}
+	if c.worktreeRefs == nil {
+		c.worktreeRefs = &workflow.WorktreeRefIndex{}
+	}
+	return c.worktreeRefs
 }
 
 // candidateJobRepo is what one tick learned about a retry candidate's owning
@@ -1965,6 +1982,7 @@ func attemptDelegationReclaim(ctx context.Context, worker jobWorker, cand *tickC
 		return false, nil
 	}
 	engine := worker.workflowForJob(checkout.path, runner)
+	engine.WorktreeRefs = cand.worktreeRefIndex()
 	reclaimed, err := reclaim(engine)
 	if err != nil {
 		if delegationCleanupContended(err) {
