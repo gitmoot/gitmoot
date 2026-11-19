@@ -418,7 +418,11 @@ func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, req
 	}, workspaceBasePATH); err != nil {
 		return fail(err)
 	}
-	if err := store.MarkWorkspaceReady(ctx, workspace.ID, plan.Branch, plan.Head, plan.BaseRef, workspaceNow()); err != nil {
+	rootDev, rootIno, err := workspaceRootIdentity(ctx, sandbox)
+	if err != nil {
+		return fail(err)
+	}
+	if err := store.MarkWorkspaceReady(ctx, workspace.ID, plan.Branch, plan.Head, plan.BaseRef, int64(rootDev), int64(rootIno), workspaceNow()); err != nil {
 		return fail(err)
 	}
 	return store.GetWorkspace(ctx, workspace.ID)

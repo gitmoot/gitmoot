@@ -258,6 +258,9 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 		}
 		return workspaceExecStatus{}, asWorkspaceError(err, wsErrInternal)
 	}
+	if workspace.State == db.WorkspaceStateReady && workspace.RootDev == 0 && workspace.RootIno == 0 {
+		return workspaceExecStatus{}, wsErrorf(wsErrNotReady, "workspace %s has no recorded root identity; close it and open a new one", workspace.ID)
+	}
 	if workspace.State != db.WorkspaceStateReady {
 		return workspaceExecStatus{}, wsErrorf(wsErrNotReady, "workspace %s is %s", workspace.ID, workspace.State)
 	}
@@ -293,6 +296,8 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 		"timeout":    request.Timeout.Seconds(),
 		"grace":      workspaceWatchdogGrace.Seconds(),
 		"kill_grace": workspaceKillGrace.Seconds(),
+		"root_dev":   uint64(workspace.RootDev),
+		"root_ino":   uint64(workspace.RootIno),
 		"stdin":      request.Stdin,
 		"log":        path.Join(remoteexec.WorkspaceLogDir(sandbox.Home()), logName),
 	}

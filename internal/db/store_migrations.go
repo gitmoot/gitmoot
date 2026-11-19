@@ -3465,4 +3465,13 @@ CREATE TABLE workspaces (
 CREATE UNIQUE INDEX idx_workspaces_one_open ON workspaces(seat, repo, issue, pr) WHERE state IN ('opening', 'ready', 'closing');
 CREATE INDEX idx_workspaces_state ON workspaces(state);
 	`,
+	// #2694 review: the workspace root's identity (st_dev, st_ino), recorded
+	// at open. The exec supervisor refuses a root whose identity differs, so a
+	// workspace command that replaces the root or any ancestor with a symlink
+	// cannot move later commands outside it. 0/0 is "not recorded", which the
+	// CLI and the supervisor refuse.
+	`
+ALTER TABLE workspaces ADD COLUMN root_dev INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workspaces ADD COLUMN root_ino INTEGER NOT NULL DEFAULT 0;
+	`,
 }

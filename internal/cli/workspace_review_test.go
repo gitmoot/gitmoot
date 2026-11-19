@@ -175,9 +175,17 @@ func TestWorkspaceProviderDeadlineStaysInsideFundedTime(t *testing.T) {
 
 func workspaceSupervisorConfig(t *testing.T, root, cwd string, argv []string) string {
 	t.Helper()
+	// The identity the CLI records at open: the root as it is now (following
+	// a symlink, so a root that already is one never matches its own lstat).
+	var rootDev, rootIno uint64
+	if info, err := os.Stat(root); err == nil {
+		stat := info.Sys().(*syscall.Stat_t)
+		rootDev, rootIno = uint64(stat.Dev), stat.Ino
+	}
 	encoded, err := json.Marshal(map[string]any{
 		"root": root, "cwd": cwd, "env": map[string]string{"PATH": "/usr/bin:/bin"}, "argv": argv,
 		"timeout": 0, "grace": 60, "kill_grace": 0.2, "stdin": false, "log": "",
+		"root_dev": rootDev, "root_ino": rootIno,
 	})
 	if err != nil {
 		t.Fatal(err)

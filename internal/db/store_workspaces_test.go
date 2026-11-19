@@ -39,7 +39,7 @@ func TestWorkspaceLedgerEnforcesBothCapsAndOneOpenPerSubject(t *testing.T) {
 	if err := store.CreateWorkspace(ctx, workspace("ws-c", 3), 12); err != nil {
 		t.Fatalf("at the cap = %v", err)
 	}
-	if err := store.MarkWorkspaceReady(ctx, "ws-a", "ws/intern/1", "abc", "main", now); err != nil {
+	if err := store.MarkWorkspaceReady(ctx, "ws-a", "ws/intern/1", "abc", "main", 1, 2, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ExtendWorkspaceReservation(ctx, "ws-a", 4, now.Add(2*time.Hour), 1, 100, 6); !errors.As(err, &capErr) || capErr.Clause != "workspace" {

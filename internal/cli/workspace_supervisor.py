@@ -13,8 +13,9 @@
 # SIGTERM, SIGINT or SIGHUP to the supervisor itself also kills the group
 # before the supervisor exits, so the watchdog never dies leaving the command
 # behind. A forwarded signal escalates to SIGKILL after `kill_grace` seconds.
-# The cwd is opened one component at a time below the root without following
-# symlinks, and the command starts in that pinned directory, so a concurrent
+# The root is accepted only if its (st_dev, st_ino) matches the identity
+# recorded at open, whatever path led to it; the cwd is then opened one
+# component at a time below it without following symlinks, and the command starts in that pinned directory, so a concurrent
 # rename or symlink swap cannot move it outside the root.
 # Output is copied to the host and to a log file that `workspace close` copies
 # out. After the group is dead the last bytes on stderr are a status trailer:
@@ -97,6 +98,17 @@ def open_root(root):
     parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
     root_fd = open_child(parent_fd, name, "workspace root %s" % root)
     os.close(parent_fd)
+    # The path above is only a hint: on the local backend workspace commands
+    # own every ancestor and can replace the parent too. What makes this the
+    # workspace root is its identity, recorded when the workspace opened.
+    expected = (int(cfg.get("root_dev") or 0), int(cfg.get("root_ino") or 0))
+    if expected == (0, 0):
+        os.close(root_fd)
+        refuse("invalid_args", "the workspace root has no recorded identity")
+    info = os.fstat(root_fd)
+    if (info.st_dev, info.st_ino) != expected:
+        os.close(root_fd)
+        refuse("cwd_outside_root", "workspace root %s was replaced: it is not the directory the workspace opened" % root)
     return root_fd
 
 

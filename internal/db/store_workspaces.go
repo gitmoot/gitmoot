@@ -69,6 +69,10 @@ type Workspace struct {
 	CostAccruedUSD     float64
 	PaidUntil          time.Time
 	LinkedPR           int64
+	// RootDev and RootIno identify the root directory (st_dev, st_ino as
+	// recorded at open, bit-cast to int64). Both zero means not recorded.
+	RootDev int64
+	RootIno int64
 }
 
 // Active reports whether the workspace may still hold a provider sandbox.
@@ -78,7 +82,7 @@ func (w Workspace) Active() bool {
 
 const workspaceColumns = `id, seat, repo, issue, pr, branch, base, base_ref, provider, provider_instance_id,
 	root, state, created_at, last_active_at, closed_at, close_reason, cost_rate_usd_per_hour,
-	cost_reserved_usd, cost_accrued_usd, paid_until, linked_pr`
+	cost_reserved_usd, cost_accrued_usd, paid_until, linked_pr, root_dev, root_ino`
 
 // workspaceCommittedSQL is every workspace's spend that is already certain:
 // a terminal workspace's settled cost and an active one's whole reservation.
@@ -118,7 +122,7 @@ func (s *Store) CreateWorkspace(ctx context.Context, w Workspace, maxTotalUSD fl
 		return errors.New("workspace needs exactly one of issue or pr")
 	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO workspaces(`+workspaceColumns+`)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, 0, ?, 0
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, 0, ?, 0, 0, 0
 		WHERE (`+workspaceCommittedSQL+`) + ? <= ? + ?`,
 		w.ID, w.Seat, w.Repo, w.Issue, w.PR, w.Branch, w.Base, w.BaseRef, w.Provider, w.ProviderInstanceID,
 		w.Root, WorkspaceStateOpening, formatWorkspaceTime(w.CreatedAt), formatWorkspaceTime(w.LastActiveAt),
@@ -208,10 +212,14 @@ func (s *Store) SetWorkspaceInstance(ctx context.Context, id, instanceID, root s
 	return s.updateOneWorkspace(ctx, `UPDATE workspaces SET provider_instance_id = ?, root = ? WHERE id = ? AND state = 'opening'`, instanceID, root, id)
 }
 
-// MarkWorkspaceReady finishes open: the branch is checked out at base.
-func (s *Store) MarkWorkspaceReady(ctx context.Context, id, branch, base, baseRef string, now time.Time) error {
-	return s.updateOneWorkspace(ctx, `UPDATE workspaces SET state = 'ready', branch = ?, base = ?, base_ref = ?, last_active_at = ?
-		WHERE id = ? AND state = 'opening'`, branch, base, baseRef, formatWorkspaceTime(now), id)
+// MarkWorkspaceReady finishes open: the branch is checked out at base, and
+// the root directory's identity is recorded for the exec supervisor.
+func (s *Store) MarkWorkspaceReady(ctx context.Context, id, branch, base, baseRef string, rootDev, rootIno int64, now time.Time) error {
+	if rootDev == 0 && rootIno == 0 {
+		return fmt.Errorf("workspace %s: the root identity is required", id)
+	}
+	return s.updateOneWorkspace(ctx, `UPDATE workspaces SET state = 'ready', branch = ?, base = ?, base_ref = ?, root_dev = ?, root_ino = ?, last_active_at = ?
+		WHERE id = ? AND state = 'opening'`, branch, base, baseRef, rootDev, rootIno, formatWorkspaceTime(now), id)
 }
 
 // TouchWorkspace moves last_active_at forward (never back) on a ready
@@ -319,7 +327,7 @@ func scanWorkspace(row interface{ Scan(...any) error }) (Workspace, error) {
 	var created, lastActive, closed, paidUntil string
 	if err := row.Scan(&w.ID, &w.Seat, &w.Repo, &w.Issue, &w.PR, &w.Branch, &w.Base, &w.BaseRef, &w.Provider,
 		&w.ProviderInstanceID, &w.Root, &w.State, &created, &lastActive, &closed, &w.CloseReason,
-		&w.RateUSDPerHour, &w.CostReservedUSD, &w.CostAccruedUSD, &paidUntil, &w.LinkedPR); err != nil {
+		&w.RateUSDPerHour, &w.CostReservedUSD, &w.CostAccruedUSD, &paidUntil, &w.LinkedPR, &w.RootDev, &w.RootIno); err != nil {
 		return Workspace{}, err
 	}
 	var errs []error

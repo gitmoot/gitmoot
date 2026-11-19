@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -360,4 +361,29 @@ func (t *workspaceTail) String() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return string(t.data)
+}
+
+// workspaceRootIdentity reads the root directory's (st_dev, st_ino) inside
+// the workspace, with the same stat the supervisor's fstat compares against.
+// stat does not follow a symlink, and the root must be a directory.
+func workspaceRootIdentity(ctx context.Context, sandbox workspaceSandbox) (uint64, uint64, error) {
+	result, err := sandbox.Run(ctx, e2b.StartRequest{
+		Name:           "stat",
+		Args:           []string{"-c", "%d %i %F", "--", sandbox.Root()},
+		Dir:            sandbox.Home(),
+		MaxOutputBytes: 4 << 10,
+	})
+	if err != nil {
+		return 0, 0, fmt.Errorf("read the workspace root identity: %w: %s", err, strings.TrimSpace(result.Stderr))
+	}
+	fields := strings.SplitN(strings.TrimSpace(result.Stdout), " ", 3)
+	if len(fields) != 3 || fields[2] != "directory" {
+		return 0, 0, fmt.Errorf("read the workspace root identity: unexpected stat output %q", result.Stdout)
+	}
+	dev, devErr := strconv.ParseUint(fields[0], 10, 64)
+	ino, inoErr := strconv.ParseUint(fields[1], 10, 64)
+	if devErr != nil || inoErr != nil || (dev == 0 && ino == 0) {
+		return 0, 0, fmt.Errorf("read the workspace root identity: unexpected stat output %q", result.Stdout)
+	}
+	return dev, ino, nil
 }
