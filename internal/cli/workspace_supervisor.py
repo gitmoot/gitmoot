@@ -9,7 +9,13 @@
 # The command runs in its own session and process group, with exactly the
 # environment the host sent and stdin from /dev/null unless --stdin. When no
 # frame arrives for `grace` seconds, or the channel closes, the host is gone
-# (killed, SIGKILL included, or cut off) and the whole group is killed.
+# (killed, SIGKILL included, or cut off) and the whole group is killed. A
+# SIGTERM, SIGINT or SIGHUP to the supervisor itself also kills the group
+# before the supervisor exits, so the watchdog never dies leaving the command
+# behind. A forwarded signal escalates to SIGKILL after `kill_grace` seconds.
+# The cwd is opened one component at a time below the root without following
+# symlinks, and the command starts in that pinned directory, so a concurrent
+# rename or symlink swap cannot move it outside the root.
 # Output is copied to the host and to a log file that `workspace close` copies
 # out. After the group is dead the last bytes on stderr are a status trailer:
 # MARK + JSON {exit_code, signal, timed_out, error} + newline. The supervisor
@@ -18,6 +24,7 @@
 import json
 import os
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -25,12 +32,23 @@ import threading
 import time
 
 MARK = b"\x1e\x1fgitmoot-ws-status "
-KILL_GRACE = 3.0
 LOG_CAP = 32 << 20
 
 cfg = json.loads(sys.argv[1])
+KILL_GRACE = float(cfg["kill_grace"])
 lock = threading.Lock()
 state = {"beat": time.monotonic(), "kill": None, "timed_out": False, "escalate_at": None}
+# The last termination signal the supervisor itself received. Its handler only
+# records it; the main loop acts on it, so a handler can never deadlock on lock.
+received = []
+
+
+def on_signal(signum, _frame):
+    received.append(signum)
+
+
+for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(_sig, on_signal)
 
 
 def finish(status):
@@ -44,12 +62,39 @@ def refuse(code, message):
     finish({"exit_code": 125, "signal": None, "timed_out": False, "error": {"code": code, "message": message}})
 
 
-root = os.path.realpath(cfg["root"])
-cwd = os.path.realpath(os.path.join(root, cfg["cwd"]))
-if cwd != root and not cwd.startswith(root + os.sep):
-    refuse("cwd_outside_root", "cwd %s resolves outside the workspace root" % cfg["cwd"])
-if not os.path.isdir(cwd):
-    refuse("invalid_args", "cwd %s is not a directory in the workspace" % cfg["cwd"])
+def open_cwd(root, relative):
+    """Open relative below root without following any symlink."""
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    if relative in ("", "."):
+        return fd
+    for part in relative.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            os.close(fd)
+            refuse("cwd_outside_root", "cwd %s leaves the workspace root" % relative)
+        try:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        except FileNotFoundError:
+            os.close(fd)
+            refuse("invalid_args", "cwd %s is not a directory in the workspace" % relative)
+        except OSError:
+            try:
+                is_link = stat.S_ISLNK(os.lstat(part, dir_fd=fd).st_mode)
+            except OSError:
+                is_link = False
+            os.close(fd)
+            if is_link:
+                refuse("cwd_outside_root", "cwd %s goes through a symlink; workspace cwd never follows symlinks" % relative)
+            refuse("invalid_args", "cwd %s is not a directory in the workspace" % relative)
+        os.close(fd)
+        fd = child
+    return fd
+
+
+if os.path.isabs(cfg["cwd"]):
+    refuse("cwd_outside_root", "cwd %s must be relative to the workspace root" % cfg["cwd"])
+cwd_fd = open_cwd(os.path.realpath(cfg["root"]), cfg["cwd"])
 
 log = None
 log_size = 0
@@ -74,10 +119,13 @@ def write_log(data):
             log.write(b"\n[gitmoot: log truncated at %d bytes]\n" % LOG_CAP)
 
 
+if received:
+    finish({"exit_code": 128 + received[-1], "signal": received[-1], "timed_out": False, "error": {"code": "supervisor_signal", "message": "the supervisor was signalled before the command started"}})
 try:
+    os.fchdir(cwd_fd)
+    os.close(cwd_fd)
     proc = subprocess.Popen(
         cfg["argv"],
-        cwd=cwd,
         env=cfg["env"],
         stdin=subprocess.PIPE if cfg["stdin"] else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -194,6 +242,8 @@ while True:
     now = time.monotonic()
     with lock:
         beat, escalate_at = state["beat"], state["escalate_at"]
+    if received and state["kill"] is None:
+        kill_group(signal.SIGTERM, "supervisor_signal")
     if now - beat > grace:
         kill_group(signal.SIGKILL, "watchdog")
     elif deadline is not None and now > deadline and state["kill"] is None:
@@ -223,6 +273,8 @@ if state["timed_out"]:
     status["exit_code"] = 124
 if state["kill"] in ("watchdog", "control_closed"):
     status["error"] = {"code": state["kill"], "message": "the host session ended; the command's process group was killed"}
+elif state["kill"] == "supervisor_signal":
+    status["error"] = {"code": "supervisor_signal", "message": "the supervisor was signalled; the command's process group was killed"}
 if log is not None:
     try:
         with lock:

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -316,6 +317,10 @@ func TestWorkspaceExecNeverPassesHostEnvironment(t *testing.T) {
 		if len(proc.env) != 0 {
 			t.Fatalf("envd Start carried environment %v", proc.env)
 		}
+		// One owner for the kill grace: the supervisor gets the host's value.
+		if len(proc.args) < 3 || !strings.Contains(proc.args[2], fmt.Sprintf(`"kill_grace":%v`, workspaceKillGrace.Seconds())) {
+			t.Fatalf("supervisor config lacks the host kill grace: %v", proc.args)
+		}
 		for _, arg := range proc.args {
 			if strings.Contains(arg, "host-secret-value") || strings.Contains(arg, "ghp_host_token") {
 				t.Fatalf("a host secret reached the VM in argv")
@@ -500,7 +505,7 @@ func TestWorkspaceCostCapRefusesOpenAndClosesRunning(t *testing.T) {
 	if !closeTo(a.CostAccruedUSD, 55.0/6) || !closeTo(a.CostReservedUSD, 10+55.0/6) || !a.PaidUntil.Equal(env.clock().Add(time.Hour)) {
 		t.Fatalf("renewed ledger = %+v", a)
 	}
-	if timeouts := env.cloud.sandbox(a.ProviderInstanceID).timeouts; len(timeouts) != 2 || timeouts[1] != 3600 {
+	if timeouts := env.cloud.sandbox(a.ProviderInstanceID).timeouts; len(timeouts) != 2 || timeouts[1] != 3540 {
 		t.Fatalf("provider deadline moves = %v", timeouts)
 	}
 	if got := committed(); got > 29.5+1e-9 {
@@ -624,7 +629,7 @@ func TestWorkspaceDaemonRestartReattachesFromRecord(t *testing.T) {
 	if record.State != db.WorkspaceStateReady || !record.PaidUntil.Equal(env.clock().Add(time.Hour)) {
 		t.Fatalf("after the restarted sweep: %+v\n%s", record, out.String())
 	}
-	if timeouts := env.cloud.sandbox(sandboxID).timeouts; len(timeouts) != 2 || timeouts[1] != 3600 {
+	if timeouts := env.cloud.sandbox(sandboxID).timeouts; len(timeouts) != 2 || timeouts[1] != 3540 {
 		t.Fatalf("restarted daemon did not renew the recorded sandbox: %v\n%s", timeouts, out.String())
 	}
 	// And exec, a fresh process each time, attaches from the same record.

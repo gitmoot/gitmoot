@@ -94,8 +94,11 @@ stderr (and on stdout too with `--json`) and exits **125**. Codes:
   exits 125 (or 124) on its own is told apart.
 - **Streaming:** stdout and stderr stream live, kept apart.
 - **stdin:** `/dev/null` unless `--stdin`.
-- **cwd:** relative to `root`; `..` out of it, an absolute path, or a symlink
-  that resolves outside it is `cwd_outside_root`.
+- **cwd:** relative to `root`; `..` out of it, an absolute path, or any
+  symlink component is `cwd_outside_root`. The supervisor opens the directory
+  one component at a time without following symlinks and starts the command
+  in that pinned directory, so a concurrent rename or symlink swap cannot move
+  it outside the root.
 - **Environment:** exactly the base environment above plus `--env`. Nothing
   from the host is sent.
 - **Cancellation:** SIGINT/SIGTERM to the CLI forwards that signal to the
@@ -111,32 +114,54 @@ gitmoot runs every command under a small supervisor (`python3 -c`, embedded in
 the binary as `internal/cli/workspace_supervisor.py`). envd starts the
 supervisor with a stdin pipe; the CLI feeds it through envd `SendInput` with
 framed messages: a heartbeat every 2 s, the command's stdin (`--stdin`), and a
-kill request on SIGINT/SIGTERM. The command runs in its own session and process
-group. When no frame arrives for 15 s, or the pipe closes, the supervisor kills
-the whole group with SIGKILL. When the command ends, anything left in its group
-is killed too, so nothing outlives the exec. The supervisor's exit status is
-the command's, and it reports `{exit_code, signal, timed_out, error}` as a
-trailer on stderr that the CLI strips.
+kill request on SIGINT/SIGTERM (kill requests jump the stdin queue). The
+command runs in its own session and process group. When no frame arrives for
+15 s, or the pipe closes, the supervisor kills the whole group with SIGKILL. A
+SIGTERM, SIGINT or SIGHUP sent to the supervisor itself also kills the group
+before it exits; the CLI never signals the supervisor. A forwarded signal or
+`--timeout` escalates to SIGKILL after the kill grace (3 s), a value the CLI
+owns and passes to the supervisor. When the command ends, anything left in its
+group is killed too, so nothing outlives the exec. The supervisor's exit
+status is the command's, and it reports `{exit_code, signal, timed_out,
+error}` as a trailer on stderr that the CLI strips.
 
 ## Cost
 
 Each workspace reserves one hour up front at the provider's
 `cost_per_hour_usd` (`open` refuses with `cost_cap` if that would pass either
-cap, before anything is provisioned). The provider deadline is set to the end
-of what is reserved (`paid_until`). Ten minutes before it, the daemon settles
-the accrued cost and reserves up to one more hour, then moves the provider
-deadline. When a reservation would pass `max_total_usd` or
-`max_workspace_usd`, the workspace is closed with reason `cost_cap`. Lowering
-`max_total_usd` closes the newest workspaces until the committed total fits.
-Without a running daemon a sandbox ends at `paid_until`: spend never exceeds
-what was reserved.
+cap, before anything is provisioned). The reservation is written, with its
+end `paid_until`, before the provider is called. Every provider deadline
+request (the create and each renewal) is computed right before it is sent so
+the sandbox's deadline lands one minute before `paid_until`; that margin
+absorbs the request's transit, so the provider deadline stays inside the
+funded time. Ten minutes before `paid_until`, the daemon settles the accrued
+cost and reserves up to one more hour, then moves the provider deadline. When
+a reservation would pass `max_total_usd` or `max_workspace_usd`, the
+workspace is closed with reason `cost_cap`. Lowering `max_total_usd` closes
+the newest workspaces until the committed total fits. Without a running
+daemon a sandbox ends before `paid_until`: spend never exceeds what was
+reserved.
 
 Committed spend = settled cost of closed workspaces + full reservations of open
 ones. Both caps are enforced inside the SQL statement that reserves, so
 concurrent opens cannot both pass.
 
-On cloud E2B a sandbox also ends at the team's maximum sandbox length; an exec
-then finds it gone and the workspace closes with reason `provider_gone`.
+**An ambiguous outcome keeps paying.** A reservation is released only by an
+authoritative teardown (the provider confirmed the delete, or a complete
+inventory, as with `local`, shows nothing was allocated) or by a create the
+provider refused outright. Everything else stays reserved, with the workspace
+`closing`:
+
+- a create that failed without a refusal (a 5xx, a lost answer) or an open that
+  died before recording the sandbox ID: the sandbox is looked up by its
+  workspace metadata in the provider's list and torn down if found. E2B's list
+  cannot prove absence, so if it is not found the reservation is held;
+- a delete or re-attach the provider answers inconclusively (E2B answers 404
+  for an expired sandbox, which gitmoot does not treat as proof).
+
+Such a workspace settles once `paid_until` plus 15 minutes (the provider's
+enforcement grace) has passed, because the provider guarantees teardown by
+then. It is recorded `expired`, and the whole reservation is charged.
 
 ## Lifecycle
 
@@ -148,9 +173,10 @@ The daemon (every 30 s, once per process however many repos it watches):
 - closes a ready workspace idle for `idle_timeout` (`idle_timeout`), measured
   from `last_active_at`;
 - settles and renews (above), closing on `cost_cap`, `expired` (past
-  `paid_until`) or `provider_gone`;
+  `paid_until`) or `provider_gone` (`local` only);
 - fails an `open` that never finished within 15 minutes (`open_abandoned`) and
-  retries any close whose teardown the provider did not confirm.
+  retries any close whose teardown the provider did not confirm, settling it
+  as `expired` once the provider deadline guarantee covers it.
 
 It keeps nothing in memory: every pass re-reads the `workspaces` table and
 re-attaches to each sandbox by its recorded id, so a restarted daemon carries

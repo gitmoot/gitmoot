@@ -4,9 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 )
 
 // WorkspaceProcess describes one process of a local remote-workspace instance
@@ -57,4 +61,104 @@ func (b *LocalBackend) StartWorkspaceProcess(instance *Instance, process Workspa
 		return nil, fmt.Errorf("start local workspace command: %w", err)
 	}
 	return cmd, nil
+}
+
+// FindInstanceByJobID returns the instance whose metadata carries jobID, or
+// "" when none does. The instance directory is the whole local inventory, so
+// an empty result proves no such instance exists.
+func (b *LocalBackend) FindInstanceByJobID(jobID string) (string, error) {
+	entries, err := os.ReadDir(b.root)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("scan local execution-backend root: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		meta, err := readLocalMetadata(filepath.Join(b.root, entry.Name()))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("read local execution instance %q: %w", entry.Name(), err)
+		}
+		if meta.JobID == jobID {
+			return meta.ID, nil
+		}
+	}
+	return "", nil
+}
+
+// StopWorkspaceProcesses ends every process working in home (its current
+// directory is home or below it): the workspace supervisors, which kill their
+// command's whole process group on SIGTERM, and any command still inside the
+// tree. Survivors after wait are killed outright. It fails if any remain.
+func StopWorkspaceProcesses(home string, wait time.Duration) error {
+	home = filepath.Clean(home)
+	signalAll := func(sig syscall.Signal) []int {
+		var matched []int
+		entries, _ := os.ReadDir("/proc")
+		for _, entry := range entries {
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil || pid == os.Getpid() {
+				continue
+			}
+			cwd, err := os.Readlink(filepath.Join("/proc", entry.Name(), "cwd"))
+			if err != nil {
+				continue
+			}
+			cwd = strings.TrimSuffix(cwd, " (deleted)")
+			if cwd != home && !strings.HasPrefix(cwd, home+string(filepath.Separator)) {
+				continue
+			}
+			if syscall.Kill(pid, sig) == nil {
+				matched = append(matched, pid)
+			}
+		}
+		return matched
+	}
+	alive := func(pids []int) []int {
+		var left []int
+		for _, pid := range pids {
+			if syscall.Kill(pid, 0) == nil && !processZombie(pid) {
+				left = append(left, pid)
+			}
+		}
+		return left
+	}
+	pids := signalAll(syscall.SIGTERM)
+	deadline := time.Now().Add(wait)
+	for len(alive(pids)) > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if left := alive(pids); len(left) > 0 {
+		for _, pid := range left {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	signalAll(syscall.SIGKILL)
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		left := alive(append(pids, signalAll(0)...))
+		if len(left) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("local workspace processes %v did not exit", left)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// processZombie reports whether pid has exited and only awaits its reaper.
+func processZombie(pid int) bool {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return true
+	}
+	fields := strings.Fields(string(data[strings.LastIndexByte(string(data), ')')+1:]))
+	return len(fields) > 0 && fields[0] == "Z"
 }

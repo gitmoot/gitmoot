@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -32,6 +31,10 @@ type workspaceBackend interface {
 	attach(ctx context.Context, instanceID string) (workspaceSandbox, e2b.State, error)
 	extend(ctx context.Context, instanceID string, ttl time.Duration) (e2b.State, error)
 	destroy(ctx context.Context, instanceID string) (e2b.State, error)
+	// find looks up the instance tagged with workspaceID in the provider's
+	// inventory, for a workspace whose create answer was lost. authoritative
+	// reports that an empty result proves nothing was allocated.
+	find(ctx context.Context, workspaceID string) (instanceID string, authoritative bool, err error)
 }
 
 // workspaceSandbox is one attached workspace instance.
@@ -42,7 +45,6 @@ type workspaceSandbox interface {
 	Start(ctx context.Context, request e2b.StartRequest) (workspaceStream, error)
 	Run(ctx context.Context, request e2b.StartRequest) (execbackend.ExecResult, error)
 	SendInput(ctx context.Context, pid int, data []byte) error
-	SendSignal(ctx context.Context, pid int, signal e2b.Signal) error
 }
 
 type workspaceStream interface {
@@ -74,6 +76,13 @@ func (r remoteWorkspaceBackend) extend(ctx context.Context, instanceID string, t
 
 func (r remoteWorkspaceBackend) destroy(ctx context.Context, instanceID string) (e2b.State, error) {
 	return r.backend.DestroyWorkspace(ctx, instanceID)
+}
+
+// find lists the account's sandboxes. E2B's list cannot prove absence, so an
+// empty result is never authoritative.
+func (r remoteWorkspaceBackend) find(ctx context.Context, workspaceID string) (string, bool, error) {
+	id, err := r.backend.FindWorkspace(ctx, workspaceID)
+	return id, false, err
 }
 
 type remoteWorkspaceSandbox struct{ *remoteexec.Workspace }
@@ -125,11 +134,33 @@ func (l localWorkspaceBackend) extend(ctx context.Context, instanceID string, _ 
 	return e2b.Present, nil
 }
 
+// destroy stops every process of the instance, then removes it. Removing
+// the directory alone would leave a running command (and the host exec still
+// feeding its watchdog) alive after close reported the workspace closed.
 func (l localWorkspaceBackend) destroy(ctx context.Context, instanceID string) (e2b.State, error) {
+	instance, err := l.backend.Attach(ctx, instanceID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return e2b.Unknown, err
+	}
+	if err == nil {
+		home, err := l.backend.InstanceHome(instance)
+		if err != nil {
+			return e2b.Unknown, err
+		}
+		if err := execbackend.StopWorkspaceProcesses(home, workspaceKillGrace+2*time.Second); err != nil {
+			return e2b.Unknown, err
+		}
+	}
 	if err := l.backend.Destroy(ctx, &execbackend.Instance{ID: instanceID}); err != nil {
 		return e2b.Unknown, err
 	}
 	return e2b.Gone, nil
+}
+
+// find scans the local instances, which is a complete inventory.
+func (l localWorkspaceBackend) find(_ context.Context, workspaceID string) (string, bool, error) {
+	id, err := l.backend.FindInstanceByJobID(execbackend.WorkspaceJobIDPrefix + workspaceID)
+	return id, true, err
 }
 
 func (l localWorkspaceBackend) sandbox(instance *execbackend.Instance) (*localWorkspaceSandbox, error) {
@@ -285,14 +316,6 @@ func (s *localWorkspaceSandbox) SendInput(_ context.Context, pid int, data []byt
 	}
 	_, err := stdin.Write(data)
 	return err
-}
-
-func (s *localWorkspaceSandbox) SendSignal(_ context.Context, pid int, signal e2b.Signal) error {
-	sig := syscall.SIGTERM
-	if signal == e2b.SignalKill {
-		sig = syscall.SIGKILL
-	}
-	return syscall.Kill(pid, sig)
 }
 
 // workspaceTail passes output through and keeps a bounded tail of it.

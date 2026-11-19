@@ -279,13 +279,24 @@ func (s *Store) BeginWorkspaceClose(ctx context.Context, id, reason string) (boo
 }
 
 // FinishWorkspaceClose settles a closing workspace into closed or failed with
-// its final accrued cost. Only a closing workspace can finish.
-func (s *Store) FinishWorkspaceClose(ctx context.Context, id, state string, accruedUSD float64, closedAt time.Time) error {
+// its final accrued cost. Only a closing workspace can finish. A non-empty
+// reason replaces close_reason (a close settled by the provider's deadline
+// guarantee rather than a confirmed teardown is recorded as expired).
+func (s *Store) FinishWorkspaceClose(ctx context.Context, id, state string, accruedUSD float64, closedAt time.Time, reason string) error {
 	if state != WorkspaceStateClosed && state != WorkspaceStateFailed {
 		return fmt.Errorf("workspace close state %q is not terminal", state)
 	}
-	return s.updateOneWorkspace(ctx, `UPDATE workspaces SET state = ?, cost_accrued_usd = ?, closed_at = ?
-		WHERE id = ? AND state = 'closing'`, state, accruedUSD, formatWorkspaceTime(closedAt), id)
+	return s.updateOneWorkspace(ctx, `UPDATE workspaces SET state = ?, cost_accrued_usd = ?, closed_at = ?,
+		close_reason = CASE WHEN ? != '' THEN ? ELSE close_reason END
+		WHERE id = ? AND state = 'closing'`, state, accruedUSD, formatWorkspaceTime(closedAt), reason, reason, id)
+}
+
+// RecordWorkspaceInstance records a sandbox found for a workspace that never
+// recorded one (its create's answer was lost, or open died first), so the
+// close can tear it down.
+func (s *Store) RecordWorkspaceInstance(ctx context.Context, id, instanceID string) error {
+	return s.updateOneWorkspace(ctx, `UPDATE workspaces SET provider_instance_id = ?
+		WHERE id = ? AND provider_instance_id = '' AND state IN ('opening', 'closing')`, instanceID, id)
 }
 
 func (s *Store) updateOneWorkspace(ctx context.Context, query string, args ...any) error {

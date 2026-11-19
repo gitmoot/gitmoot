@@ -39,7 +39,46 @@ const (
 	workspaceOpenAbandonedAfter = 15 * time.Minute
 	// workspaceLogCopyLimit bounds what close copies to the host.
 	workspaceLogCopyLimit = 1 << 30
+	// workspaceDeadlineMargin is how far before paid_until every provider
+	// deadline request aims. A TTL is applied when the request arrives, so the
+	// margin absorbs the request's transit (the E2B client bounds one control
+	// request at 15s) and keeps the provider deadline inside the funded time.
+	workspaceDeadlineMargin = time.Minute
+	// workspaceExpiryGrace is how long after paid_until gitmoot still treats a
+	// sandbox as possibly alive: the provider's own enforcement latency, the
+	// same bound the job reaper uses (remote.Backend.ProviderTTLGrace). After
+	// it, the provider guarantees the sandbox is gone, so a workspace whose
+	// teardown was never confirmed can be settled.
+	workspaceExpiryGrace = 15 * time.Minute
 )
+
+// workspaceProviderDeadline is the absolute deadline every provider request
+// for w aims at. It derives from paid_until alone, which is recorded before
+// any create or extension, so a crash cannot lose the bound.
+func workspaceProviderDeadline(paidUntil time.Time) time.Time {
+	return paidUntil.Add(-workspaceDeadlineMargin)
+}
+
+// workspaceTTLUntil is the TTL to send now so the provider deadline lands at
+// workspaceProviderDeadline(paidUntil): whole seconds, rounded down, never
+// above the provider's per-request ceiling.
+func workspaceTTLUntil(paidUntil time.Time) (time.Duration, error) {
+	ttl := workspaceProviderDeadline(paidUntil).Sub(workspaceNow()).Truncate(time.Second)
+	if ttl > workspaceReservePeriod {
+		ttl = workspaceReservePeriod
+	}
+	if ttl < time.Second {
+		return 0, fmt.Errorf("no funded time is left before %s", paidUntil.UTC().Format(time.RFC3339))
+	}
+	return ttl, nil
+}
+
+// workspaceProviderExpired reports whether the provider guarantees every
+// sandbox w could hold is gone at now: its funded deadline plus the
+// provider's enforcement grace has passed.
+func workspaceProviderExpired(w db.Workspace, now time.Time) bool {
+	return !now.Before(w.PaidUntil.Add(workspaceExpiryGrace))
+}
 
 // Close reasons the daemon and CLI record.
 const (
@@ -78,10 +117,17 @@ type workspaceCloseRecord struct {
 
 // closeWorkspace closes one workspace: it records the reason (the first one
 // wins), copies the VM's logs and a summary of the work tree to
-// <home>/workspaces/<id>/, destroys the sandbox, and settles the ledger. A
-// teardown the provider cannot confirm leaves the workspace closing, and the
-// daemon retries it; the provider deadline (paid_until) bounds the spend
-// either way.
+// <home>/workspaces/<id>/, destroys the sandbox, and settles the ledger.
+//
+// AN AMBIGUOUS OUTCOME KEEPS PAYING. The reservation is released only by an
+// authoritative teardown (the provider confirmed the delete, or an
+// authoritative inventory shows nothing was allocated), or once the funded
+// provider deadline plus its enforcement grace has passed; that late
+// settlement charges the whole reservation. Until then the workspace stays
+// closing with its full reservation committed, and the daemon retries. An
+// empty provider_instance_id is not evidence: a create whose response was
+// lost, or an open that died before recording the ID, may still have a
+// sandbox billing, so it is looked up by its workspace metadata first.
 func closeWorkspace(ctx context.Context, store *db.Store, paths config.Paths, id, reason string, log io.Writer) error {
 	workspace, err := store.GetWorkspace(ctx, id)
 	if err != nil {
@@ -110,48 +156,78 @@ func closeWorkspace(ctx context.Context, store *db.Store, paths config.Paths, id
 	if workspace.CloseReason == workspaceReasonOpenFailed || workspace.CloseReason == workspaceReasonOpenAbandoned {
 		outcome = db.WorkspaceStateFailed
 	}
-	if workspace.ProviderInstanceID == "" {
-		// The provider never returned a sandbox (or open died before recording
-		// it). Nothing can be copied or destroyed; a sandbox created in that gap
-		// is retired by its provider deadline, which its reservation covers.
-		outcome = db.WorkspaceStateFailed
-		record.LogsError = "no sandbox was recorded"
-	} else {
-		provider, err := newWorkspaceProvider(paths, workspace.Provider)
-		if err != nil {
-			return fmt.Errorf("close workspace %s: %w", id, err)
+	// settle finishes the close. expired settles by the provider's deadline
+	// guarantee rather than a confirmed teardown: it charges the whole
+	// reservation and records reason expired.
+	settle := func(expired bool) error {
+		now := workspaceNow().UTC()
+		accrued := workspaceAccruedUSD(workspace, now)
+		finalReason := ""
+		if expired {
+			accrued = max(accrued, workspace.CostReservedUSD)
+			finalReason = workspaceReasonExpired
+			record.Reason = workspaceReasonExpired
 		}
-		sandbox, state, attachErr := provider.backend.attach(ctx, workspace.ProviderInstanceID)
+		record.State, record.ClosedAt, record.CostAccruedUSD = outcome, now.Format(time.RFC3339), accrued
+		if encoded, err := json.MarshalIndent(record, "", "  "); err == nil {
+			_ = os.WriteFile(filepath.Join(hostDir, "close.json"), append(encoded, '\n'), 0o600)
+		}
+		return store.FinishWorkspaceClose(ctx, id, outcome, accrued, now, finalReason)
+	}
+	// pending leaves the workspace closing with its reservation, unless the
+	// provider's deadline guarantee now covers it.
+	pending := func(cause error) error {
+		if workspaceProviderExpired(workspace, workspaceNow()) {
+			if record.LogsError == "" {
+				record.LogsError = cause.Error()
+			}
+			return settle(true)
+		}
+		return fmt.Errorf("close workspace %s: still reserved until teardown is confirmed or the provider deadline %s passes: %w",
+			id, workspace.PaidUntil.Add(workspaceExpiryGrace).UTC().Format(time.RFC3339), cause)
+	}
+	provider, err := newWorkspaceProvider(paths, workspace.Provider)
+	if err != nil {
+		return pending(err)
+	}
+	instanceID := workspace.ProviderInstanceID
+	if instanceID == "" {
+		found, authoritative, err := provider.backend.find(ctx, workspace.ID)
 		switch {
-		case attachErr == nil:
-			if err := copyWorkspaceLogs(ctx, sandbox, workspace, hostDir); err != nil {
-				record.LogsError = err.Error()
-				writeLine(log, "workspace %s: copying logs failed before teardown: %v", id, err)
-			} else {
-				record.LogsCopied = true
+		case err != nil:
+			return pending(fmt.Errorf("look up the workspace's sandbox: %w", err))
+		case found != "":
+			if err := store.RecordWorkspaceInstance(ctx, id, found); err != nil {
+				return err
 			}
-		case state == e2b.Gone:
+			instanceID = found
+		case authoritative:
+			// The inventory is complete: nothing was allocated.
 			outcome = db.WorkspaceStateFailed
-			record.LogsError = "the sandbox was already gone"
+			record.LogsError = "no sandbox was allocated"
+			return settle(false)
 		default:
-			// Unreachable is not gone: tear it down anyway so it stops costing.
-			record.LogsError = attachErr.Error()
-			writeLine(log, "workspace %s: cannot reach the sandbox to copy logs: %v", id, attachErr)
-		}
-		if state != e2b.Gone {
-			destroyed, err := provider.backend.destroy(ctx, workspace.ProviderInstanceID)
-			if err != nil || destroyed != e2b.Gone {
-				return fmt.Errorf("close workspace %s: the provider did not confirm teardown (%s): %v", id, destroyed, err)
-			}
+			return pending(errors.New("no sandbox was recorded and the provider inventory cannot prove none exists"))
 		}
 	}
-	now := workspaceNow().UTC()
-	accrued := workspaceAccruedUSD(workspace, now)
-	record.State, record.ClosedAt, record.CostAccruedUSD = outcome, now.Format(time.RFC3339), accrued
-	if encoded, err := json.MarshalIndent(record, "", "  "); err == nil {
-		_ = os.WriteFile(filepath.Join(hostDir, "close.json"), append(encoded, '\n'), 0o600)
+	sandbox, _, attachErr := provider.backend.attach(ctx, instanceID)
+	if attachErr == nil {
+		if err := copyWorkspaceLogs(ctx, sandbox, workspace, hostDir); err != nil {
+			record.LogsError = err.Error()
+			writeLine(log, "workspace %s: copying logs failed before teardown: %v", id, err)
+		} else {
+			record.LogsCopied = true
+		}
+	} else {
+		// Unreachable is not gone: tear it down anyway so it stops costing.
+		record.LogsError = attachErr.Error()
+		writeLine(log, "workspace %s: cannot reach the sandbox to copy logs: %v", id, attachErr)
 	}
-	return store.FinishWorkspaceClose(ctx, id, outcome, accrued, now)
+	destroyed, err := provider.backend.destroy(ctx, instanceID)
+	if err != nil || destroyed != e2b.Gone {
+		return pending(fmt.Errorf("the provider did not confirm teardown (%s): %v", destroyed, err))
+	}
+	return settle(false)
 }
 
 // workspaceLogScript writes a summary of the work tree beside the exec logs
@@ -381,11 +457,20 @@ func renewWorkspace(ctx context.Context, store *db.Store, provider *workspacePro
 	if err != nil {
 		return "", fmt.Errorf("renew workspace %s: %w", w.ID, err)
 	}
-	state, err := provider.backend.extend(ctx, w.ProviderInstanceID, paidUntil.Sub(now))
+	// The TTL is computed right before the request from the funded deadline,
+	// not from the sweep's earlier now, so the provider deadline stays inside
+	// what was just reserved.
+	ttl, err := workspaceTTLUntil(paidUntil)
+	if err != nil {
+		return "", fmt.Errorf("renew workspace %s: %w", w.ID, err)
+	}
+	state, err := provider.backend.extend(ctx, w.ProviderInstanceID, ttl)
 	if state == e2b.Gone {
 		return workspaceReasonProviderGone, nil
 	}
 	if err != nil {
+		// The reservation stays extended: an unconfirmed extension may still
+		// have moved the provider deadline, so it is paid for.
 		return "", fmt.Errorf("renew workspace %s: extend the provider deadline: %w", w.ID, err)
 	}
 	return "", nil

@@ -66,7 +66,7 @@ func TestWorkspaceLedgerEnforcesBothCapsAndOneOpenPerSubject(t *testing.T) {
 	if began, _ := store.BeginWorkspaceClose(ctx, "ws-a", "other"); began {
 		t.Fatal("a second close reason replaced the first")
 	}
-	if err := store.FinishWorkspaceClose(ctx, "ws-a", WorkspaceStateClosed, 1.5, now.Add(time.Hour)); err != nil {
+	if err := store.FinishWorkspaceClose(ctx, "ws-a", WorkspaceStateClosed, 1.5, now.Add(time.Hour), ""); err != nil {
 		t.Fatal(err)
 	}
 	if committed, _ := store.WorkspaceCommittedUSD(ctx); committed != 1.5+4+4 {

@@ -28,7 +28,9 @@ func TestClientConnectReattachesWithSandboxCredential(t *testing.T) {
 	if err != nil || state != Present || sandbox.ID != "sbx-live" || sandbox.Domain != "example.test" || credential.token != "envd-token" {
 		t.Fatalf("Connect = %+v %v %v", sandbox, state, err)
 	}
-	if _, _, state, err := client.Connect(context.Background(), "sbx-gone"); err == nil || state != Gone {
+	// A per-ID 404 stays inconclusive, the shared client's fail-closed rule:
+	// the workspace ledger settles such a sandbox by its funded deadline.
+	if _, _, state, err := client.Connect(context.Background(), "sbx-gone"); err == nil || state != Unknown {
 		t.Fatalf("Connect gone = %v %v", state, err)
 	}
 	if _, _, state, err := client.Connect(context.Background(), "sbx-insecure"); err == nil || state != Unknown {
@@ -36,7 +38,7 @@ func TestClientConnectReattachesWithSandboxCredential(t *testing.T) {
 	}
 }
 
-func TestEnvdSendInputAndSignalUseConnectUnaryJSON(t *testing.T) {
+func TestEnvdSendInputUsesConnectUnaryJSON(t *testing.T) {
 	type call struct {
 		path string
 		body map[string]any
@@ -49,10 +51,6 @@ func TestEnvdSendInputAndSignalUseConnectUnaryJSON(t *testing.T) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		calls <- call{path: r.URL.Path, body: body}
-		if r.URL.Path == "/process.Process/SendSignal" {
-			http.Error(w, `{"code":"not_found"}`, http.StatusNotFound)
-			return
-		}
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	defer server.Close()
@@ -66,21 +64,4 @@ func TestEnvdSendInputAndSignalUseConnectUnaryJSON(t *testing.T) {
 	if got.path != "/process.Process/SendInput" || process["pid"] != 42.0 || input["stdin"] != "aGk=" {
 		t.Fatalf("SendInput = %+v", got)
 	}
-	err := envd.SendSignal(context.Background(), 42, SignalKill)
-	got = <-calls
-	if got.path != "/process.Process/SendSignal" || got.body["signal"] != "SIGNAL_SIGKILL" {
-		t.Fatalf("SendSignal = %+v", got)
-	}
-	var status *HTTPStatusError
-	if err == nil || !asHTTPStatus(err, &status) || status.StatusCode != http.StatusNotFound {
-		t.Fatalf("SendSignal error = %v", err)
-	}
-}
-
-func asHTTPStatus(err error, target **HTTPStatusError) bool {
-	status, ok := err.(*HTTPStatusError)
-	if ok {
-		*target = status
-	}
-	return ok
 }

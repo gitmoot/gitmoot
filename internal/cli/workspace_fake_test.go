@@ -65,11 +65,16 @@ type fakeWorkspaceCloud struct {
 	control   *httptest.Server
 	envd      *httptest.Server
 
-	mu        sync.Mutex
-	created   int
-	sandboxes map[string]*fakeWorkspaceSandbox
-	procs     map[int]*fakeWorkspaceProc
-	events    []string
+	mu      sync.Mutex
+	created int
+	// createLost makes a create allocate a sandbox and then answer 503, the
+	// lost-answer case; listLost also hides such sandboxes from the list.
+	createLost bool
+	listLost   bool
+	lost       map[string]bool
+	sandboxes  map[string]*fakeWorkspaceSandbox
+	procs      map[int]*fakeWorkspaceProc
+	events     []string
 }
 
 type fakeWorkspaceSandbox struct {
@@ -95,6 +100,7 @@ func newFakeWorkspaceCloud(t *testing.T) *fakeWorkspaceCloud {
 		guestHome: filepath.Join(t.TempDir(), "guest"),
 		sandboxes: map[string]*fakeWorkspaceSandbox{},
 		procs:     map[int]*fakeWorkspaceProc{},
+		lost:      map[string]bool{},
 	}
 	if err := os.MkdirAll(cloud.guestHome, 0o700); err != nil {
 		t.Fatal(err)
@@ -138,6 +144,16 @@ func (c *fakeWorkspaceCloud) sandbox(id string) fakeWorkspaceSandbox {
 		return fakeWorkspaceSandbox{deleted: sandbox.deleted, timeouts: append([]int(nil), sandbox.timeouts...), metadata: sandbox.metadata}
 	}
 	return fakeWorkspaceSandbox{}
+}
+
+// expire retires a sandbox the way the provider does at its deadline: every
+// later per-ID request answers 404.
+func (c *fakeWorkspaceCloud) expire(id string) {
+	c.mu.Lock()
+	if sandbox := c.sandboxes[id]; sandbox != nil {
+		sandbox.deleted = true
+	}
+	c.mu.Unlock()
 }
 
 func (c *fakeWorkspaceCloud) createdCount() int {
@@ -189,10 +205,32 @@ func (c *fakeWorkspaceCloud) serveControl(w http.ResponseWriter, r *http.Request
 		id = fmt.Sprintf("sbx-%d", c.created)
 		c.sandboxes[id] = &fakeWorkspaceSandbox{timeouts: []int{request.Timeout}, metadata: request.Metadata}
 		c.events = append(c.events, "create:"+id)
+		lostAnswer := c.createLost
+		if lostAnswer {
+			c.lost[id] = true
+		}
 		c.mu.Unlock()
+		if lostAnswer {
+			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"sandboxID": id, "templateID": request.TemplateID, "envdAccessToken": "token-" + id, "domain": nil})
+	case r.Method == http.MethodGet && r.URL.Path == "/v2/sandboxes":
+		c.mu.Lock()
+		items := []map[string]any{}
+		for sandboxID, sandbox := range c.sandboxes {
+			if sandbox.deleted || (c.listLost && c.lost[sandboxID]) {
+				continue
+			}
+			items = append(items, map[string]any{"sandboxID": sandboxID, "templateID": "tmpl", "envdVersion": "0.1.0",
+				"startedAt": "2026-11-19T12:00:00Z", "endAt": "2026-11-19T13:00:00Z", "cpuCount": 2, "memoryMB": 1024,
+				"diskSizeMB": 0, "metadata": sandbox.metadata, "state": "running"})
+		}
+		c.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(items)
 	case r.Method == http.MethodGet && suffix == "":
 		c.mu.Lock()
 		sandbox := c.sandboxes[id]
@@ -223,12 +261,13 @@ func (c *fakeWorkspaceCloud) serveControl(w http.ResponseWriter, r *http.Request
 	case r.Method == http.MethodDelete && suffix == "":
 		c.mu.Lock()
 		sandbox := c.sandboxes[id]
-		if sandbox != nil {
+		alreadyGone := sandbox == nil || sandbox.deleted
+		if !alreadyGone {
 			sandbox.deleted = true
 			c.events = append(c.events, "delete:"+id)
 		}
 		c.mu.Unlock()
-		if sandbox == nil {
+		if alreadyGone {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -462,6 +501,8 @@ type workspaceTestEnv struct {
 type workspaceTestConfig struct {
 	rate, maxTotal, maxWorkspace float64
 	idle                         string
+	// local selects [workspaces] provider = "local".
+	local bool
 }
 
 func newWorkspaceTestEnv(t *testing.T, settings workspaceTestConfig) *workspaceTestEnv {
@@ -504,6 +545,9 @@ max_total_usd = %v
 max_workspace_usd = %v
 idle_timeout = %q
 `, keyFile, cloud.control.URL, settings.rate, settings.maxTotal, settings.maxWorkspace, settings.idle))
+	if settings.local {
+		appendWorkspaceConfig(t, env.paths, "provider = \"local\"\n")
+	}
 
 	root := t.TempDir()
 	env.origin = filepath.Join(root, "origin.git")

@@ -50,8 +50,9 @@ var (
 	workspaceTouchInterval = time.Minute
 )
 
-// workspaceKillGrace mirrors the supervisor's KILL_GRACE: SIGKILL follows a
-// forwarded signal after this long.
+// workspaceKillGrace is how long after a forwarded signal or timeout the
+// command's group gets SIGKILL. It is the only copy: the supervisor receives
+// it as kill_grace, and the host backstop is built from the same value.
 const workspaceKillGrace = 3 * time.Second
 
 // workspaceInputChunk bounds one stdin frame.
@@ -285,14 +286,15 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 	}
 	logName := fmt.Sprintf("%s-%d.log", workspaceNow().UTC().Format("20060102T150405.000000000Z"), os.Getpid())
 	config := map[string]any{
-		"root":    workspace.Root,
-		"cwd":     request.Cwd,
-		"env":     env,
-		"argv":    request.Argv,
-		"timeout": request.Timeout.Seconds(),
-		"grace":   workspaceWatchdogGrace.Seconds(),
-		"stdin":   request.Stdin,
-		"log":     path.Join(remoteexec.WorkspaceLogDir(sandbox.Home()), logName),
+		"root":       workspace.Root,
+		"cwd":        request.Cwd,
+		"env":        env,
+		"argv":       request.Argv,
+		"timeout":    request.Timeout.Seconds(),
+		"grace":      workspaceWatchdogGrace.Seconds(),
+		"kill_grace": workspaceKillGrace.Seconds(),
+		"stdin":      request.Stdin,
+		"log":        path.Join(remoteexec.WorkspaceLogDir(sandbox.Home()), logName),
 	}
 	encodedConfig, err := json.Marshal(config)
 	if err != nil {
@@ -334,6 +336,10 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 	sendCtx, stopSending := context.WithCancel(ctx)
 	defer stopSending()
 	pidKnown := make(chan int, 1)
+	// Kill requests have their own queue, which the sender always drains
+	// first: a stdin backlog can delay a kill by at most the one SendInput in
+	// flight, and the supervisor (the watchdog) is never signalled itself.
+	kills := make(chan byte, 1)
 	senderWG.Add(1)
 	go func() {
 		defer senderWG.Done()
@@ -351,8 +357,16 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 		_ = sandbox.SendInput(sendCtx, pid, heartbeat)
 		for {
 			select {
+			case sig := <-kills:
+				_ = sandbox.SendInput(sendCtx, pid, workspaceSessionFrame('K', []byte{sig}))
+				continue
+			default:
+			}
+			select {
 			case <-sendCtx.Done():
 				return
+			case sig := <-kills:
+				_ = sandbox.SendInput(sendCtx, pid, workspaceSessionFrame('K', []byte{sig}))
 			case frame := <-frames:
 				_ = sandbox.SendInput(sendCtx, pid, frame)
 			case <-ticker.C:
@@ -414,9 +428,9 @@ wait:
 			case pid := <-pidKnown:
 				pidKnown <- pid
 				select {
-				case frames <- workspaceSessionFrame('K', []byte{byte(received.(syscall.Signal))}):
+				case kills <- byte(received.(syscall.Signal)):
 				default:
-					_ = sandbox.SendSignal(ctx, pid, e2b.SignalTerm)
+					// A kill is already queued; it covers this one.
 				}
 			default:
 				// Not started yet: drop the request. A process that starts anyway

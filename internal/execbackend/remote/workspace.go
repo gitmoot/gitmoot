@@ -158,11 +158,10 @@ func (b *Backend) DestroyWorkspace(ctx context.Context, sandboxID string) (e2b.S
 	if b == nil {
 		return e2b.Unknown, errors.New("remote execution backend is nil")
 	}
-	state, err := b.client.Delete(ctx, sandboxID)
-	if err != nil && state == e2b.Gone {
-		return e2b.Gone, nil
-	}
-	return state, err
+	// The shared client's rule stands: only a confirmed delete is Gone; a 404
+	// is inconclusive. The workspace ledger settles such a sandbox by its
+	// funded provider deadline instead.
+	return b.client.Delete(ctx, sandboxID)
 }
 
 func (b *Backend) workspaceGuestHome() string {
@@ -233,16 +232,27 @@ func (w *Workspace) SendInput(ctx context.Context, pid int, data []byte) error {
 	return w.envd.SendInput(ctx, pid, data)
 }
 
-// SendSignal signals one workspace process.
-func (w *Workspace) SendSignal(ctx context.Context, pid int, signal e2b.Signal) error {
-	if w == nil || w.envd == nil {
-		return errors.New("workspace is not attached")
-	}
-	return w.envd.SendSignal(ctx, pid, signal)
-}
-
 // Home is the guest home the workspace lives under.
 func (w *Workspace) Home() string { return w.GuestHome }
 
 // Root is the workspace's work tree inside the guest.
 func (w *Workspace) Root() string { return WorkspaceRoot(w.GuestHome) }
+
+// FindWorkspace looks up the sandbox a workspace's create tagged with its
+// workspace ID, for a create whose answer was lost. "" means the provider's
+// list did not show one, which on E2B does not prove none exists.
+func (b *Backend) FindWorkspace(ctx context.Context, workspaceID string) (string, error) {
+	if b == nil {
+		return "", errors.New("remote execution backend is nil")
+	}
+	sandboxes, err := b.client.List(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list sandboxes for workspace %s: %w", workspaceID, err)
+	}
+	for _, sandbox := range sandboxes {
+		if strings.TrimSpace(sandbox.Metadata[metadataWorkspaceID]) == workspaceID && strings.TrimSpace(sandbox.Metadata[metadataJobID]) == WorkspaceJobIDPrefix+workspaceID {
+			return sandbox.ID, nil
+		}
+	}
+	return "", nil
+}

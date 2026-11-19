@@ -384,8 +384,25 @@ func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, req
 		closeErr := closeWorkspace(context.WithoutCancel(ctx), store, paths, workspace.ID, "open_failed", io.Discard)
 		return db.Workspace{}, errors.Join(asWorkspaceError(cause, wsErrProviderUnavailable), closeErr)
 	}
-	instanceID, sandbox, err := provider.backend.provision(ctx, workspace.ID, workspaceReservePeriod)
+	// The create's deadline derives from paid_until, recorded above before the
+	// provider is called, so even a create whose answer is lost is bounded.
+	ttl, err := workspaceTTLUntil(workspace.PaidUntil)
 	if err != nil {
+		return fail(err)
+	}
+	instanceID, sandbox, err := provider.backend.provision(ctx, workspace.ID, ttl)
+	if err != nil {
+		var refused *e2b.RequestRefusedError
+		if errors.As(err, &refused) && refused.Operation == e2b.OperationCreate {
+			// Only a refused create proves nothing was allocated, so only it
+			// releases the reservation at once. Every other failure is
+			// ambiguous and stays reserved (closeWorkspace).
+			if _, beginErr := store.BeginWorkspaceClose(context.WithoutCancel(ctx), workspace.ID, workspaceReasonOpenFailed); beginErr != nil {
+				return db.Workspace{}, errors.Join(asWorkspaceError(err, wsErrProviderUnavailable), beginErr)
+			}
+			finishErr := store.FinishWorkspaceClose(context.WithoutCancel(ctx), workspace.ID, db.WorkspaceStateFailed, 0, workspaceNow(), "")
+			return db.Workspace{}, errors.Join(asWorkspaceError(err, wsErrProviderUnavailable), finishErr)
+		}
 		return fail(err)
 	}
 	if err := store.SetWorkspaceInstance(ctx, workspace.ID, instanceID, sandbox.Root()); err != nil {

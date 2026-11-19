@@ -329,14 +329,6 @@ func (e *Envd) Upload(ctx context.Context, path string, reader io.Reader) error 
 	return nil
 }
 
-// Signal is an envd process signal (process.proto Signal).
-type Signal string
-
-const (
-	SignalTerm Signal = "SIGNAL_SIGTERM"
-	SignalKill Signal = "SIGNAL_SIGKILL"
-)
-
 type processSelector struct {
 	PID int `json:"pid"`
 }
@@ -351,15 +343,6 @@ func (e *Envd) SendInput(ctx context.Context, pid int, data []byte) error {
 	}{Process: processSelector{PID: pid}, Input: struct {
 		Stdin []byte `json:"stdin"`
 	}{Stdin: data}})
-}
-
-// SendSignal delivers signal to one envd process (the process itself, not its
-// group: envd signals the PID it started).
-func (e *Envd) SendSignal(ctx context.Context, pid int, signal Signal) error {
-	return e.unary(ctx, "SendSignal", struct {
-		Process processSelector `json:"process"`
-		Signal  Signal          `json:"signal"`
-	}{Process: processSelector{PID: pid}, Signal: signal})
 }
 
 // unary calls one Connect unary process RPC with the JSON codec. Its
