@@ -438,15 +438,3 @@ func RedactCommentText(value string) string {
 	}
 	return value
 }
-
-// commentRedactionSpans is every [start, end) a comment redactor matches in
-// value, each redactor run over the unredacted text.
-func commentRedactionSpans(value []byte) [][2]int {
-	var spans [][2]int
-	for _, redactor := range commentRedactors {
-		for _, match := range redactor.pattern.FindAllIndex(value, -1) {
-			spans = append(spans, [2]int{match[0], match[1]})
-		}
-	}
-	return spans
-}

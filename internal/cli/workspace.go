@@ -14,8 +14,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -610,17 +612,20 @@ func readWorkspaceOpenRecord(paths config.Paths, id string) (workspaceOpenRecord
 // Require checks (#2704). Each command gets workspaceRequireTimeout (a
 // variable only so the offline tests can shorten it); a failure reports the
 // last workspaceRequireTailBytes of the command's combined output, redacted
-// as it streams (workflow.RedactedTail) so no cut can split a secret.
+// (workspaceRequireTail).
 var workspaceRequireTimeout = 60 * time.Second
 
-const workspaceRequireTailBytes = 2 << 10
+const (
+	workspaceRequireTailBytes    = 2 << 10
+	workspaceRequireCaptureBytes = 64 << 10
+)
 
 // runWorkspaceRequire runs one require command as `bash -lc '<command>'` in
 // the workspace root through runWorkspaceCommand, the exec path. It returns
 // the requirements_unmet error for a command that exited non-zero or timed
 // out (exit 124), or the session's own failure.
 func runWorkspaceRequire(ctx context.Context, store *db.Store, workspace db.Workspace, sandbox workspaceSandbox, command string) (unmet, failure *workspaceError) {
-	output := workflow.NewRedactedTail(workspaceRequireTailBytes)
+	output := &workspaceRequireCapture{max: workspaceRequireCaptureBytes}
 	status, failure := runWorkspaceCommand(ctx, store, workspace, sandbox, workspaceExecRequest{
 		ID: workspace.ID, Cwd: ".", Timeout: workspaceRequireTimeout, Argv: []string{"bash", "-lc", command},
 	}, nil, output, output)
@@ -636,8 +641,68 @@ func runWorkspaceRequire(ctx context.Context, store *db.Store, workspace db.Work
 		exitCode = 124
 		message = fmt.Sprintf("require check %q timed out after %s", command, workspaceRequireTimeout)
 	}
-	tail := output.String()
+	tail := output.tail()
 	return &workspaceError{Code: wsErrRequirementsUnmet, Message: message, FailedCheck: command, ExitCode: &exitCode, OutputTail: &tail}, nil
+}
+
+// workspaceRequireCapture keeps the last max bytes of a check's combined
+// output, remembering whether anything before them was dropped.
+type workspaceRequireCapture struct {
+	mu   sync.Mutex
+	max  int
+	data []byte
+	cut  bool
+}
+
+func (c *workspaceRequireCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.data = append(c.data, p...)
+	if len(c.data) > c.max {
+		c.data = append(c.data[:0], c.data[len(c.data)-c.max:]...)
+		c.cut = true
+	}
+	return len(p), nil
+}
+
+func (c *workspaceRequireCapture) tail() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return workspaceRequireTail(c.data, c.cut)
+}
+
+// workspaceRequireTail is the reported output_tail: the redactors run over
+// whole lines only, then the last workspaceRequireTailBytes are kept.
+//
+// When the capture dropped earlier output, its first line is a fragment whose
+// start (a key such as `password =`, a `ghp_` prefix, an opening quote) may
+// be gone, so no redactor can recognize the rest of that secret. That
+// fragment is dropped whole, up to its newline, before redacting; a capture
+// with no newline at all reports nothing. Cutting the already redacted text
+// afterwards cannot expose a secret, because its bytes are already replaced.
+//
+// This is defence in depth, not a boundary: the seat that ran open can run
+// the same command with `workspace exec` and read its raw output. A secret
+// that spans several lines and lost its first line to the capture cut (a PEM
+// body, for one) is not recognized on its later lines.
+func workspaceRequireTail(data []byte, cut bool) string {
+	text := string(data)
+	if cut {
+		newline := strings.IndexByte(text, '\n')
+		if newline < 0 {
+			return ""
+		}
+		text = text[newline+1:]
+	}
+	text = workflow.RedactCommentText(text)
+	if len(text) <= workspaceRequireTailBytes {
+		return text
+	}
+	text = text[len(text)-workspaceRequireTailBytes:]
+	for len(text) > 0 && !utf8.RuneStart(text[0]) {
+		text = text[1:]
+	}
+	return text
 }
 
 func newWorkspaceID() (string, error) {
