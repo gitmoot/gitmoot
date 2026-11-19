@@ -98,10 +98,18 @@ func TestRemoteAgentForBindingFailsClosed(t *testing.T) {
 			t.Errorf("%s = %+v, %v; want pane %s", tc.binding, got, ok, tc.wantPane)
 		}
 	}
-	// A label two saved machines share names neither.
+	// A label two saved machines share names neither, even when both have the agent.
 	twinMachines := append(machines, savedMachine{ID: "other", Label: "jerrys-mac-studio"})
-	if got, ok := remoteAgentForBinding(live, twinMachines, "agent:jerrys-mac-studio/mac-studio"); ok {
+	withTwin := append(append([]registeredAgent{}, live...), agent("other", "mac-studio"))
+	if got, ok := remoteAgentForBinding(withTwin, twinMachines, "agent:jerrys-mac-studio/mac-studio"); ok {
 		t.Errorf("ambiguous machine label resolved to %+v", got)
+	}
+	// The machine id Herdr reports wins over the name: an entry named for the
+	// studio but reported from another machine is not the studio's agent.
+	spoofed := agent(studioID, "mac-studio")
+	spoofed.MachineID = h2ID
+	if got, ok := remoteAgentForBinding([]registeredAgent{spoofed}, machines, "agent:jerrys-mac-studio/mac-studio"); ok {
+		t.Errorf("agent reported from %s resolved for the studio: %+v", h2ID, got)
 	}
 	// An unqualified agent binding never reaches a remote agent of that name.
 	if got, ok := registeredAgentForBinding([]registeredAgent{agent(studioID, "mac-studio")}, "agent:mac-studio"); ok {
