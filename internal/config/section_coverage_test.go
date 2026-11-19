@@ -52,6 +52,7 @@ var (
 		"review_router.go::LoadReviewRouterSettings",
 		"runtime_registry.go::LoadRuntimeOverrides",
 		"transcripts.go::LoadTranscriptsConfig",
+		"workspaces.go::LoadWorkspacesPolicy", // TestLoadWorkspacesPolicyRefusesInvalidValues (#2678)
 	}
 
 	// unpinnedSectionHeaderSites key off prefixes, repo-scoped names or no fixed
@@ -156,11 +157,11 @@ func TestSectionHeaderCoverageIsDerivedNotAsserted(t *testing.T) {
 	if want := len(pinnedSectionHeaderSites) + len(unpinnedSectionHeaderSites); len(sites) != want {
 		t.Errorf("discovered %d sectionHeader call sites, classified %d: the lists and the package disagree", len(sites), want)
 	}
-	// 20 since #2677 added pr_stalled.go (19 after #2590 deleted parallel_sessions.go; 20 after #2588 deleted staged_review.go; 21 after #2585 deleted heartbeats.go; 22 after #2584 deleted router.go; 23 after #2542 deleted github_remote.go; 24 after #2375 added
+	// 21 since #2678 added workspaces.go (20 after #2677 added pr_stalled.go; 19 after #2590 deleted parallel_sessions.go; 20 after #2588 deleted staged_review.go; 21 after #2585 deleted heartbeats.go; 22 after #2584 deleted router.go; 23 after #2542 deleted github_remote.go; 24 after #2375 added
 	// worktrees.go::LoadWorktreeRoot; 23 after #2360 added cleanup_budget.go; 22
 	// after #2203 deleted internal/config/implement_base.go).
-	if distinctFiles != 20 {
-		t.Errorf("sectionHeader call sites span %d files, want 20: update this expectation together with the lists above", distinctFiles)
+	if distinctFiles != 21 {
+		t.Errorf("sectionHeader call sites span %d files, want 21: update this expectation together with the lists above", distinctFiles)
 	}
 }
 

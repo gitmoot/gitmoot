@@ -2314,6 +2314,9 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if err := reconcileExecBackendInventory(ctx, worker, stdout, now); err != nil {
 		writeLine(stdout, "execution backend reconciliation failed: %v", err)
 	}
+	// Remote workspaces (#2678): renew, settle and close them. Global, so it
+	// runs once per interval however many repos tick; logged, never fatal.
+	sweepWorkspacesTick(ctx, worker, stdout, now)
 	// Checkout-mutating maintenance (advancement/merge retries, delegation
 	// worktree reclaims) is gated on the ACTUAL mutation hazard — each
 	// candidate is skipped while an in-flight job holds the checkout key the

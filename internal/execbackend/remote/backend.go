@@ -82,6 +82,9 @@ type Options struct {
 	// tree's in-flight job, or one that has already left the running state. Nil
 	// renews on the deadline alone.
 	ShouldRenewTTL func(jobID string) bool
+	// WorkspaceGuestHome is the guest home remote workspaces live under. Empty
+	// is DefaultWorkspaceGuestHome; an offline fake provider sets its own.
+	WorkspaceGuestHome string
 }
 
 // Backend owns E2B sandboxes for one daemon process.
@@ -97,6 +100,7 @@ type Backend struct {
 	ownerAlive   func(pid int, bootID, startTime string) bool
 
 	shouldRenewTTL func(jobID string) bool
+	guestHome      string
 
 	mu        sync.Mutex
 	sandboxes map[string]*sandboxState
@@ -138,6 +142,7 @@ func NewBackend(client *e2b.Client, options Options) (*Backend, error) {
 		templateID:     templateID,
 		envd:           options.Envd,
 		shouldRenewTTL: options.ShouldRenewTTL,
+		guestHome:      strings.TrimSpace(options.WorkspaceGuestHome),
 		bootID:         hostBootID(),
 		pidNamespace:   processPIDNamespace(),
 		ownerPID:       pid,
@@ -486,7 +491,7 @@ func (b *Backend) SyncIn(ctx context.Context, instance *execbackend.Instance, ma
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if err := uploadWorkspaceArchive(ctx, state.envd, history, inputPatch); err != nil {
+	if err := uploadWorkspaceArchive(ctx, state.envd, syncArchivePath, history, inputPatch); err != nil {
 		return fmt.Errorf("upload remote execution workspace: %w", err)
 	}
 	result, err := runEnvd(ctx, state.envd, e2b.StartRequest{
@@ -845,7 +850,7 @@ func runEnvd(ctx context.Context, envd *e2b.Envd, request e2b.StartRequest) (exe
 	return stream.Wait()
 }
 
-func uploadWorkspaceArchive(ctx context.Context, envd *e2b.Envd, history string, inputPatch []byte) error {
+func uploadWorkspaceArchive(ctx context.Context, envd *e2b.Envd, archivePath, history string, inputPatch []byte) error {
 	reader, writer := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
@@ -853,7 +858,7 @@ func uploadWorkspaceArchive(ctx context.Context, envd *e2b.Envd, history string,
 		_ = writer.CloseWithError(archiveErr)
 		done <- archiveErr
 	}()
-	uploadErr := envd.Upload(ctx, syncArchivePath, reader)
+	uploadErr := envd.Upload(ctx, archivePath, reader)
 	_ = reader.CloseWithError(uploadErr)
 	archiveErr := <-done
 	return errors.Join(uploadErr, archiveErr)

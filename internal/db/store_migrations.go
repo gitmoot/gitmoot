@@ -3430,4 +3430,39 @@ CREATE INDEX idx_jobs_workflow_id ON jobs(workflow_id, state, created_at, update
 	`
 CREATE INDEX IF NOT EXISTS idx_jobs_review_repo_pr ON jobs(repo, pull_request) WHERE type = 'review';
 	`,
+	// #2678 remote workspaces: one provider sandbox per (seat, repo, issue|pr).
+	// The partial unique index is the one-open-workspace rule, so two
+	// concurrent `workspace open` calls cannot both win. Cost columns are the
+	// time-based ledger: cost_reserved_usd is every hour reserved so far,
+	// paid_until is where that reservation ends (the provider TTL never
+	// passes it), and cost_accrued_usd is the settled spend. linked_pr is the
+	// pull request an issue workspace's branch was later opened as.
+	`
+CREATE TABLE workspaces (
+	id TEXT PRIMARY KEY,
+	seat TEXT NOT NULL CHECK(seat != ''),
+	repo TEXT NOT NULL CHECK(repo != ''),
+	issue INTEGER NOT NULL DEFAULT 0 CHECK(issue >= 0),
+	pr INTEGER NOT NULL DEFAULT 0 CHECK(pr >= 0),
+	branch TEXT NOT NULL DEFAULT '',
+	base TEXT NOT NULL DEFAULT '',
+	base_ref TEXT NOT NULL DEFAULT '',
+	provider TEXT NOT NULL CHECK(provider != ''),
+	provider_instance_id TEXT NOT NULL DEFAULT '',
+	root TEXT NOT NULL,
+	state TEXT NOT NULL CHECK(state IN ('opening', 'ready', 'closing', 'closed', 'failed')),
+	created_at TEXT NOT NULL,
+	last_active_at TEXT NOT NULL,
+	closed_at TEXT NOT NULL DEFAULT '',
+	close_reason TEXT NOT NULL DEFAULT '',
+	cost_rate_usd_per_hour REAL NOT NULL DEFAULT 0 CHECK(cost_rate_usd_per_hour >= 0),
+	cost_reserved_usd REAL NOT NULL DEFAULT 0 CHECK(cost_reserved_usd >= 0),
+	cost_accrued_usd REAL NOT NULL DEFAULT 0 CHECK(cost_accrued_usd >= 0),
+	paid_until TEXT NOT NULL,
+	linked_pr INTEGER NOT NULL DEFAULT 0,
+	CHECK((issue > 0) != (pr > 0))
+);
+CREATE UNIQUE INDEX idx_workspaces_one_open ON workspaces(seat, repo, issue, pr) WHERE state IN ('opening', 'ready', 'closing');
+CREATE INDEX idx_workspaces_state ON workspaces(state);
+	`,
 }

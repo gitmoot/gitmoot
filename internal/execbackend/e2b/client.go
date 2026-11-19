@@ -427,6 +427,36 @@ func (c *Client) Get(ctx context.Context, sandboxID string) (Observation, error)
 	return Observation{State: Present, Sandbox: &sandbox}, nil
 }
 
+// Connect re-attaches to a running sandbox from its ID alone: it reads the
+// sandbox detail, whose envdAccessToken is the same sandbox-scoped credential
+// Create returned. Nothing is persisted on the host; a process that holds only
+// the ID asks the control plane again. A sandbox that is gone reports Gone; a
+// detail without a token is refused, so data-plane calls never go out
+// unauthenticated.
+func (c *Client) Connect(ctx context.Context, sandboxID string) (Sandbox, EnvdCredential, State, error) {
+	path, err := sandboxPath(sandboxID, "")
+	if err != nil {
+		return Sandbox{}, EnvdCredential{}, Unknown, err
+	}
+	var response createResponse
+	status, _, err := c.doJSONState(ctx, http.MethodGet, path, nil, http.StatusOK, &response)
+	if err != nil {
+		return Sandbox{}, EnvdCredential{}, status, err
+	}
+	if strings.TrimSpace(response.ID) == "" {
+		return Sandbox{}, EnvdCredential{}, Unknown, c.errorf(nil, "connect sandbox: malformed response: missing sandboxID")
+	}
+	if strings.TrimSpace(response.EnvdAccessToken) == "" {
+		return Sandbox{}, EnvdCredential{}, Unknown, c.errorf(nil, "connect sandbox: detail is missing envdAccessToken; this provider cannot re-attach to a secure sandbox")
+	}
+	domain := DefaultSandboxDomain
+	if response.Domain != nil && strings.TrimSpace(*response.Domain) != "" {
+		domain = strings.TrimSpace(*response.Domain)
+	}
+	response.Sandbox.Domain = domain
+	return response.Sandbox, EnvdCredential{token: response.EnvdAccessToken}, Present, nil
+}
+
 // Delete requests sandbox termination. A successful deletion is Gone; failed
 // or inconclusive communication remains Unknown.
 func (c *Client) Delete(ctx context.Context, sandboxID string) (State, error) {

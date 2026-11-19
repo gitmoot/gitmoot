@@ -51,6 +51,8 @@ var rootCommands = []command{
 	{name: "campaign", summary: "inspect campaigns: sets of runs and notes that belong together", run: runWorkflowJournal},
 	{name: "note", summary: "add and read campaign notes", run: runNote},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},
+	{name: "workspace", summary: "open, run commands in and close remote workspaces for coding seats", run: runWorkspace},
+	{name: "ws", summary: "short forms for the workspace named by $GITMOOT_WORKSPACE", run: runWS},
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {

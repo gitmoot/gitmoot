@@ -47,6 +47,11 @@ func TestMain(m *testing.M) {
 	if home := os.Getenv(daemonRunChildHomeEnv); home != "" {
 		os.Exit(Run([]string{"daemon", "run", "--home", home}, os.Stdout, os.Stderr))
 	}
+	if os.Getenv(workspaceCLIChildEnv) != "" {
+		// A real `gitmoot workspace ...` process for the exec signal tests,
+		// with the offline fake provider's seams (workspace_fake_test.go).
+		os.Exit(runWorkspaceCLIChild(os.Args[1:]))
+	}
 	// Read-only seats (#2314) make a private temp dir under the daemon's
 	// TMPDIR when that is short, else under /tmp. Tests compose many seats and
 	// not all of them run the job-end cleanup, so point TMPDIR at this run's own

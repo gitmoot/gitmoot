@@ -127,15 +127,20 @@ func NewEnvd(sandbox Sandbox, credential EnvdCredential, options EnvdOptions) (*
 }
 
 // StartRequest describes one envd process and its streaming capture. Output
-// receives stdout and stderr in event order while Wait retains separate tails.
+// receives stdout and stderr in event order while Wait retains separate tails;
+// a non-nil ErrOutput receives stderr instead, so the two stay apart. Stdin
+// opens the process's stdin as a pipe fed by SendInput; otherwise the process
+// has no stdin.
 type StartRequest struct {
 	Name           string
 	Args           []string
 	Dir            string
 	Env            []string
 	Output         io.Writer
+	ErrOutput      io.Writer
 	MaxOutputBytes int
 	OnStart        func(pid int)
+	Stdin          bool
 }
 
 // ExitError reports a provider-confirmed non-zero process exit.
@@ -218,7 +223,7 @@ func (e *Envd) Start(ctx context.Context, request StartRequest) (*Stream, error)
 			Env:     env,
 			Dir:     request.Dir,
 		},
-		Stdin: false,
+		Stdin: request.Stdin,
 	})
 	if err != nil {
 		return nil, e.errorf(err, "encode envd Start request")
@@ -324,6 +329,81 @@ func (e *Envd) Upload(ctx context.Context, path string, reader io.Reader) error 
 	return nil
 }
 
+// Signal is an envd process signal (process.proto Signal).
+type Signal string
+
+const (
+	SignalTerm Signal = "SIGNAL_SIGTERM"
+	SignalKill Signal = "SIGNAL_SIGKILL"
+)
+
+type processSelector struct {
+	PID int `json:"pid"`
+}
+
+// SendInput writes data to the stdin of a process started with Stdin.
+func (e *Envd) SendInput(ctx context.Context, pid int, data []byte) error {
+	return e.unary(ctx, "SendInput", struct {
+		Process processSelector `json:"process"`
+		Input   struct {
+			Stdin []byte `json:"stdin"`
+		} `json:"input"`
+	}{Process: processSelector{PID: pid}, Input: struct {
+		Stdin []byte `json:"stdin"`
+	}{Stdin: data}})
+}
+
+// SendSignal delivers signal to one envd process (the process itself, not its
+// group: envd signals the PID it started).
+func (e *Envd) SendSignal(ctx context.Context, pid int, signal Signal) error {
+	return e.unary(ctx, "SendSignal", struct {
+		Process processSelector `json:"process"`
+		Signal  Signal          `json:"signal"`
+	}{Process: processSelector{PID: pid}, Signal: signal})
+}
+
+// unary calls one Connect unary process RPC with the JSON codec. Its
+// deadline is the control-plane request timeout.
+func (e *Envd) unary(ctx context.Context, method string, input any) error {
+	if e == nil {
+		return errors.New("E2B envd client is nil")
+	}
+	payload, err := json.Marshal(input)
+	if err != nil {
+		return e.errorf(err, "encode envd %s request", method)
+	}
+	endpoint, err := e.endpoint("/process.Process/" + method)
+	if err != nil {
+		return err
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, e.requestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return e.errorf(err, "build envd %s request", method)
+	}
+	e.authenticate(req)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("connect-protocol-version", "1")
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return e.errorf(err, "envd %s request failed", method)
+	}
+	defer resp.Body.Close()
+	data, oversized, readErr := readProviderResponseBody(resp.Body)
+	if readErr != nil {
+		return e.errorf(readErr, "envd %s returned HTTP %d and its response could not be read", method, resp.StatusCode)
+	}
+	if oversized {
+		return e.errorf(nil, "envd %s returned HTTP %d with an oversized response", method, resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Operation: "envd_" + strings.ToLower(method), Err: e.errorf(nil, "envd %s returned HTTP %d: %s", method, resp.StatusCode, data)}
+	}
+	return nil
+}
+
 func (e *Envd) readStartStream(reader io.Reader, request StartRequest) (execbackend.ExecResult, error) {
 	result := execbackend.ExecResult{Command: request.Name, Args: append([]string(nil), request.Args...)}
 	stdout := outputTail{max: request.MaxOutputBytes}
@@ -382,7 +462,11 @@ func (e *Envd) readStartStream(reader io.Reader, request StartRequest) (execback
 				}
 			}
 			if len(response.Event.Data.Stderr) > 0 {
-				if err := writeProcessOutput(&stderr, request.Output, response.Event.Data.Stderr); err != nil {
+				errOutput := request.Output
+				if request.ErrOutput != nil {
+					errOutput = request.ErrOutput
+				}
+				if err := writeProcessOutput(&stderr, errOutput, response.Event.Data.Stderr); err != nil {
 					return result, e.errorf(err, "stream envd stderr")
 				}
 			}
