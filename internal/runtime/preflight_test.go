@@ -50,7 +50,9 @@ func (r *contractProbeRunner) Run(ctx context.Context, _ string, command string,
 		case strings.Contains(mode, "unparseable"):
 			return subprocess.Result{Stdout: "???\n"}, nil
 		case strings.Contains(mode, "omp-without-plan"):
-			return subprocess.Result{Stdout: "Usage: omp [options]\n  -p, --print\n  --mode=<value>\n  --approval-mode=<value>\n  --no-session\n"}, nil
+			return subprocess.Result{Stdout: "Usage: omp [options]\n  -p, --print\n  --mode=<value>\n  --approval-mode=<value>\n  --no-session\n  --wait-async\n"}, nil
+		case strings.Contains(mode, "omp-without-wait-async"):
+			return subprocess.Result{Stdout: "Usage: omp [options]\n  -p, --print\n  --mode=<value>\n  --approval-mode=<value>\n  --no-session\n  --plan-yolo\n  --plan-yolo-into\n"}, nil
 		case strings.Contains(mode, "unsupported"):
 			return subprocess.Result{Stdout: "Usage: stub [options]\n  --prompt\n  --output-format\n"}, nil
 		default:
@@ -148,6 +150,22 @@ func TestRuntimePreflightScopesOmpPlanFlagsToPlanJobs(t *testing.T) {
 	err := RuntimeContractDispatchError(agent, plan)
 	if err == nil || !strings.Contains(err.Error(), "--plan-yolo") {
 		t.Fatalf("plan job error = %v, want missing plan flag named", err)
+	}
+}
+
+// TestRuntimePreflightRefusesOmpWithoutWaitAsync: every print-mode run passes
+// --wait-async (#2705), so an omp CLI whose help lacks it must be refused at the
+// capability check, naming the flag, instead of failing per run.
+func TestRuntimePreflightRefusesOmpWithoutWaitAsync(t *testing.T) {
+	checker, _, _ := newContractCheckerForTest(t, "omp-without-wait-async")
+	agent := Agent{Name: "reviewer", Runtime: OmpRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+	got := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
+	if got.State != RuntimeContractUnsupported {
+		t.Fatalf("state = %q, want unsupported when --wait-async is absent: %#v", got.State, got)
+	}
+	err := RuntimeContractDispatchError(agent, got)
+	if err == nil || !strings.Contains(err.Error(), "--wait-async") {
+		t.Fatalf("error = %v, want the missing --wait-async named", err)
 	}
 }
 

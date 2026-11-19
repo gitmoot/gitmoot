@@ -481,7 +481,7 @@ func TestOmpDeliverFreshArgv(t *testing.T) {
 		if _, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "review this PR"}); err != nil {
 			t.Fatalf("Deliver: %v", err)
 		}
-		runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--", "review this PR")
+		runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--wait-async", "--", "review this PR")
 	})
 
 	t.Run("model effort and workspace grants", func(t *testing.T) {
@@ -496,7 +496,7 @@ func TestOmpDeliverFreshArgv(t *testing.T) {
 		if _, err := adapter.Deliver(context.Background(), agent, job); err != nil {
 			t.Fatalf("Deliver: %v", err)
 		}
-		runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session",
+		runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--wait-async",
 			"--add-dir", "/work/out", "--add-dir", "/work/cache", "--add-dir", "/inputs",
 			"--model", "anthropic/claude-opus-4", "--thinking", "high", "--", "implement it")
 	})
@@ -507,7 +507,7 @@ func TestOmpDeliverFreshArgv(t *testing.T) {
 		if _, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "go", Effort: "ludicrous"}); err != nil {
 			t.Fatalf("Deliver: %v", err)
 		}
-		runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--", "go")
+		runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--wait-async", "--", "go")
 	})
 
 	// The FULL model/effort precedence chain, byte-exact: job override > agent
@@ -562,7 +562,7 @@ func TestOmpDeliverFreshArgv(t *testing.T) {
 				if _, err := adapter.Deliver(context.Background(), agent, tc.job); err != nil {
 					t.Fatalf("Deliver: %v", err)
 				}
-				runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session",
+				runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--wait-async",
 					"--model", tc.wantModel, "--thinking", tc.wantEffort, "--", "work")
 			})
 		}
@@ -574,7 +574,7 @@ func TestOmpDeliverFreshArgv(t *testing.T) {
 // resumed session's cwd and leave the job's own worktree clean — a green job with
 // an empty diff.
 func TestOmpDeliverNeverResumes(t *testing.T) {
-	wantArgv := []string{"omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--", "work"}
+	wantArgv := []string{"omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--wait-async", "--", "work"}
 	tests := []struct {
 		name     string
 		ref      string
@@ -634,6 +634,30 @@ func TestOmpDeliverIsSessionless(t *testing.T) {
 	assertOmpPlanArgv(t, argv, false, "")
 }
 
+// TestOmpArgsWaitAsyncBeforeSeparator kills a dropped --wait-async (#2705):
+// without it print mode cancels backgrounded commands and exits mid-run. The
+// flag must be a session flag, exactly once, before `--`, for every seat shape.
+func TestOmpArgsWaitAsyncBeforeSeparator(t *testing.T) {
+	readOnly := ompTestAgent()
+	readOnly.AutonomyPolicy = AutonomyPolicyReadOnly
+	for name, agent := range map[string]Agent{"default": ompTestAgent(), "read-only": readOnly} {
+		argv := ompArgs(agent, "m", "high", "60", true, "", []string{"@/staged/prompt.md"}, "--wait-async")
+		sep := -1
+		for i, tok := range argv {
+			if tok == "--" {
+				sep = i
+				break
+			}
+		}
+		if sep < 0 {
+			t.Fatalf("%s: no -- separator: %v", name, argv)
+		}
+		if got := ompCountToken(argv[:sep], "--wait-async"); got != 1 {
+			t.Fatalf("%s: --wait-async appears %d times before --, want exactly 1: %v", name, got, argv)
+		}
+	}
+}
+
 // TestOmpPlanArgv pins the plan-mode argv byte for byte on BOTH sides of the
 // if-and-only-if: a job that asked for nothing gets no plan flag, a plan job gets
 // --plan-yolo, and a pinned execution model gets --plan-yolo-into directly after
@@ -643,7 +667,7 @@ func TestOmpDeliverIsSessionless(t *testing.T) {
 // and refuted; see the ompRuntimeContract comment). Result.PlanMode is asserted
 // alongside so the durable evidence cannot drift from the argv it describes.
 func TestOmpPlanArgv(t *testing.T) {
-	base := []string{"omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session"}
+	base := []string{"omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--wait-async"}
 	cases := []struct {
 		name         string
 		job          Job
@@ -2041,6 +2065,30 @@ func TestParseOmpStreamJSONRequiresTerminalAgentEnd(t *testing.T) {
 	})
 }
 
+// TestParseOmpStreamJSONNamesAwaitingAsyncWork (#2705): a stream whose LAST
+// agent_end yielded with awaitingAsyncWork:true means omp exited while a
+// backgrounded command was still running, and the error must say so. A plain
+// isTerminal:false end keeps the continuation message.
+func TestParseOmpStreamJSONNamesAwaitingAsyncWork(t *testing.T) {
+	const want = "omp stream ended while the run was waiting for background work (agent_end awaitingAsyncWork): omp exited before the background job finished"
+	awaiting := ompHeaderLine(ompFixtureSessionID) +
+		ompAssistantEnd("Running the tests in the background.", 5, 2) +
+		`{"type":"agent_end","messages":[],"isTerminal":false,"yielded":true,"awaitingAsyncWork":true}` + "\n" +
+		`{"type":"tool_execution_update"}` + "\n"
+	_, _, _, err := parseOmpStreamJSON(awaiting)
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+
+	plain := ompHeaderLine(ompFixtureSessionID) +
+		ompAssistantEnd("Let me start by reading the diff.", 5, 2) +
+		ompAgentEndContinuation()
+	_, _, _, err = parseOmpStreamJSON(plain)
+	if err == nil || !strings.Contains(err.Error(), "non-terminal agent_end (isTerminal false)") || strings.Contains(err.Error(), "awaitingAsyncWork") {
+		t.Fatalf("error = %v, want the unchanged non-terminal message", err)
+	}
+}
+
 // TestOmpAssistantTextKeepsOnlyTextParts: an assistant message mixes thinking,
 // tool-call and text parts. Kills: concatenating every part regardless of type,
 // which would leak reasoning or tool arguments into the extracted result.
@@ -3123,7 +3171,7 @@ func TestOmpPolicyArgs(t *testing.T) {
 			if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "work"}); err != nil {
 				t.Fatalf("Deliver: %v", err)
 			}
-			wantArgv := []string{"omp", "-p", "--mode=json", tc.want, "--no-session", "--", "work"}
+			wantArgv := []string{"omp", "-p", "--mode=json", tc.want, "--no-session", "--wait-async", "--", "work"}
 			if !reflect.DeepEqual(runner.calls[0], wantArgv) {
 				t.Fatalf("argv = %v, want %v", runner.calls[0], wantArgv)
 			}
@@ -3159,7 +3207,7 @@ func TestOmpDeliverReadOnlySeatDefersApprovalToLandlock(t *testing.T) {
 			if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "run the review checks"}); err != nil {
 				t.Fatalf("Deliver: %v", err)
 			}
-			runner.want(t, 0, "omp", "-p", "--mode=json", tc.wantFlag, "--no-session", "--", "run the review checks")
+			runner.want(t, 0, "omp", "-p", "--mode=json", tc.wantFlag, "--no-session", "--wait-async", "--", "run the review checks")
 		})
 	}
 }
@@ -3330,7 +3378,7 @@ func TestOmpOversizePromptStaged(t *testing.T) {
 		if runner.stagedPath != "" {
 			t.Fatalf("sub-threshold prompt was staged to %s", runner.stagedPath)
 		}
-		want := []string{"omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--", prompt}
+		want := []string{"omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--wait-async", "--", prompt}
 		if !reflect.DeepEqual(runner.lastArgs, want) {
 			t.Fatalf("sub-threshold argv diverged from the plain path (len=%d)", len(runner.lastArgs))
 		}
@@ -3599,7 +3647,7 @@ func TestOmpStartReturnsUsableRef(t *testing.T) {
 	if result.Raw != "done" {
 		t.Fatalf("Raw = %q, want the unwrapped assistant text", result.Raw)
 	}
-	runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--", "introduce yourself")
+	runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--wait-async", "--", "introduce yourself")
 
 	t.Run("empty prompt is rejected before any run", func(t *testing.T) {
 		empty := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
@@ -3788,7 +3836,7 @@ func TestOmpHealthUsesLiveCheckPrompt(t *testing.T) {
 	if err := adapter.Health(context.Background(), ompTestAgent()); err != nil {
 		t.Fatalf("Health: %v", err)
 	}
-	runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--", OmpLiveCheckPrompt)
+	runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--wait-async", "--", OmpLiveCheckPrompt)
 }
 
 // TestOmpPlanRejectsMalformedResolvedTarget closes the argv-injection BLOCKER that
