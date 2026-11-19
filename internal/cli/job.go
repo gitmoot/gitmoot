@@ -90,7 +90,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 
 // listRuns backs `run list` and `review list`; a non-empty onlyType keeps only
 // runs of that type.
-func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string) int {
+func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string) (code int) {
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
@@ -196,7 +196,14 @@ func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string)
 	// One /proc snapshot serves every row, taken only if some row needs it.
 	liveness := lazyWorktreeLiveness(jobWorktreeLivenessSnapshot)
 	out := bufio.NewWriter(stdout)
-	defer out.Flush()
+	// Flush on every return path; a failed flush is a failed listing, because
+	// small output never reaches the underlying writer before it.
+	defer func() {
+		if err := out.Flush(); err != nil && code == 0 {
+			fmt.Fprintf(stderr, "%s: %v\n", command, err)
+			code = 1
+		}
+	}()
 	stdout = out
 	if *jsonOutput {
 		entries := make([]jobListEntry, 0, len(filtered))

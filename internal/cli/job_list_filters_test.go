@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -153,6 +154,39 @@ func TestRunListPullRequestAndLimitFilters(t *testing.T) {
 		}
 		if stdout.Len() != 0 {
 			t.Fatalf("%v printed rows on rejection: %s", bad, stdout.String())
+		}
+	}
+}
+
+type failingListWriter struct{}
+
+func (failingListWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+// TestRunListReportsAFailedFlush pins the #2703 review finding: with buffered
+// output, a small listing first reaches stdout in the final flush, so a flush
+// failure must still fail the command instead of exiting 0 with nothing written.
+func TestRunListReportsAFailedFlush(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedCLIJob(t, store, db.Job{
+		ID:      "one",
+		Agent:   "worker",
+		Type:    "review",
+		State:   string(workflow.JobSucceeded),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", PullRequest: 7}),
+	}, "succeeded")
+	store.Close()
+	for _, argv := range [][]string{
+		{"run", "list", "--home", home},
+		{"run", "list", "--home", home, "--json"},
+		{"review", "list", "--home", home},
+	} {
+		var stderr bytes.Buffer
+		if code := Run(argv, failingListWriter{}, &stderr); code != 1 {
+			t.Fatalf("%v exit = %d, want 1; stderr=%q", argv, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "disk full") {
+			t.Fatalf("%v stderr = %q, want the write error", argv, stderr.String())
 		}
 	}
 }
