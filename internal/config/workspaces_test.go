@@ -27,6 +27,11 @@ func TestLoadWorkspacesPolicyRefusesInvalidValues(t *testing.T) {
 		"[workspaces]\nprovider = \"aws\"\n",
 		"[workspaces]\nmax_total = 5\n",
 		"[workspaces\nenabled = true\n",
+		"[workspaces]\ntemplate = \"\"\n",
+		"[workspaces]\ntemplate = \"has space\"\n",
+		"[workspaces]\ntemplate = \"-leading-dash\"\n",
+		"[workspaces]\ntemplate = \"quote\\\"d\"\n",
+		"[workspaces]\ntemplate = base\n",
 	} {
 		if _, err := LoadWorkspacesPolicy(writeGateConfig(t, body)); err == nil {
 			t.Fatalf("LoadWorkspacesPolicy accepted %q", body)
@@ -42,5 +47,18 @@ func TestLoadWorkspacesPolicyRefusesInvalidValues(t *testing.T) {
 	}
 	if policy, err := LoadWorkspacesPolicy(writeGateConfig(t, "[workspaces]\nprovider = \"local\"\n")); err != nil || policy.Provider != WorkspacesLocalProvider {
 		t.Fatalf("local provider = %+v %v", policy, err)
+	}
+}
+
+func TestLoadWorkspacesPolicyTemplate(t *testing.T) {
+	for _, name := range []string{"gitmoot-omp-go126-2c4g-v1", "rki5dems9wqfm4r03t7g", "team/name:v1.2_3"} {
+		policy, err := LoadWorkspacesPolicy(writeGateConfig(t, "[workspaces]\ntemplate = \""+name+"\"\n"))
+		if err != nil || policy.Template != name {
+			t.Fatalf("template %q = %+v, %v", name, policy, err)
+		}
+	}
+	// Unset means the provider's [remote_exec] template (resolved by the CLI).
+	if policy, err := LoadWorkspacesPolicy(writeGateConfig(t, "[workspaces]\nenabled = true\n")); err != nil || policy.Template != "" {
+		t.Fatalf("no template = %+v, %v", policy, err)
 	}
 }

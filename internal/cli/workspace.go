@@ -32,7 +32,8 @@ import (
 
 // Error codes of the workspace commands. Every failure prints
 // {"error":{"code","message"}} as one line on stderr (and on stdout too for
-// --json) and exits workspaceCLIFailure.
+// --json) and exits workspaceCLIFailure, except the file commands' missing
+// path (workspaceExitMissing) and directory (workspaceExitIsDir).
 const (
 	wsErrNotFound            = "not_found"
 	wsErrNotReady            = "not_ready"
@@ -43,12 +44,22 @@ const (
 	wsErrInvalidArgs         = "invalid_args"
 	wsErrDisabled            = "disabled"
 	wsErrInternal            = "internal"
+	wsErrIsDirectory         = "is_directory"
+	wsErrPushRefused         = "push_refused"
+	wsErrNotEmpty            = "not_empty"
 )
 
 // workspaceCLIFailure is the exit status of a workspace command that failed
 // itself, before or around the command it was asked to run (docker run's
 // convention). exec and ws sh otherwise exit with the command's own status.
 const workspaceCLIFailure = 125
+
+// Exit statuses of read, write and stat for a path that does not exist and
+// for a directory where a file was wanted (code not_found / is_directory).
+const (
+	workspaceExitMissing = 3
+	workspaceExitIsDir   = 4
+)
 
 // workspaceReservePeriod is one reservation: the hour reserved up front and
 // each hour the daemon settles. It equals the provider's per-request TTL
@@ -74,6 +85,9 @@ var (
 type workspaceError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// exit overrides workspaceCLIFailure: a file command's missing path (3)
+	// or directory (4).
+	exit int
 }
 
 func (e *workspaceError) Error() string { return e.Code + ": " + e.Message }
@@ -112,11 +126,15 @@ func reportWorkspaceError(stdout, stderr io.Writer, jsonOutput bool, err error) 
 	if jsonOutput {
 		fmt.Fprintln(stdout, string(line))
 	}
+	if wsErr.exit != 0 {
+		return wsErr.exit
+	}
 	return workspaceCLIFailure
 }
 
-// workspaceJSON is the pinned `open` / `show --json` shape. Issue and PR are
-// null when unset. Env is the base environment, in `show` only.
+// workspaceJSON is the pinned `open` / `show --json` / `close --json` shape.
+// Issue and PR are null when unset; ClosedAt and CloseReason are null until
+// the workspace closes. Env is the base environment, in `show` only.
 type workspaceJSON struct {
 	ID           string            `json:"id"`
 	Seat         string            `json:"seat"`
@@ -130,15 +148,15 @@ type workspaceJSON struct {
 	State        string            `json:"state"`
 	CreatedAt    string            `json:"created_at"`
 	LastActiveAt string            `json:"last_active_at"`
+	ClosedAt     *string           `json:"closed_at"`
+	CloseReason  *string           `json:"close_reason"`
 	Env          map[string]string `json:"env,omitempty"`
 }
 
 // workspaceListJSON is one `ls --json` entry: the pinned fields plus the
-// ledger and close record.
+// ledger.
 type workspaceListJSON struct {
 	workspaceJSON
-	ClosedAt        string  `json:"closed_at,omitempty"`
-	CloseReason     string  `json:"close_reason,omitempty"`
 	CostReservedUSD float64 `json:"cost_reserved_usd"`
 	CostAccruedUSD  float64 `json:"cost_accrued_usd"`
 }
@@ -156,6 +174,14 @@ func newWorkspaceJSON(w db.Workspace) workspaceJSON {
 	if w.PR > 0 {
 		pr := w.PR
 		out.PR = &pr
+	}
+	if !w.ClosedAt.IsZero() {
+		closedAt := formatWorkspaceJSONTime(w.ClosedAt)
+		out.ClosedAt = &closedAt
+	}
+	if w.CloseReason != "" {
+		reason := w.CloseReason
+		out.CloseReason = &reason
 	}
 	return out
 }
@@ -194,6 +220,22 @@ func runWorkspace(args []string, stdout, stderr io.Writer) int {
 		return runWorkspaceExec(args[1:], os.Stdin, stdout, stderr)
 	case "close":
 		return runWorkspaceClose(args[1:], stdout, stderr)
+	case "read":
+		return runWorkspaceRead(args[1:], stdout, stderr)
+	case "write":
+		return runWorkspaceWrite(args[1:], os.Stdin, stdout, stderr)
+	case "stat":
+		return runWorkspaceStat(args[1:], stdout, stderr)
+	case "changes":
+		return runWorkspaceChanges(args[1:], stdout, stderr)
+	case "pull":
+		return runWorkspacePull(args[1:], stdout, stderr)
+	case "push":
+		return runWorkspacePush(args[1:], os.Stdin, stdout, stderr)
+	case "remove":
+		return runWorkspaceRemove(args[1:], stdout, stderr)
+	case "mirror":
+		return runWorkspaceMirror(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown workspace command %q\n\n", args[0])
 		printWorkspaceUsage(stderr)
@@ -210,11 +252,21 @@ func printWorkspaceUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot workspace ls [--all] [--json]")
 	fmt.Fprintln(w, "  gitmoot workspace exec <id> [--cwd REL] [--env K=V]... [--timeout S] [--stdin] [--status-file HOSTPATH] -- <argv...>")
 	fmt.Fprintln(w, "  gitmoot workspace close <id> [--reason TEXT] [--json]")
+	fmt.Fprintln(w, "  gitmoot workspace read <id> <rel>")
+	fmt.Fprintln(w, "  gitmoot workspace write <id> <rel> [--mode OCTAL]")
+	fmt.Fprintln(w, "  gitmoot workspace stat <id> <rel> [--json]")
+	fmt.Fprintln(w, "  gitmoot workspace changes <id> --since <token|start> [--json]")
+	fmt.Fprintln(w, "  gitmoot workspace pull <id> -- <paths...>")
+	fmt.Fprintln(w, "  gitmoot workspace push <id> --files")
+	fmt.Fprintln(w, "  gitmoot workspace push <id>")
+	fmt.Fprintln(w, "  gitmoot workspace remove <id> -- <paths...>")
+	fmt.Fprintln(w, "  gitmoot workspace mirror <id> <dir>")
 	fmt.Fprintln(w, "  gitmoot ws sh [--cwd REL] '<command>'")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "The seat is the acting org role (GITMOOT_ORG_ROLE or the calling pane's seat).")
 	fmt.Fprintln(w, "Requires [workspaces] enabled = true. A failure prints")
-	fmt.Fprintln(w, `{"error":{"code","message"}} on stderr (and stdout with --json) and exits 125.`)
+	fmt.Fprintln(w, `{"error":{"code","message"}} on stderr (and stdout with --json) and exits 125;`)
+	fmt.Fprintln(w, "read, write and stat exit 3 for a missing path and 4 for a directory.")
 	fmt.Fprintln(w, "See skills/gitmoot/references/WORKSPACES.md.")
 }
 
@@ -565,6 +617,12 @@ func newWorkspaceProvider(paths config.Paths, providerName string) (*workspacePr
 	if err != nil {
 		return nil, wsErrorf(wsErrProviderUnavailable, "%v", err)
 	}
+	// [workspaces] template, else the provider's e2b_template. Only create
+	// uses it; a [workspaces] section open has already refused as invalid
+	// falls back here, so attach, renew and close keep working.
+	if policy, err := config.LoadWorkspacesPolicy(paths); err == nil && policy.Template != "" {
+		cfg.E2BTemplate = policy.Template
+	}
 	if err := cfg.ValidateE2BProvider(); err != nil {
 		return nil, wsErrorf(wsErrProviderUnavailable, "%v", err)
 	}
@@ -664,7 +722,7 @@ func runWorkspaceList(args []string, stdout, stderr io.Writer) int {
 		out := make([]workspaceListJSON, 0, len(workspaces))
 		for _, w := range workspaces {
 			out = append(out, workspaceListJSON{
-				workspaceJSON: newWorkspaceJSON(w), ClosedAt: formatWorkspaceJSONTime(w.ClosedAt), CloseReason: w.CloseReason,
+				workspaceJSON:   newWorkspaceJSON(w),
 				CostReservedUSD: w.CostReservedUSD, CostAccruedUSD: w.CostAccruedUSD,
 			})
 		}

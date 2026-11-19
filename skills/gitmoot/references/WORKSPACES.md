@@ -6,17 +6,17 @@ messages on the host; its checkout, builds and tests run in the VM. The seat
 is still the implementer: gitmoot provisions and tears down the VM and never
 edits code. The VM gets no GitHub token and none of the host's environment.
 
-Slice 1 ships `open`, `show`, `ls`, `exec`, `ws sh` and `close`. File sync
-(`changes`, `pull`, `push --files`, `mirror`, `read`, `write`, `stat`) and
-`push <id>` (commits out) come in slice 2.
+Commands: `open`, `show`, `ls`, `exec`, `ws sh` and `close`; file sync for a
+host mirror (`read`, `write`, `stat`, `changes`, `pull`, `push --files`,
+`remove`, `mirror`); and `push <id>`, commits out, pushed from the host.
 
 ## Setup
 
 ```toml
 [remote_exec]
 e2b_api_key_file = "/path/to/e2b-api-key"
-e2b_template = "gitmoot-omp-go126-2c4g-v1"  # needs git, tar and python3
-cost_per_hour_usd = 0.2                       # required: the cap is priced by it
+e2b_template = "base"     # remote jobs' template; workspaces fall back to it
+cost_per_hour_usd = 0.2   # required: the cap is priced by it
 
 [workspaces]
 enabled = true          # default false
@@ -24,7 +24,15 @@ provider = "e2b"        # a configured sandboxd provider, or "local" (below)
 max_total_usd = 50      # every workspace ever: settled cost + open reservations
 max_workspace_usd = 10  # one workspace's reservations over its life
 idle_timeout = "4h"     # close after this long without an exec
+template = "gitmoot-omp-go126-2c4g-v1"  # optional; needs git, tar and python3
 ```
+
+`template` is the provider template workspaces are created from; without it
+they use the provider's `[remote_exec] e2b_template` (or the sandboxd
+section's `template`), which remote jobs use too. Set it to a template with
+the toolchain your seat builds with, without changing the jobs' template. It
+must be 1-128 letters, digits and `. _ - : /`, starting with a letter or
+digit.
 
 The section is read on every command and every daemon pass, so edits apply
 without a restart. An invalid section refuses `open`; the daemon then keeps
@@ -53,19 +61,22 @@ registered seat.
 |---|---|
 | `gitmoot workspace open --repo O/R (--issue N \| --pr N) [--json]` | Provisions the VM and checks out the branch. `--pr`: the PR's head branch at its head commit. `--issue`: a new branch `ws/<seat>/<N>` from the default branch. One non-closed workspace per (seat, repo, issue\|pr). |
 | `gitmoot workspace show <id> [--json]` | The record, plus `env`, the VM's base environment. |
-| `gitmoot workspace ls [--all] [--json]` | Open workspaces (`--all`: closed and failed too), with `cost_reserved_usd`, `cost_accrued_usd`, `closed_at`, `close_reason`. |
+| `gitmoot workspace ls [--all] [--json]` | Open workspaces (`--all`: closed and failed too): the `show` keys without `env`, plus `cost_reserved_usd` and `cost_accrued_usd`. |
 | `gitmoot workspace exec <id> [--cwd REL] [--env K=V]... [--timeout S] [--stdin] [--status-file HOSTPATH] -- argv...` | Runs argv in the VM. |
 | `gitmoot ws sh [--cwd REL] [--status-file HOSTPATH] '<cmd>'` | `exec $GITMOOT_WORKSPACE --cwd REL -- bash -lc '<cmd>'`. Exactly one command string; more is `invalid_args`. |
 | `gitmoot workspace close <id> [--reason TEXT] [--json]` | Copies the logs out, destroys the VM, settles the ledger. Default reason `manual`. |
+| `gitmoot workspace read\|write\|stat\|changes\|pull\|remove\|mirror …`, `push <id> --files` | Files in the VM and the host mirror: see [Files](#files-read-write-stat-changes-pull-push---files-remove-mirror). |
+| `gitmoot workspace push <id>` | Commits out, pushed from the host: see [Commits out](#commits-out-push). |
 
-`open` and `show --json` print exactly these keys (`issue` and `pr` are `null`
-when unset; `env` is in `show` only):
+`open`, `show --json` and `close --json` print exactly these keys (`issue` and
+`pr` are `null` when unset, `closed_at` and `close_reason` until the workspace
+closes; `env` is in `show` only):
 
 ```json
 {"id":"ws-1a2b3c4d5e6f","seat":"intern","repo":"o/r","issue":12,"pr":null,
  "branch":"ws/intern/12","base":"<40-hex commit>","root":"/home/user/work",
  "provider":"e2b","state":"ready","created_at":"2026-11-19T12:00:00Z",
- "last_active_at":"2026-11-19T12:00:00Z",
+ "last_active_at":"2026-11-19T12:00:00Z","closed_at":null,"close_reason":null,
  "env":{"PATH":"/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME":"/home/user","LANG":"C.UTF-8","GITMOOT_WORKSPACE_ROOT":"/home/user/work"}}
 ```
@@ -81,7 +92,11 @@ when unset; `env` is in `show` only):
 Every failure prints one line `{"error":{"code":"<code>","message":"…"}}` on
 stderr (and on stdout too with `--json`) and exits **125**. Codes:
 `not_found`, `not_ready`, `cost_cap`, `provider_unavailable`,
-`cwd_outside_root`, `already_open`, `invalid_args`, `disabled`, `internal`.
+`cwd_outside_root`, `already_open`, `invalid_args`, `disabled`, `internal`,
+and for the file commands `is_directory`, `not_empty`, `push_refused` and
+`nothing_to_push`. `read`, `write` and `stat` exit **3** (`not_found`) for a
+path that does not exist and **4** (`is_directory`) for a directory where a
+file was wanted, with the same error line.
 
 ### exec and ws sh
 
@@ -94,9 +109,11 @@ stderr (and on stdout too with `--json`) and exits **125**. Codes:
   exits 125 (or 124) on its own is told apart.
 - **Streaming:** stdout and stderr stream live, kept apart.
 - **stdin:** `/dev/null` unless `--stdin`.
-- **cwd:** relative to `root`. The `--cwd` argument cannot name a location
-  outside the root: `..` out of it, an absolute path, or a symlink present at
-  exec time is refused with `cwd_outside_root`.
+- **cwd:** relative to `root`, taken exactly as given: leading and trailing
+  spaces are part of the name and only the empty string means the root. The
+  `--cwd` argument cannot name a location outside the root: `..` out of it,
+  an absolute path, or a symlink present at exec time is refused with
+  `cwd_outside_root`.
 - **Threat model:** cwd confinement is about the `--cwd` argument, not a
   boundary against code already running in the workspace. Workspace commands
   run as the user that owns the root and every directory above it, so a
@@ -133,6 +150,114 @@ owns and passes to the supervisor. When the command ends, anything left in its
 group is killed too, so nothing outlives the exec. The supervisor's exit
 status is the command's, and it reports `{exit_code, signal, timed_out,
 error}` as a trailer on stderr that the CLI strips.
+
+## Files: read, write, stat, changes, pull, push --files, remove, mirror
+
+omp's file tools run on a host mirror of the work tree; these commands read
+and write the VM side. Every `<rel>` is relative to `root`, taken exactly as
+given (never trimmed; `""` is the root), and confined like `--cwd`: an
+absolute path, a `..` out of the root, or a symlink anywhere on the way is
+refused with `cwd_outside_root` (a final symlink too, except for `stat`,
+which reports it as `symlink`).
+
+**.git:** `write`, `push --files`, `pull` and `remove` refuse (`invalid_args`)
+any path with a component named `.git`, in any letter case and at any depth
+(`.git/config`, `sub/.git/x`: nested repositories and submodules too), on
+the host and again in the VM, before anything is applied. `changes` never
+lists such a path.
+
+**Symlink targets** (`push --files`): a relative target must not climb above
+the root from the link's directory; an absolute one must not start with `//`
+or contain a `..` component (refused rather than normalized, so the host's
+check and the VM's agree) and must name the root or a path below it.
+
+| Command | Contract |
+|---|---|
+| `gitmoot workspace read <id> <rel>` | The file's bytes on stdout. Exit 3 if missing, 4 if a directory. |
+| `gitmoot workspace write <id> <rel> [--mode OCTAL]` | stdin to the file, atomically (a temp file in the same directory, renamed over). An existing file keeps its mode; a new one gets `0644` unless `--mode`. Parent directories are created. A directory there exits 4. |
+| `gitmoot workspace stat <id> <rel> --json` | `{"type":"file\|dir\|symlink\|other","size":N,"mtime":<unix seconds, fractional>}`, without following a final symlink. Exit 3 if missing. |
+| `gitmoot workspace changes <id> --since <token\|start> --json` | `{"reset":bool,"token":"ws1.…","changed":[{"path","type","size","mtime","mode"}],"deleted":[path]}` (below). |
+| `gitmoot workspace pull <id> -- <paths...>` | A tar stream of those paths on stdout: regular files with their permission bits, directories (the entry only) and symlinks (never followed). A path that is missing, special or behind a symlink is left out. |
+| `gitmoot workspace push <id> --files` | A tar stream on stdin (files, directories, symlinks), each entry applied atomically with its permission bits, parents created. The whole stream is checked first, on the host and again in the VM: an absolute name, a `..` component or a symlink whose target leaves the root (`cwd_outside_root`), or a `.git` path (`invalid_args`), refuses it before anything is applied. Prints `applied N entries` (`--json`: `{"applied":N}`). |
+| `gitmoot workspace remove <id> -- <paths...>` | Unlinks files and symlinks (a symlink itself, never its target) and removes empty directories; a non-empty directory is refused with `not_empty`. A missing path is not an error (it counts 0); `.git` paths are refused (`invalid_args`, above). remove checks every path before removing any; on an error nothing is removed, and the error names the first failing path (like `push --files`). A directory counts as empty when every entry in it is listed before it in the same batch, so `-- dir/a dir` removes both. Prints `{"removed":N}`, what was actually removed. The next `changes` reports them in `deleted`. |
+| `gitmoot workspace mirror <id> <dir>` | Fills `<dir>` (absent or empty) with the work tree and prints the `changes` token it is current at (`--json`: `{"token","dir"}`). |
+
+### changes
+
+- **Token:** `ws1.<base64url(json)>` with JSON `{"w":"<workspace id>","g":<generation>,"t":<VM monotonic ns at the walk's start>}`.
+- **Manifest:** the VM keeps one, for the last issued token, under the
+  workspace user's home (`~/.gitmoot/workspace/changes/manifest-<generation>.json`,
+  outside the root): path → type, size, mtime_ns, ctime_ns, inode, mode, and
+  the wall-clock start of the walk that recorded it. The generation is minted
+  in the VM on first use, so a new sandbox has a new one.
+- **Changed** means new, or any of mtime, ctime, inode, size or mode differs
+  (a directory: only its inode or mode), **or racily clean**: git's rule. A
+  file whose recorded ctime or mtime is within 1 s of (or after) the start of
+  the walk that recorded it is reported again, whatever its fingerprint, until
+  a walk starts more than 1 s after it. ctime advances on a coarse kernel
+  clock, so a same-size edit that restores the mtime can leave every field
+  unchanged; this rule reports it. `changes` may over-report; it never
+  under-reports.
+- **Deleted** is exact: the stored manifest's paths that are gone.
+- **Reset:** a malformed token, one from another workspace or generation, or
+  any token but the last issued (its manifest is replaced) returns
+  `"reset":true` with every entry in `changed`: a full resync.
+- **Scope:** untracked and ignored files are included; every `.git`
+  (the repository's, a nested repository's or a submodule's, any letter case)
+  is excluded. Names that are not valid UTF-8 are left out.
+
+### mirror
+
+`mirror` writes the workspace's base commit into `<dir>` from the **host's**
+registered clone (raw blobs, modes and symlinks, `git ls-tree` +
+`git cat-file --batch`), so nothing that is already on the host crosses the
+network. It then runs `changes --since start` and `git diff --name-only
+<base>` in the VM, and removes what the VM does not have. It pulls (in
+batches of 256) every entry that git reports as changed, that is new, or
+whose type or size differs. Every other file is compared by content: one
+batched call hashes the VM's work-tree bytes (sha256), and a file whose hash
+differs from the host copy is pulled too, since git diff compares cleaned
+content and misses a same-size smudge or eol conversion. Every mode is set to
+the VM's, setuid, setgid and sticky included. It prints the token of that
+`changes` call: what changes after it, the next `changes --since <token>`
+reports.
+
+### Transport and confinement
+
+Each file operation is one `python3` process in the workspace
+(`internal/cli/workspace_files.py`), started through the same process API as
+exec, with the confinement code exec's supervisor uses
+(`internal/cli/workspace_confine.py`) prepended: the root is opened by its
+recorded identity and every path below it one component at a time with
+`O_NOFOLLOW`. envd's file API is not used for work-tree paths: it resolves the
+path it is given with the envd user's rights, follows symlinks and knows
+nothing of the root, so it cannot give the confinement exec has. It is used
+only to hand an input over 48 KiB (or a long config) to the operation, as a
+file directly in the guest home whose random name gitmoot chooses; the
+operation unlinks it as soon as it is open. The threat model is exec's: the
+argument cannot name a place outside the root; code already running in the
+workspace is not confined.
+
+## Commits out: push
+
+`gitmoot workspace push <id>` (no `--files`) copies the workspace branch's new
+commits out and pushes them from the host. The VM never holds a GitHub token.
+
+1. In the VM: the workspace's HEAD must be its branch (`push_refused`
+   otherwise), with commits past the recorded base (`nothing_to_push`
+   otherwise). `git bundle create - refs/heads/<branch> ^<base>` streams them
+   out; a bundle needs no credential.
+2. On the host, in the registered clone: the bundle must carry exactly
+   `refs/heads/<branch>`; its objects are fetched (no ref written) and the tip
+   must descend from the recorded base (`push_refused`: rewritten history is
+   never pushed).
+3. `git push origin <tip>:refs/heads/<target>` from the host, with the host's
+   own identity and credentials, without `--force` or a `+` refspec: the remote
+   accepts a fast-forward of that one branch or nothing (`push_refused`).
+   `<target>` is the pull request's head branch for a PR workspace and
+   `ws/<seat>/<issue>` for an issue workspace; no other ref is ever pushed.
+
+It prints the pushed commit (`--json`: `{"sha"}`).
 
 ## Cost
 

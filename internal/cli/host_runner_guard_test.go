@@ -123,6 +123,14 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		rawCommands: 1,
 		reason:      "workspace open (#2678) fetches and resolves the workspace's commits in the registered host clone with the host's own credentials before any sandbox exists; it is host-side source preparation for a workspace, not a job, so there is no resolved backend runner, and only the credential-free object store derived from it reaches the sandbox",
 	},
+	"internal/cli/workspace_sync.go:workspaceMirrorBase": {
+		rawCommands: 2,
+		reason:      "workspace mirror (#2678) writes the workspace's base commit into the seat's host mirror from the registered host clone (git ls-tree + cat-file --batch, read-only), so the VM sends only what differs; it is host-side file sync for a seat's mirror, not a job, so there is no resolved backend runner",
+	},
+	"internal/cli/workspace_sync.go:workspacePushGit": {
+		rawCommands: 1,
+		reason:      "workspace push (#2678) applies the VM's bundle to the registered host clone, checks the commits descend from the recorded base and fast-forward-pushes only the workspace branch from the HOST with the host's own identity and credentials, so the VM never holds a GitHub token; it is host-side commit-out for a workspace, not a job, so there is no resolved backend runner",
+	},
 }
 
 func TestJobPathsDoNotHardcodeHostRunners(t *testing.T) {

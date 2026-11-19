@@ -26,11 +26,18 @@ import (
 	remoteexec "github.com/gitmoot/gitmoot/internal/execbackend/remote"
 )
 
+// workspaceConfineScript is the root confinement every VM-side workspace
+// script starts with: identity-checked root, O_NOFOLLOW walk.
+//
+//go:embed workspace_confine.py
+var workspaceConfineScript string
+
+//go:embed workspace_supervisor.py
+var workspaceSupervisorBody string
+
 // workspaceSupervisorScript runs every workspace command inside the VM. It is
 // the VM-side watchdog the exec contract requires: see its header.
-//
-//go:embed workspace_supervisor.py
-var workspaceSupervisorScript string
+var workspaceSupervisorScript = workspaceConfineScript + "\n" + workspaceSupervisorBody
 
 // workspaceStatusMark starts the supervisor's status trailer, the last bytes
 // it writes to stderr.
@@ -197,21 +204,29 @@ func writeWorkspaceStatusFile(file string, status workspaceExecStatus) error {
 
 // workspaceRelativeCwd validates --cwd lexically: relative, and still under
 // the root once cleaned. The supervisor re-checks the resolved path in the VM,
-// so a symlink cannot lead out either.
+// so a symlink cannot lead out either. The argument is taken exactly as
+// given: only the empty string is special (the root); whitespace is part of
+// a name.
 func workspaceRelativeCwd(cwd string) (string, *workspaceError) {
-	cwd = strings.TrimSpace(cwd)
-	if cwd == "" {
-		cwd = "."
+	return workspaceRelativePath("--cwd", cwd)
+}
+
+// workspaceRelativePath validates a path argument relative to the workspace
+// root, exactly as given (never trimmed): "" is the root, an absolute path or
+// one that climbs out with .. is cwd_outside_root, a NUL byte invalid_args.
+func workspaceRelativePath(what, rel string) (string, *workspaceError) {
+	if rel == "" {
+		return ".", nil
 	}
-	if strings.ContainsRune(cwd, 0) {
-		return "", wsErrorf(wsErrInvalidArgs, "--cwd contains a NUL byte")
+	if strings.ContainsRune(rel, 0) {
+		return "", wsErrorf(wsErrInvalidArgs, "%s contains a NUL byte", what)
 	}
-	if path.IsAbs(cwd) {
-		return "", wsErrorf(wsErrCwdOutsideRoot, "--cwd %q must be relative to the workspace root", cwd)
+	if path.IsAbs(rel) {
+		return "", wsErrorf(wsErrCwdOutsideRoot, "%s %q must be relative to the workspace root", what, rel)
 	}
-	cleaned := path.Clean(cwd)
+	cleaned := path.Clean(rel)
 	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", wsErrorf(wsErrCwdOutsideRoot, "--cwd %q leaves the workspace root", cwd)
+		return "", wsErrorf(wsErrCwdOutsideRoot, "%s %q leaves the workspace root", what, rel)
 	}
 	return cleaned, nil
 }
@@ -249,27 +264,29 @@ func workspaceSessionFrame(kind byte, payload []byte) []byte {
 	return frame
 }
 
-func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceExecRequest, stdin io.Reader, stdout, stderr io.Writer) (workspaceExecStatus, *workspaceError) {
-	ctx := context.Background()
-	workspace, err := store.GetWorkspace(ctx, request.ID)
+// attachReadyWorkspace loads a ready workspace with a recorded root
+// identity, moves its last_active_at and attaches its sandbox. A sandbox the
+// provider retired closes the record (provider_gone).
+func attachReadyWorkspace(ctx context.Context, store *db.Store, paths config.Paths, id string) (db.Workspace, workspaceSandbox, *workspaceError) {
+	workspace, err := store.GetWorkspace(ctx, id)
 	if err != nil {
 		if errors.Is(err, db.ErrWorkspaceNotFound) {
-			return workspaceExecStatus{}, wsErrorf(wsErrNotFound, "no workspace %s", request.ID)
+			return db.Workspace{}, nil, wsErrorf(wsErrNotFound, "no workspace %s", id)
 		}
-		return workspaceExecStatus{}, asWorkspaceError(err, wsErrInternal)
+		return db.Workspace{}, nil, asWorkspaceError(err, wsErrInternal)
 	}
 	if workspace.State == db.WorkspaceStateReady && workspace.RootDev == 0 && workspace.RootIno == 0 {
-		return workspaceExecStatus{}, wsErrorf(wsErrNotReady, "workspace %s has no recorded root identity; close it and open a new one", workspace.ID)
+		return db.Workspace{}, nil, wsErrorf(wsErrNotReady, "workspace %s has no recorded root identity; close it and open a new one", workspace.ID)
 	}
 	if workspace.State != db.WorkspaceStateReady {
-		return workspaceExecStatus{}, wsErrorf(wsErrNotReady, "workspace %s is %s", workspace.ID, workspace.State)
+		return db.Workspace{}, nil, wsErrorf(wsErrNotReady, "workspace %s is %s", workspace.ID, workspace.State)
 	}
 	provider, err := newWorkspaceProvider(paths, workspace.Provider)
 	if err != nil {
-		return workspaceExecStatus{}, asWorkspaceError(err, wsErrProviderUnavailable)
+		return db.Workspace{}, nil, asWorkspaceError(err, wsErrProviderUnavailable)
 	}
 	if err := store.TouchWorkspace(ctx, workspace.ID, workspaceNow()); err != nil {
-		return workspaceExecStatus{}, asWorkspaceError(err, wsErrInternal)
+		return db.Workspace{}, nil, asWorkspaceError(err, wsErrInternal)
 	}
 	sandbox, state, err := provider.backend.attach(ctx, workspace.ProviderInstanceID)
 	if err != nil {
@@ -278,9 +295,18 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 			// deleted elsewhere). Settle the record now rather than leave a
 			// ready workspace nothing can run in.
 			_ = closeWorkspace(ctx, store, paths, workspace.ID, "provider_gone", io.Discard)
-			return workspaceExecStatus{}, wsErrorf(wsErrNotReady, "workspace %s: its sandbox is gone", workspace.ID)
+			return db.Workspace{}, nil, wsErrorf(wsErrNotReady, "workspace %s: its sandbox is gone", workspace.ID)
 		}
-		return workspaceExecStatus{}, wsErrorf(wsErrProviderUnavailable, "%v", err)
+		return db.Workspace{}, nil, wsErrorf(wsErrProviderUnavailable, "%v", err)
+	}
+	return workspace, sandbox, nil
+}
+
+func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceExecRequest, stdin io.Reader, stdout, stderr io.Writer) (workspaceExecStatus, *workspaceError) {
+	ctx := context.Background()
+	workspace, sandbox, failure := attachReadyWorkspace(ctx, store, paths, request.ID)
+	if failure != nil {
+		return workspaceExecStatus{}, failure
 	}
 	env := workspaceBaseEnv(sandbox.Home(), workspace.Root)
 	for _, entry := range request.Env {

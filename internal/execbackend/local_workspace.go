@@ -35,6 +35,35 @@ func (b *LocalBackend) InstanceHome(instance *Instance) (string, error) {
 	return filepath.Clean(instance.root), nil
 }
 
+// WriteWorkspaceHomeFile writes reader to a new file (0600) named name
+// directly in the instance home, owned by the configured local identity: the
+// local counterpart of an envd upload, for a workspace file operation to
+// read and unlink. name is one plain file name; an existing file is refused.
+func (b *LocalBackend) WriteWorkspaceHomeFile(instance *Instance, name string, reader io.Reader) error {
+	home, err := b.InstanceHome(instance)
+	if err != nil {
+		return err
+	}
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\x00") {
+		return fmt.Errorf("local workspace file name %q is not one plain file name", name)
+	}
+	target := filepath.Join(home, name)
+	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("create local workspace file: %w", err)
+	}
+	_, copyErr := io.Copy(file, reader)
+	var chownErr error
+	if b.identity != nil {
+		chownErr = file.Chown(int(b.identity.UID), int(b.identity.GID))
+	}
+	if err := errors.Join(copyErr, chownErr, file.Close()); err != nil {
+		_ = os.Remove(target)
+		return fmt.Errorf("write local workspace file: %w", err)
+	}
+	return nil
+}
+
 // StartWorkspaceProcess starts one process for a local workspace instance in
 // a new session, so terminal signals aimed at the caller never reach it. Dir
 // must be the instance home or below it. It runs as the configured local

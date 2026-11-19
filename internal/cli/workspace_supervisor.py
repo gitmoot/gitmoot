@@ -13,12 +13,10 @@
 # SIGTERM, SIGINT or SIGHUP to the supervisor itself also kills the group
 # before the supervisor exits, so the watchdog never dies leaving the command
 # behind. A forwarded signal escalates to SIGKILL after `kill_grace` seconds.
-# The root is accepted only if its (st_dev, st_ino) matches the identity
-# recorded at open; the cwd is then opened one component at a time below it
-# without following symlinks, and the command starts in that pinned directory.
-# These stop accidental misuse (a --cwd naming a place outside the root); they
-# are not a boundary against a hostile process already in the workspace, which
-# runs as the owner of the root and every ancestor (see open_root).
+# The root and cwd are confined by workspace_confine.py, which the CLI
+# prepends to this script: the root is accepted only by its recorded identity
+# and the cwd is opened one component at a time below it without following
+# symlinks; the command starts in that pinned directory.
 # Output is copied to the host and to a log file that `workspace close` copies
 # out. After the group is dead the last bytes on stderr are a status trailer:
 # MARK + JSON {exit_code, signal, timed_out, error} + newline. The supervisor
@@ -27,7 +25,6 @@
 import json
 import os
 import signal
-import stat
 import struct
 import subprocess
 import sys
@@ -65,78 +62,14 @@ def refuse(code, message):
     finish({"exit_code": 125, "signal": None, "timed_out": False, "error": {"code": code, "message": message}})
 
 
-def open_child(fd, part, what):
-    """Open one directory entry below fd without following a symlink."""
-    try:
-        return os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-    except FileNotFoundError:
-        os.close(fd)
-        refuse("invalid_args", "%s is not a directory in the workspace" % what)
-    except OSError:
-        try:
-            is_link = stat.S_ISLNK(os.lstat(part, dir_fd=fd).st_mode)
-        except OSError:
-            is_link = False
-        os.close(fd)
-        if is_link:
-            refuse("cwd_outside_root", "%s goes through a symlink; workspace paths never follow symlinks" % what)
-        refuse("invalid_args", "%s is not a directory in the workspace" % what)
-
-
-def open_root(root):
-    """Open the workspace root and verify it by its recorded identity.
-
-    The parent is opened by path as a best-effort hint: it follows whatever
-    the path names now, including a parent that was replaced. The root's last
-    component is opened from it with O_NOFOLLOW, and the result is accepted
-    only if its (st_dev, st_ino) is the identity recorded at open. This stops
-    accidental misuse; it is not a boundary against a process already running
-    in the workspace (see the threat model in WORKSPACES.md).
-    """
-    root = os.path.normpath(root)
-    parent, name = os.path.split(root)
-    if not os.path.isabs(root) or name in ("", ".", ".."):
-        refuse("invalid_args", "workspace root %s is not an absolute directory path" % root)
-    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-    root_fd = open_child(parent_fd, name, "workspace root %s" % root)
-    os.close(parent_fd)
-    # The path above is only a hint. What makes this the workspace root is its
-    # identity, recorded when the workspace opened. This check and the
-    # O_NOFOLLOW walk are defence in depth against accidental misuse (a stale
-    # or mistyped --cwd, a root moved or replaced by mistake). They are NOT a
-    # boundary against a hostile process already running in the workspace: it
-    # runs as the user that owns the root and every ancestor, and can defeat
-    # any path or identity check (for example by reclaiming the inode). On E2B
-    # the VM is the isolation boundary; local has no isolation.
-    expected = (int(cfg.get("root_dev") or 0), int(cfg.get("root_ino") or 0))
-    if expected == (0, 0):
-        os.close(root_fd)
-        refuse("invalid_args", "the workspace root has no recorded identity")
-    info = os.fstat(root_fd)
-    if (info.st_dev, info.st_ino) != expected:
-        os.close(root_fd)
-        refuse("cwd_outside_root", "workspace root %s was replaced: it is not the directory the workspace opened" % root)
-    return root_fd
-
-
-def open_cwd(root_fd, relative):
-    """Open relative below root_fd without following any symlink."""
-    fd = root_fd
-    for part in relative.split("/"):
-        if part in ("", "."):
-            continue
-        if part == "..":
-            os.close(fd)
-            refuse("cwd_outside_root", "cwd %s leaves the workspace root" % relative)
-        child = open_child(fd, part, "cwd %s" % relative)
-        os.close(fd)
-        fd = child
-    return fd
-
-
-if os.path.isabs(cfg["cwd"]):
-    refuse("cwd_outside_root", "cwd %s must be relative to the workspace root" % cfg["cwd"])
-cwd_fd = open_cwd(open_root(cfg["root"]), cfg["cwd"])
+try:
+    cwd_fd = open_dirs(
+        open_root(cfg["root"], cfg.get("root_dev"), cfg.get("root_ino")),
+        relative_parts(cfg["cwd"], "cwd %s" % cfg["cwd"]),
+        "cwd %s" % cfg["cwd"],
+    )
+except Refused as refusal:
+    refuse(refusal.code, refusal.message)
 
 log = None
 log_size = 0
