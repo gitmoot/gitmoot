@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -125,7 +126,25 @@ func (c *GhClient) OpenPullRequestFacts(ctx context.Context, repo Repository) (O
 		"-F", "owner="+repo.Owner,
 		"-F", "name="+repo.Name)
 	if err != nil {
-		return OpenPullRequestFacts{}, err
+		// gh exits non-zero whenever the response carries any GraphQL error,
+		// including the NOT_FOUND a commit without .github/workflows reports
+		// for Commit.file (#2701 follow-up). The body decides: decode tolerates
+		// only that error and fails on any other, so a failed or empty
+		// response keeps gh's own error.
+		//
+		// run can also fail AFTER a response, while waiting to retry it (the
+		// rate-limit classifier reads the body, and a PR title can trip it), and
+		// hands back that earlier response with a context or limiter error. That
+		// failure is the caller's, not GitHub's answer, so it is never traded
+		// for the stale body.
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return OpenPullRequestFacts{}, err
+		}
+		facts, decodeErr := decodeOpenPullRequestFacts([]byte(result.Stdout))
+		if decodeErr != nil {
+			return OpenPullRequestFacts{}, err
+		}
+		return facts, nil
 	}
 	return decodeOpenPullRequestFacts([]byte(result.Stdout))
 }
@@ -277,15 +296,15 @@ func decodeOpenPullRequestFacts(body []byte) (OpenPullRequestFacts, error) {
 				} `json:"pullRequests"`
 			} `json:"repository"`
 		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
+		Errors []graphQLError `json:"errors"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
 		return OpenPullRequestFacts{}, fmt.Errorf("decode open pull request facts: %w", err)
 	}
-	if len(response.Errors) > 0 {
-		return OpenPullRequestFacts{}, fmt.Errorf("open pull request facts: %s", response.Errors[0].Message)
+	for _, gqlErr := range response.Errors {
+		if !gqlErr.isMissingWorkflowsDir() {
+			return OpenPullRequestFacts{}, fmt.Errorf("open pull request facts: %s", gqlErr.Message)
+		}
 	}
 	if response.Data.Repository == nil {
 		return OpenPullRequestFacts{}, fmt.Errorf("open pull request facts: repository not found")
@@ -361,4 +380,23 @@ func parseGraphQLTime(value string) time.Time {
 		return time.Time{}
 	}
 	return parsed.UTC()
+}
+
+// graphQLError is one entry of a GraphQL response's errors list.
+type graphQLError struct {
+	Type    string `json:"type"`
+	Path    []any  `json:"path"`
+	Message string `json:"message"`
+}
+
+// isMissingWorkflowsDir reports the one error this query expects: GitHub
+// answers Commit.file(path: ".github/workflows") on a commit without that
+// directory with a null field plus a NOT_FOUND error at that field's path,
+// and a null file already reads as a known tree with no workflows.
+func (e graphQLError) isMissingWorkflowsDir() bool {
+	if e.Type != "NOT_FOUND" || len(e.Path) == 0 {
+		return false
+	}
+	last, ok := e.Path[len(e.Path)-1].(string)
+	return ok && last == "file"
 }
