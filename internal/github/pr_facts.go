@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -130,6 +131,15 @@ func (c *GhClient) OpenPullRequestFacts(ctx context.Context, repo Repository) (O
 		// for Commit.file (#2701 follow-up). The body decides: decode tolerates
 		// only that error and fails on any other, so a failed or empty
 		// response keeps gh's own error.
+		//
+		// run can also fail AFTER a response, while waiting to retry it (the
+		// rate-limit classifier reads the body, and a PR title can trip it), and
+		// hands back that earlier response with a context or limiter error. That
+		// failure is the caller's, not GitHub's answer, so it is never traded
+		// for the stale body.
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return OpenPullRequestFacts{}, err
+		}
 		facts, decodeErr := decodeOpenPullRequestFacts([]byte(result.Stdout))
 		if decodeErr != nil {
 			return OpenPullRequestFacts{}, err

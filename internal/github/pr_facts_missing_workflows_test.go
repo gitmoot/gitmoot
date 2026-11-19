@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
@@ -75,6 +76,25 @@ func TestOpenPullRequestFactsToleratesMissingWorkflowsDir(t *testing.T) {
 		client := GhClient{Runner: runner}
 		if _, err := client.OpenPullRequestFacts(context.Background(), repo); err == nil {
 			t.Fatal("an empty failed response was tolerated")
+		}
+	})
+
+	t.Run("a cancellation while waiting to retry is not traded for the stale body", func(t *testing.T) {
+		// "rate limit" in a PR title trips run's retry classifier, so run waits
+		// to retry and returns the earlier body alongside the wait's error.
+		body := `{` + strings.Replace(data, `"number":4,`, `"number":4,"title":"handle rate limit",`, 1) +
+			`,"errors":[` + notFound(`"repository","defaultBranchRef","target","file"`) + `]}`
+		ctx, cancel := context.WithCancel(context.Background())
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: body}, {Stdout: body}, {Stdout: body}}, errs: []error{ghFailed, ghFailed, ghFailed}}
+		client := GhClient{Runner: runner, Sleep: func(context.Context, time.Duration) error {
+			cancel()
+			return context.Canceled
+		}}
+		if _, err := client.OpenPullRequestFacts(ctx, repo); !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+		if len(runner.calls) != 1 {
+			t.Fatalf("gh calls = %d, want 1 before the cancelled wait", len(runner.calls))
 		}
 	})
 }
