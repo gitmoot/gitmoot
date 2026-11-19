@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,7 +65,7 @@ func runJob(args []string, stdout, stderr io.Writer) int {
 
 func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot run list [--repo owner/repo] [--state state] [--campaign label] [--json]")
+	fmt.Fprintln(w, "  gitmoot run list [--repo owner/repo] [--pr n] [--state state] [--campaign label] [--killed] [--limit n] [--json]")
 	fmt.Fprintln(w, "  gitmoot run show <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot run events <id>")
 	fmt.Fprintln(w, "  gitmoot run watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]")
@@ -99,6 +101,8 @@ func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string)
 	// failure messages for two different renderings of the same fact.
 	killed := fs.Bool("killed", false, "only runs whose delivery was killed by a signal and which nothing requeued")
 	jsonOutput := fs.Bool("json", false, "print runs (with operational detail) as JSON")
+	pr := fs.Int("pr", 0, "only runs for this pull request number (combine with --repo)")
+	limit := fs.Int("limit", 0, "after all filters, keep only the n newest runs (by created_at, then id), printed in id order; 0 means all")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -111,6 +115,14 @@ func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string)
 	}
 	if flagWasSupplied(fs, "campaign") && strings.TrimSpace(*workflowID) == "" {
 		fmt.Fprintln(stderr, "run list: --campaign requires a non-blank value")
+		return 2
+	}
+	if flagWasSupplied(fs, "pr") && *pr <= 0 {
+		fmt.Fprintf(stderr, "%s: --pr must be a positive pull request number\n", command)
+		return 2
+	}
+	if *limit < 0 {
+		fmt.Fprintf(stderr, "%s: --limit must be 0 (all) or a positive count\n", command)
 		return 2
 	}
 	if err := workflow.ValidateWorkflowID(*workflowID); err != nil {
@@ -154,6 +166,16 @@ func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string)
 			// one would list every job as killed, which is the wrong direction for a
 			// filter an operator uses to find abandoned work.
 			signalKilled, killedErr = store.JobIDsWithEventKind(context.Background(), workflow.DeliverySignalKilledEvent)
+			if killedErr != nil {
+				return nil
+			}
+			jobs = retainJobsWithID(jobs, signalKilled)
+		}
+		// Filter before the per-job derivations: each is a pure function of one
+		// job, so deriving only the listed rows changes no output.
+		jobs = filterJobs(jobs, *repo, *state, onlyType, *pr)
+		if *limit > 0 {
+			jobs = newestJobs(jobs, *limit)
 		}
 		reasonEvents, _ = store.LatestJobEventsOfKinds(context.Background(), stuckReasonEventKinds)
 		locks, _ = store.ListResourceLocks(context.Background())
@@ -163,24 +185,26 @@ func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string)
 		fmt.Fprintf(stderr, "run list: %v\n", err)
 		return 1
 	}
-	if *killed {
-		if killedErr != nil {
-			fmt.Fprintf(stderr, "run list: --killed could not read signal-kill evidence: %v\n", killedErr)
-			return 1
-		}
-		jobs = retainJobsWithID(jobs, signalKilled)
+	if killedErr != nil {
+		fmt.Fprintf(stderr, "run list: --killed could not read signal-kill evidence: %v\n", killedErr)
+		return 1
 	}
-	filtered := filterJobs(jobs, *repo, *state, onlyType)
+	filtered := jobs
 	for jobID, status := range deriveDispatchedReviewStatuses(paths, filtered) {
 		reviewStatuses[jobID] = status
 	}
+	// One /proc snapshot serves every row, taken only if some row needs it.
+	liveness := lazyWorktreeLiveness(jobWorktreeLivenessSnapshot)
+	out := bufio.NewWriter(stdout)
+	defer out.Flush()
+	stdout = out
 	if *jsonOutput {
 		entries := make([]jobListEntry, 0, len(filtered))
 		for _, job := range filtered {
 			payload, _ := jobListPayload(job)
 			ev, ok := reasonEvents[job.ID]
 			reason := deriveStuckReason(job, ev, ok, locks)
-			processActive := deriveWorktreeProcessActive(job, jobWorktreeLiveness)
+			processActive := payloadWorktreeProcessActive(job.State, payload, liveness)
 			runtimeProcessActive := deriveRuntimeProcessActive(job, jobRuntimeProcessLiveness)
 			reviewStatus := reviewStatuses[job.ID]
 			entries = append(entries, jobListEntry{
@@ -237,7 +261,7 @@ func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string)
 				fmt.Fprintf(stdout, " [action: %s]", reason.SuggestedAction)
 			}
 		}
-		if deriveWorktreeProcessActive(job, jobWorktreeLiveness) {
+		if payloadWorktreeProcessActive(job.State, payload, liveness) {
 			fmt.Fprint(stdout, "\tLIVE PROCESS: worktree still has an active process")
 		}
 		printReadOnlyWorktreeDiffSummary(stdout, payload, "\t")
@@ -1451,8 +1475,9 @@ func retainJobsWithID(jobs []db.Job, keep map[string]string) []db.Job {
 	return retained
 }
 
-// filterJobs keeps the jobs matching every non-empty filter, sorted by id.
-func filterJobs(jobs []db.Job, repoFilter, stateFilter, typeFilter string) []db.Job {
+// filterJobs keeps the jobs matching every non-empty filter, sorted by id. A
+// pullRequest of 0 matches any; the payload is decoded at most once per job.
+func filterJobs(jobs []db.Job, repoFilter, stateFilter, typeFilter string, pullRequest int) []db.Job {
 	repoFilter = strings.TrimSpace(repoFilter)
 	stateFilter = strings.TrimSpace(stateFilter)
 	filtered := make([]db.Job, 0, len(jobs))
@@ -1463,9 +1488,11 @@ func filterJobs(jobs []db.Job, repoFilter, stateFilter, typeFilter string) []db.
 		if typeFilter != "" && job.Type != typeFilter {
 			continue
 		}
-		if repoFilter != "" {
+		if repoFilter != "" || pullRequest != 0 {
 			payload, err := jobListPayload(job)
-			if err != nil || payload.Repo != repoFilter {
+			if err != nil ||
+				(repoFilter != "" && payload.Repo != repoFilter) ||
+				(pullRequest != 0 && payload.PullRequest != pullRequest) {
 				continue
 			}
 		}
@@ -1475,6 +1502,26 @@ func filterJobs(jobs []db.Job, repoFilter, stateFilter, typeFilter string) []db.
 		return filtered[i].ID < filtered[j].ID
 	})
 	return filtered
+}
+
+// newestJobs keeps the n newest of jobs, then restores filterJobs' id order.
+// Job ids are not chronological (they embed the agent, action and a random or
+// hashed suffix), so "newest" is decided by created_at, with id breaking ties
+// between jobs created in the same second.
+func newestJobs(jobs []db.Job, n int) []db.Job {
+	if n <= 0 || len(jobs) <= n {
+		return jobs
+	}
+	byAge := slices.Clone(jobs)
+	sort.SliceStable(byAge, func(i, j int) bool {
+		if byAge[i].CreatedAt != byAge[j].CreatedAt {
+			return byAge[i].CreatedAt < byAge[j].CreatedAt
+		}
+		return byAge[i].ID < byAge[j].ID
+	})
+	kept := byAge[len(byAge)-n:]
+	sort.Slice(kept, func(i, j int) bool { return kept[i].ID < kept[j].ID })
+	return kept
 }
 
 func jobListPayload(job db.Job) (workflow.JobPayload, error) {

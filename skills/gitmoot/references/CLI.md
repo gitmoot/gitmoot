@@ -1140,7 +1140,7 @@ Usage:
   gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer NAME] [--message TEXT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--campaign LABEL] [--session REF] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede RUN --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- "review instructions"]
   gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]
   gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]
-  gitmoot review list [--repo owner/repo] [--state state] [--campaign label] [--json]
+  gitmoot review list [--repo owner/repo] [--pr n] [--state state] [--campaign label] [--killed] [--limit n] [--json]
   gitmoot review show <id> [--json]
   gitmoot review watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
   gitmoot review cancel <id>
@@ -1164,7 +1164,7 @@ it. Findings outside the pull request's own diff never block and are not carried
 
 ```text
 Usage:
-  gitmoot run list [--repo owner/repo] [--state state] [--campaign label] [--json]
+  gitmoot run list [--repo owner/repo] [--pr n] [--state state] [--campaign label] [--killed] [--limit n] [--json]
   gitmoot run show <id> [--json]
   gitmoot run events <id>
   gitmoot run watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
@@ -1209,6 +1209,10 @@ Usage of review list:
     	print runs (with operational detail) as JSON
   -killed
     	only runs whose delivery was killed by a signal and which nothing requeued
+  -limit int
+    	after all filters, keep only the n newest runs (by created_at, then id), printed in id order; 0 means all
+  -pr int
+    	only runs for this pull request number (combine with --repo)
   -repo string
     	repo scope as owner/repo
   -state string
@@ -1531,7 +1535,7 @@ Usage of reviewer type show:
 
 ```text
 Usage:
-  gitmoot run list [--repo owner/repo] [--state state] [--campaign label] [--json]
+  gitmoot run list [--repo owner/repo] [--pr n] [--state state] [--campaign label] [--killed] [--limit n] [--json]
   gitmoot run show <id> [--json]
   gitmoot run events <id>
   gitmoot run watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
@@ -1664,6 +1668,10 @@ Usage of run list:
     	print runs (with operational detail) as JSON
   -killed
     	only runs whose delivery was killed by a signal and which nothing requeued
+  -limit int
+    	after all filters, keep only the n newest runs (by created_at, then id), printed in id order; 0 means all
+  -pr int
+    	only runs for this pull request number (combine with --repo)
   -repo string
     	repo scope as owner/repo
   -state string

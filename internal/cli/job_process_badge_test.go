@@ -98,6 +98,9 @@ func TestRunJobListShowSurfaceWorktreeProcessBadge(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() { jobWorktreeLiveness = previous })
+	previousSnapshot := jobWorktreeLivenessSnapshot
+	jobWorktreeLivenessSnapshot = func() worktreeLivenessProbe { return jobWorktreeLiveness }
+	t.Cleanup(func() { jobWorktreeLivenessSnapshot = previousSnapshot })
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"run", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
