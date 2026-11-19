@@ -209,13 +209,14 @@ max_consecutive_missed_wakes = 0
 # [workspaces] (#2678) gives coding seats a remote workspace: a provider sandbox
 # bound to one seat and one issue or PR, driven with "gitmoot workspace exec".
 # Off by default. Prices come from the provider's [remote_exec]
-# cost_per_hour_usd; max_total_usd caps all workspace spend, ever.
+# cost_per_hour_usd; max_total_usd caps all workspace spend, ever. The idle
+# close (default 4h) and the "local" provider are in the skill's
+# references/WORKSPACES.md.
 # [workspaces]
 # enabled = false
 # provider = "e2b"
 # max_total_usd = 50
 # max_workspace_usd = 10
-# idle_timeout = "4h"
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool
