@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -2932,8 +2933,13 @@ func annotateJobInsertConflict(jobID string, err error) error {
 // table is marshalled by encoding/json, which never escapes a plain ASCII key
 // - and the live store contains zero such rows. If a foreign writer ever
 // appears, this prefilter is where it breaks.
-const listJobWorktreeRefsSQL = `SELECT id, state, updated_at, created_at, payload
-	FROM jobs WHERE payload LIKE '%worktree_path%'`
+//
+// The rowid bound lets a caller that already holds every row up to some rowid
+// read only the rows inserted since (#2691). Production code never deletes
+// jobs and SQLite serializes writers, so rowids only grow and a later insert
+// always lands above every rowid an earlier read returned.
+const listJobWorktreeRefsSQL = `SELECT rowid, id, state, updated_at, created_at, payload
+	FROM jobs WHERE rowid > ? AND payload LIKE '%worktree_path%'`
 
 // JobWorktreeRef is the minimum the reclaim guard needs about another job:
 // identity, finality, and age, plus the path itself.
@@ -2946,26 +2952,46 @@ type JobWorktreeRef struct {
 }
 
 // ListJobWorktreeRefs returns every job that records a non-empty worktree
-// path, decoded with the same rules the caller used to apply itself.
+// path, decoded with the same rules the caller used to apply itself, and the
+// highest rowid the read examined (math.MinInt64 when it examined none) for a
+// later ListJobWorktreeRefsAfter.
 //
 // #2149: the caller loaded every job and decoded every payload to read one
 // field - 15,320 decodes per call on the profiled host, 81% of the daemon's
 // CPU, to build a candidate set that was empty by construction. The decode
 // still happens, but only for rows that mention the key at all, and the
 // caller never sees a payload it might decode again.
-func (s *Store) ListJobWorktreeRefs(ctx context.Context) ([]JobWorktreeRef, error) {
-	rows, err := s.db.QueryContext(ctx, listJobWorktreeRefsSQL)
+func (s *Store) ListJobWorktreeRefs(ctx context.Context) ([]JobWorktreeRef, int64, error) {
+	s.worktreeRefScans.Add(1)
+	return s.ListJobWorktreeRefsAfter(ctx, math.MinInt64)
+}
+
+// WorktreeRefScansForTest reports how many full ListJobWorktreeRefs reads this
+// store has served, so a test can pin how often the reclaim guard scans the
+// jobs table (#2691). Production code must never call it.
+func (s *Store) WorktreeRefScansForTest() int64 {
+	return s.worktreeRefScans.Load()
+}
+
+// ListJobWorktreeRefsAfter is ListJobWorktreeRefs limited to rows whose rowid
+// is above afterRowID; it returns the highest rowid examined, or afterRowID
+// when there was none.
+func (s *Store) ListJobWorktreeRefsAfter(ctx context.Context, afterRowID int64) ([]JobWorktreeRef, int64, error) {
+	last := afterRowID
+	rows, err := s.db.QueryContext(ctx, listJobWorktreeRefsSQL, afterRowID)
 	if err != nil {
-		return nil, err
+		return nil, last, err
 	}
 	defer rows.Close()
 	var refs []JobWorktreeRef
 	for rows.Next() {
 		var ref JobWorktreeRef
+		var rowID int64
 		var payload string
-		if err := rows.Scan(&ref.ID, &ref.State, &ref.UpdatedAt, &ref.CreatedAt, &payload); err != nil {
-			return nil, err
+		if err := rows.Scan(&rowID, &ref.ID, &ref.State, &ref.UpdatedAt, &ref.CreatedAt, &payload); err != nil {
+			return nil, afterRowID, err
 		}
+		last = max(last, rowID)
 		// A payload that does not parse is SKIPPED, matching what the caller
 		// did with a ParseJobPayload error. Silence is correct here: an
 		// unparseable payload records no worktree path to protect.
@@ -2981,7 +3007,10 @@ func (s *Store) ListJobWorktreeRefs(ctx context.Context) ([]JobWorktreeRef, erro
 		ref.WorktreePath = decoded.WorktreePath
 		refs = append(refs, ref)
 	}
-	return refs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, afterRowID, err
+	}
+	return refs, last, nil
 }
 
 // PendingCleanupTrash is a cleanup trash directory recorded as created and not

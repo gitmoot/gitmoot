@@ -72,6 +72,10 @@ type Engine struct {
 	// configured (UNKNOWN) and an error when the configuration cannot be read or is invalid; both
 	// refuse with size_budget_unknown. Nil means no cap is ever known.
 	CleanupBudget func(repo string) (*ApprovedCleanupSizeBudget, *CleanupSizeLimits, error)
+	// WorktreeRefs answers the path_referenced cleanup guard. A reclaim pass
+	// shares one across its attempts so the jobs table is scanned once per pass
+	// (#2691); nil gives each inspection or cleanup its own, one scan each.
+	WorktreeRefs *WorktreeRefIndex
 	// OwnerPIDLive reports whether a recorded owner PID is a live process on this
 	// host. It gates the DESTRUCTIVE implement-delegation worktree/branch cleanup so
 	// a worktree still owned by a live runtime worker is never force-removed out from
