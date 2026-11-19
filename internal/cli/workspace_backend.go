@@ -363,27 +363,36 @@ func (t *workspaceTail) String() string {
 	return string(t.data)
 }
 
+// workspaceRootIdentityScript prints the root's st_dev and st_ino from the
+// same os.lstat the supervisor's fstat compares against, and refuses a root
+// that is not a directory (a symlink included: lstat does not follow it).
+const workspaceRootIdentityScript = `import os, stat, sys
+info = os.lstat(sys.argv[1])
+if not stat.S_ISDIR(info.st_mode):
+    sys.stderr.write("workspace root %s is not a directory\n" % sys.argv[1])
+    sys.exit(3)
+print(info.st_dev, info.st_ino)`
+
 // workspaceRootIdentity reads the root directory's (st_dev, st_ino) inside
-// the workspace, with the same stat the supervisor's fstat compares against.
-// stat does not follow a symlink, and the root must be a directory.
+// the workspace, with python3, which the exec supervisor needs anyway.
 func workspaceRootIdentity(ctx context.Context, sandbox workspaceSandbox) (uint64, uint64, error) {
 	result, err := sandbox.Run(ctx, e2b.StartRequest{
-		Name:           "stat",
-		Args:           []string{"-c", "%d %i %F", "--", sandbox.Root()},
+		Name:           "python3",
+		Args:           []string{"-c", workspaceRootIdentityScript, sandbox.Root()},
 		Dir:            sandbox.Home(),
 		MaxOutputBytes: 4 << 10,
 	})
 	if err != nil {
 		return 0, 0, fmt.Errorf("read the workspace root identity: %w: %s", err, strings.TrimSpace(result.Stderr))
 	}
-	fields := strings.SplitN(strings.TrimSpace(result.Stdout), " ", 3)
-	if len(fields) != 3 || fields[2] != "directory" {
-		return 0, 0, fmt.Errorf("read the workspace root identity: unexpected stat output %q", result.Stdout)
+	fields := strings.Fields(result.Stdout)
+	if len(fields) != 2 {
+		return 0, 0, fmt.Errorf("read the workspace root identity: unexpected output %q", result.Stdout)
 	}
 	dev, devErr := strconv.ParseUint(fields[0], 10, 64)
 	ino, inoErr := strconv.ParseUint(fields[1], 10, 64)
 	if devErr != nil || inoErr != nil || (dev == 0 && ino == 0) {
-		return 0, 0, fmt.Errorf("read the workspace root identity: unexpected stat output %q", result.Stdout)
+		return 0, 0, fmt.Errorf("read the workspace root identity: unexpected output %q", result.Stdout)
 	}
 	return dev, ino, nil
 }

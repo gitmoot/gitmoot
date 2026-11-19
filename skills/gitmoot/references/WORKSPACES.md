@@ -94,14 +94,19 @@ stderr (and on stdout too with `--json`) and exits **125**. Codes:
   exits 125 (or 124) on its own is told apart.
 - **Streaming:** stdout and stderr stream live, kept apart.
 - **stdin:** `/dev/null` unless `--stdin`.
-- **cwd:** relative to `root`; `..` out of it, an absolute path, or any
-  symlink component is `cwd_outside_root`. `open` records the root
-  directory's identity (`st_dev`, `st_ino`). The supervisor opens the root
-  without following a symlink and refuses it (`cwd_outside_root`) unless its
-  identity matches, so a command that replaces the root or any ancestor
-  (on `local` it owns them all) cannot move later commands elsewhere. It then
-  opens the cwd one component at a time the same way and starts the command
-  in that pinned directory.
+- **cwd:** relative to `root`. The `--cwd` argument cannot name a location
+  outside the root: `..` out of it, an absolute path, or a symlink present at
+  exec time is refused with `cwd_outside_root`.
+- **Threat model:** cwd confinement is about the `--cwd` argument, not a
+  boundary against code already running in the workspace. Workspace commands
+  run as the user that owns the root and every directory above it, so a
+  command can always move where later commands run. On E2B the VM is the
+  boundary (it holds no token and nothing else); `local` has no isolation at
+  all. As defence in depth against accidental misuse, `open` records the
+  root's identity (`st_dev`, `st_ino`), and the supervisor opens the root
+  without following a symlink, refuses it unless the identity matches, then
+  opens the cwd one component at a time without following symlinks and starts
+  the command in that pinned directory.
 - **Environment:** exactly the base environment above plus `--env`. Nothing
   from the host is sent.
 - **Cancellation:** SIGINT/SIGTERM to the CLI forwards that signal to the

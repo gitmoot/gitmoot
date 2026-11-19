@@ -168,7 +168,7 @@ func (c *fakeWorkspaceCloud) supervisors() []*fakeWorkspaceProc {
 	defer c.mu.Unlock()
 	var out []*fakeWorkspaceProc
 	for _, proc := range c.procs {
-		if proc.name == "python3" {
+		if proc.name == "python3" && len(proc.args) > 1 && proc.args[1] == workspaceSupervisorScript {
 			out = append(out, proc)
 		}
 	}

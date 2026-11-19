@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,4 +36,46 @@ ln -s "$OUTSIDE" "$HOME"`
 	if next.code != workspaceCLIFailure || strings.Contains(next.stdout, "outside") || workspaceErrorCode(t, next.stderr) != wsErrCwdOutsideRoot {
 		t.Fatalf("exec after the parent swap = %+v (outside is %s)", next, outside)
 	}
+}
+
+// open refuses a root that is not a directory: the identity it records must
+// name the directory the supervisor will open.
+func TestWorkspaceRootIdentityRefusesNonDirectory(t *testing.T) {
+	env := newWorkspaceTestEnv(t, workspaceTestConfig{local: true})
+	opened := env.open("--issue", "1")
+	sandbox, err := workspaceTestLocalSandbox(env, opened.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := workspaceRootIdentity(context.Background(), sandbox); err != nil {
+		t.Fatalf("identity of the real root: %v", err)
+	}
+	if err := os.RemoveAll(opened.Root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(opened.Root, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := workspaceRootIdentity(context.Background(), sandbox); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("identity of a regular-file root = %v", err)
+	}
+	if err := os.Remove(opened.Root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), opened.Root); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := workspaceRootIdentity(context.Background(), sandbox); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("identity of a symlink root = %v", err)
+	}
+}
+
+func workspaceTestLocalSandbox(env *workspaceTestEnv, id string) (workspaceSandbox, error) {
+	record := env.record(id)
+	provider, err := newWorkspaceProvider(env.paths, record.Provider)
+	if err != nil {
+		return nil, err
+	}
+	sandbox, _, err := provider.backend.attach(context.Background(), record.ProviderInstanceID)
+	return sandbox, err
 }

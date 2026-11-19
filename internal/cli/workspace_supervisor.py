@@ -14,9 +14,11 @@
 # before the supervisor exits, so the watchdog never dies leaving the command
 # behind. A forwarded signal escalates to SIGKILL after `kill_grace` seconds.
 # The root is accepted only if its (st_dev, st_ino) matches the identity
-# recorded at open, whatever path led to it; the cwd is then opened one
-# component at a time below it without following symlinks, and the command starts in that pinned directory, so a concurrent
-# rename or symlink swap cannot move it outside the root.
+# recorded at open; the cwd is then opened one component at a time below it
+# without following symlinks, and the command starts in that pinned directory.
+# These stop accidental misuse (a --cwd naming a place outside the root); they
+# are not a boundary against a hostile process already in the workspace, which
+# runs as the owner of the root and every ancestor (see open_root).
 # Output is copied to the host and to a log file that `workspace close` copies
 # out. After the group is dead the last bytes on stderr are a status trailer:
 # MARK + JSON {exit_code, signal, timed_out, error} + newline. The supervisor
@@ -98,9 +100,14 @@ def open_root(root):
     parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
     root_fd = open_child(parent_fd, name, "workspace root %s" % root)
     os.close(parent_fd)
-    # The path above is only a hint: on the local backend workspace commands
-    # own every ancestor and can replace the parent too. What makes this the
-    # workspace root is its identity, recorded when the workspace opened.
+    # The path above is only a hint. What makes this the workspace root is its
+    # identity, recorded when the workspace opened. This check and the
+    # O_NOFOLLOW walk are defence in depth against accidental misuse (a stale
+    # or mistyped --cwd, a root moved or replaced by mistake). They are NOT a
+    # boundary against a hostile process already running in the workspace: it
+    # runs as the user that owns the root and every ancestor, and can defeat
+    # any path or identity check (for example by reclaiming the inode). On E2B
+    # the VM is the isolation boundary; local has no isolation.
     expected = (int(cfg.get("root_dev") or 0), int(cfg.get("root_ino") or 0))
     if expected == (0, 0):
         os.close(root_fd)
