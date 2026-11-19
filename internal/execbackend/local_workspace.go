@@ -40,17 +40,26 @@ func (b *LocalBackend) InstanceHome(instance *Instance) (string, error) {
 // must be the instance home or below it. It runs as the configured local
 // identity, like Exec. The local backend gives no isolation beyond that: it
 // is for development and tests.
-func (b *LocalBackend) StartWorkspaceProcess(instance *Instance, process WorkspaceProcess) (*exec.Cmd, error) {
+//
+// The process is recorded (PID and start time) under the instance's procs
+// directory before this returns, so StopWorkspaceProcesses finds it from any
+// later CLI process. The returned forget removes the record once the caller
+// has reaped the process.
+func (b *LocalBackend) StartWorkspaceProcess(instance *Instance, process WorkspaceProcess) (*exec.Cmd, func(), error) {
 	home, err := b.InstanceHome(instance)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if process.Name == "" {
-		return nil, errors.New("local workspace command is required")
+		return nil, nil, errors.New("local workspace command is required")
 	}
 	dir, err := localCommandDir(home, process.Dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	procs := filepath.Join(home, localWorkspaceProcsDir)
+	if err := os.MkdirAll(procs, 0o700); err != nil {
+		return nil, nil, fmt.Errorf("create local workspace process records: %w", err)
 	}
 	cmd := exec.Command(process.Name, process.Args...)
 	cmd.Dir = dir
@@ -58,10 +67,22 @@ func (b *LocalBackend) StartWorkspaceProcess(instance *Instance, process Workspa
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = process.Stdin, process.Stdout, process.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Credential: b.credential()}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start local workspace command: %w", err)
+		return nil, nil, fmt.Errorf("start local workspace command: %w", err)
 	}
-	return cmd, nil
+	pid := cmd.Process.Pid
+	record := filepath.Join(procs, strconv.Itoa(pid))
+	if err := os.WriteFile(record, []byte(localProcessStartTime(pid)), 0o600); err != nil {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		return nil, nil, fmt.Errorf("record local workspace process: %w", err)
+	}
+	return cmd, func() { _ = os.Remove(record) }, nil
 }
+
+// localWorkspaceProcsDir holds one file per running workspace process, named
+// by its PID and holding its start time, so a PID reused by another process
+// is never signalled.
+const localWorkspaceProcsDir = ".gitmoot-procs"
 
 // FindInstanceByJobID returns the instance whose metadata carries jobID, or
 // "" when none does. The instance directory is the whole local inventory, so
@@ -92,16 +113,45 @@ func (b *LocalBackend) FindInstanceByJobID(jobID string) (string, error) {
 	return "", nil
 }
 
-// StopWorkspaceProcesses ends every process working in home (its current
-// directory is home or below it): the workspace supervisors, which kill their
-// command's whole process group on SIGTERM, and any command still inside the
-// tree. Survivors after wait are killed outright. It fails if any remain.
+// StopWorkspaceProcesses ends every process of a local workspace instance
+// and verifies they are gone. It signals the recorded workspace processes
+// (each supervisor kills its command's whole process group on SIGTERM) and
+// every process whose working directory is inside the instance, compared on
+// the canonical path because /proc reports physical paths. Survivors after
+// wait get SIGKILL. It returns an error unless every one of them is verified
+// gone, so a caller never reports a teardown it could not confirm.
 func StopWorkspaceProcesses(home string, wait time.Duration) error {
-	home = filepath.Clean(home)
-	signalAll := func(sig syscall.Signal) []int {
-		var matched []int
-		entries, _ := os.ReadDir("/proc")
+	canonical, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		return fmt.Errorf("resolve local workspace instance %s: %w", home, err)
+	}
+	canonical = filepath.Clean(canonical)
+	type target struct {
+		pid   int
+		start string
+	}
+	collect := func() ([]target, error) {
+		var targets []target
+		entries, err := os.ReadDir(filepath.Join(canonical, localWorkspaceProcsDir))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("read local workspace process records: %w", err)
+		}
 		for _, entry := range entries {
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil || pid <= 0 {
+				continue
+			}
+			start, err := os.ReadFile(filepath.Join(canonical, localWorkspaceProcsDir, entry.Name()))
+			if err != nil {
+				return nil, fmt.Errorf("read local workspace process record %d: %w", pid, err)
+			}
+			targets = append(targets, target{pid: pid, start: strings.TrimSpace(string(start))})
+		}
+		procs, err := os.ReadDir("/proc")
+		if err != nil {
+			return nil, fmt.Errorf("scan processes: %w", err)
+		}
+		for _, entry := range procs {
 			pid, err := strconv.Atoi(entry.Name())
 			if err != nil || pid == os.Getpid() {
 				continue
@@ -111,46 +161,80 @@ func StopWorkspaceProcesses(home string, wait time.Duration) error {
 				continue
 			}
 			cwd = strings.TrimSuffix(cwd, " (deleted)")
-			if cwd != home && !strings.HasPrefix(cwd, home+string(filepath.Separator)) {
-				continue
-			}
-			if syscall.Kill(pid, sig) == nil {
-				matched = append(matched, pid)
+			if cwd == canonical || strings.HasPrefix(cwd, canonical+string(filepath.Separator)) {
+				// A process that exited between the two reads has no start
+				// time; it is gone, and its PID must not be signalled later.
+				if start := localProcessStartTime(pid); start != "" {
+					targets = append(targets, target{pid: pid, start: start})
+				}
 			}
 		}
-		return matched
+		return targets, nil
 	}
-	alive := func(pids []int) []int {
-		var left []int
-		for _, pid := range pids {
-			if syscall.Kill(pid, 0) == nil && !processZombie(pid) {
-				left = append(left, pid)
+	// alive is the subset still running as the same process: same start
+	// time (a reused PID has another), a process leader rather than a thread
+	// (/proc/<tid> answers for threads, and signalling a thread ID signals its
+	// whole process), never this process, and not merely awaiting a reaper.
+	alive := func(targets []target) []target {
+		var left []target
+		for _, t := range targets {
+			if t.start == "" || t.pid == os.Getpid() || localProcessStartTime(t.pid) != t.start || !processLeader(t.pid) || processZombie(t.pid) {
+				continue
 			}
+			left = append(left, t)
 		}
 		return left
 	}
-	pids := signalAll(syscall.SIGTERM)
-	deadline := time.Now().Add(wait)
-	for len(alive(pids)) > 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if left := alive(pids); len(left) > 0 {
-		for _, pid := range left {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+	signal := func(targets []target, sig syscall.Signal) {
+		for _, t := range alive(targets) {
+			_ = syscall.Kill(t.pid, sig)
 		}
 	}
-	signalAll(syscall.SIGKILL)
+	targets, err := collect()
+	if err != nil {
+		return err
+	}
+	signal(targets, syscall.SIGTERM)
+	deadline := time.Now().Add(wait)
+	for len(alive(targets)) > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
 	deadline = time.Now().Add(5 * time.Second)
 	for {
-		left := alive(append(pids, signalAll(0)...))
+		more, err := collect()
+		if err != nil {
+			return err
+		}
+		targets = append(targets, more...)
+		left := alive(targets)
 		if len(left) == 0 {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("local workspace processes %v did not exit", left)
+			pids := make([]int, len(left))
+			for i, t := range left {
+				pids[i] = t.pid
+			}
+			return fmt.Errorf("local workspace processes %v did not exit", pids)
 		}
+		signal(left, syscall.SIGKILL)
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// processLeader reports whether pid names a process (its thread group
+// leader), not one thread of another process.
+func processLeader(pid int) bool {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if value, ok := strings.CutPrefix(line, "Tgid:"); ok {
+			return strings.TrimSpace(value) == strconv.Itoa(pid)
+		}
+	}
+	return false
 }
 
 // processZombie reports whether pid has exited and only awaits its reaper.

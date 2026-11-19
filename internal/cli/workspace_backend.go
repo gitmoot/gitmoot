@@ -35,6 +35,10 @@ type workspaceBackend interface {
 	// inventory, for a workspace whose create answer was lost. authoritative
 	// reports that an empty result proves nothing was allocated.
 	find(ctx context.Context, workspaceID string) (instanceID string, authoritative bool, err error)
+	// deadlineGrace is how long past a requested deadline the provider may
+	// still be running a sandbox. enforced is false when the provider has no
+	// deadline at all, so nothing may be settled by expiry.
+	deadlineGrace() (grace time.Duration, enforced bool)
 }
 
 // workspaceSandbox is one attached workspace instance.
@@ -83,6 +87,12 @@ func (r remoteWorkspaceBackend) destroy(ctx context.Context, instanceID string) 
 func (r remoteWorkspaceBackend) find(ctx context.Context, workspaceID string) (string, bool, error) {
 	id, err := r.backend.FindWorkspace(ctx, workspaceID)
 	return id, false, err
+}
+
+// deadlineGrace is the remote backend's own provider TTL grace, the bound
+// the job reaper also relies on.
+func (r remoteWorkspaceBackend) deadlineGrace() (time.Duration, bool) {
+	return r.backend.ProviderTTLGrace(), true
 }
 
 type remoteWorkspaceSandbox struct{ *remoteexec.Workspace }
@@ -156,6 +166,10 @@ func (l localWorkspaceBackend) destroy(ctx context.Context, instanceID string) (
 	}
 	return e2b.Gone, nil
 }
+
+// deadlineGrace: local instances have no provider deadline; they end only
+// when destroy confirms it.
+func (localWorkspaceBackend) deadlineGrace() (time.Duration, bool) { return 0, false }
 
 // find scans the local instances, which is a complete inventory.
 func (l localWorkspaceBackend) find(_ context.Context, workspaceID string) (string, bool, error) {
@@ -264,7 +278,7 @@ func (s *localWorkspaceSandbox) Start(ctx context.Context, request e2b.StartRequ
 		defer reader.Close()
 		process.Stdin, stdin = reader, writer
 	}
-	cmd, err := s.backend.StartWorkspaceProcess(s.instance, process)
+	cmd, forget, err := s.backend.StartWorkspaceProcess(s.instance, process)
 	if err != nil {
 		if stdin != nil {
 			_ = stdin.Close()
@@ -283,6 +297,7 @@ func (s *localWorkspaceSandbox) Start(ctx context.Context, request e2b.StartRequ
 	stream := &localWorkspaceStream{result: make(chan localWorkspaceResult, 1)}
 	go func() {
 		waitErr := cmd.Wait()
+		forget()
 		if stdin != nil {
 			s.mu.Lock()
 			delete(s.stdins, pid)

@@ -44,12 +44,6 @@ const (
 	// margin absorbs the request's transit (the E2B client bounds one control
 	// request at 15s) and keeps the provider deadline inside the funded time.
 	workspaceDeadlineMargin = time.Minute
-	// workspaceExpiryGrace is how long after paid_until gitmoot still treats a
-	// sandbox as possibly alive: the provider's own enforcement latency, the
-	// same bound the job reaper uses (remote.Backend.ProviderTTLGrace). After
-	// it, the provider guarantees the sandbox is gone, so a workspace whose
-	// teardown was never confirmed can be settled.
-	workspaceExpiryGrace = 15 * time.Minute
 )
 
 // workspaceProviderDeadline is the absolute deadline every provider request
@@ -73,11 +67,16 @@ func workspaceTTLUntil(paidUntil time.Time) (time.Duration, error) {
 	return ttl, nil
 }
 
-// workspaceProviderExpired reports whether the provider guarantees every
-// sandbox w could hold is gone at now: its funded deadline plus the
-// provider's enforcement grace has passed.
-func workspaceProviderExpired(w db.Workspace, now time.Time) bool {
-	return !now.Before(w.PaidUntil.Add(workspaceExpiryGrace))
+// workspaceExpiredAt is when the provider guarantees every sandbox w could
+// hold is gone: its funded deadline plus the backend's enforcement grace. ok
+// is false for a backend that enforces no deadline (local), whose workspaces
+// are never settled without a confirmed teardown.
+func workspaceExpiredAt(w db.Workspace, backend workspaceBackend) (time.Time, bool) {
+	grace, enforced := backend.deadlineGrace()
+	if !enforced {
+		return time.Time{}, false
+	}
+	return w.PaidUntil.Add(grace), true
 }
 
 // Close reasons the daemon and CLI record.
@@ -174,21 +173,26 @@ func closeWorkspace(ctx context.Context, store *db.Store, paths config.Paths, id
 		}
 		return store.FinishWorkspaceClose(ctx, id, outcome, accrued, now, finalReason)
 	}
+	provider, err := newWorkspaceProvider(paths, workspace.Provider)
+	if err != nil {
+		// Without the provider there is no deadline guarantee to settle by.
+		return fmt.Errorf("close workspace %s: still reserved until its provider is reachable: %w", id, err)
+	}
 	// pending leaves the workspace closing with its reservation, unless the
 	// provider's deadline guarantee now covers it.
 	pending := func(cause error) error {
-		if workspaceProviderExpired(workspace, workspaceNow()) {
+		expiresAt, enforced := workspaceExpiredAt(workspace, provider.backend)
+		if !enforced {
+			return fmt.Errorf("close workspace %s: still reserved until teardown is confirmed (this provider enforces no deadline): %w", id, cause)
+		}
+		if !workspaceNow().Before(expiresAt) {
 			if record.LogsError == "" {
 				record.LogsError = cause.Error()
 			}
 			return settle(true)
 		}
 		return fmt.Errorf("close workspace %s: still reserved until teardown is confirmed or the provider deadline %s passes: %w",
-			id, workspace.PaidUntil.Add(workspaceExpiryGrace).UTC().Format(time.RFC3339), cause)
-	}
-	provider, err := newWorkspaceProvider(paths, workspace.Provider)
-	if err != nil {
-		return pending(err)
+			id, expiresAt.UTC().Format(time.RFC3339), cause)
 	}
 	instanceID := workspace.ProviderInstanceID
 	if instanceID == "" {

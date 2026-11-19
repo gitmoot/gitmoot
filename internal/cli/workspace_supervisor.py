@@ -62,31 +62,54 @@ def refuse(code, message):
     finish({"exit_code": 125, "signal": None, "timed_out": False, "error": {"code": code, "message": message}})
 
 
-def open_cwd(root, relative):
-    """Open relative below root without following any symlink."""
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    if relative in ("", "."):
-        return fd
+def open_child(fd, part, what):
+    """Open one directory entry below fd without following a symlink."""
+    try:
+        return os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+    except FileNotFoundError:
+        os.close(fd)
+        refuse("invalid_args", "%s is not a directory in the workspace" % what)
+    except OSError:
+        try:
+            is_link = stat.S_ISLNK(os.lstat(part, dir_fd=fd).st_mode)
+        except OSError:
+            is_link = False
+        os.close(fd)
+        if is_link:
+            refuse("cwd_outside_root", "%s goes through a symlink; workspace paths never follow symlinks" % what)
+        refuse("invalid_args", "%s is not a directory in the workspace" % what)
+
+
+def open_root(root):
+    """Open the workspace root itself without following a symlink.
+
+    The root's parent (the guest home, or the local instance directory) sits
+    in a directory workspace commands cannot write, so it cannot itself be
+    swapped and is opened by path. Its entries can be: a command may replace
+    the root with a symlink. So the root is opened from the parent's
+    descriptor with O_NOFOLLOW, and a replaced root is refused rather than
+    resolved. Nothing on the path is resolved by name and reopened.
+    """
+    root = os.path.normpath(root)
+    parent, name = os.path.split(root)
+    if not os.path.isabs(root) or name in ("", ".", ".."):
+        refuse("invalid_args", "workspace root %s is not an absolute directory path" % root)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    root_fd = open_child(parent_fd, name, "workspace root %s" % root)
+    os.close(parent_fd)
+    return root_fd
+
+
+def open_cwd(root_fd, relative):
+    """Open relative below root_fd without following any symlink."""
+    fd = root_fd
     for part in relative.split("/"):
         if part in ("", "."):
             continue
         if part == "..":
             os.close(fd)
             refuse("cwd_outside_root", "cwd %s leaves the workspace root" % relative)
-        try:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-        except FileNotFoundError:
-            os.close(fd)
-            refuse("invalid_args", "cwd %s is not a directory in the workspace" % relative)
-        except OSError:
-            try:
-                is_link = stat.S_ISLNK(os.lstat(part, dir_fd=fd).st_mode)
-            except OSError:
-                is_link = False
-            os.close(fd)
-            if is_link:
-                refuse("cwd_outside_root", "cwd %s goes through a symlink; workspace cwd never follows symlinks" % relative)
-            refuse("invalid_args", "cwd %s is not a directory in the workspace" % relative)
+        child = open_child(fd, part, "cwd %s" % relative)
         os.close(fd)
         fd = child
     return fd
@@ -94,7 +117,7 @@ def open_cwd(root, relative):
 
 if os.path.isabs(cfg["cwd"]):
     refuse("cwd_outside_root", "cwd %s must be relative to the workspace root" % cfg["cwd"])
-cwd_fd = open_cwd(os.path.realpath(cfg["root"]), cfg["cwd"])
+cwd_fd = open_cwd(open_root(cfg["root"]), cfg["cwd"])
 
 log = None
 log_size = 0

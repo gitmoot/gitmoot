@@ -95,10 +95,11 @@ stderr (and on stdout too with `--json`) and exits **125**. Codes:
 - **Streaming:** stdout and stderr stream live, kept apart.
 - **stdin:** `/dev/null` unless `--stdin`.
 - **cwd:** relative to `root`; `..` out of it, an absolute path, or any
-  symlink component is `cwd_outside_root`. The supervisor opens the directory
-  one component at a time without following symlinks and starts the command
-  in that pinned directory, so a concurrent rename or symlink swap cannot move
-  it outside the root.
+  symlink component is `cwd_outside_root`. The supervisor opens the root
+  from its parent's descriptor without following a symlink (a root replaced
+  by a symlink is refused too), then the cwd one component at a time the same
+  way, and starts the command in that pinned directory, so a concurrent rename
+  or symlink swap cannot move it outside the root.
 - **Environment:** exactly the base environment above plus `--env`. Nothing
   from the host is sent.
 - **Cancellation:** SIGINT/SIGTERM to the CLI forwards that signal to the
@@ -159,9 +160,17 @@ provider refused outright. Everything else stays reserved, with the workspace
 - a delete or re-attach the provider answers inconclusively (E2B answers 404
   for an expired sandbox, which gitmoot does not treat as proof).
 
-Such a workspace settles once `paid_until` plus 15 minutes (the provider's
-enforcement grace) has passed, because the provider guarantees teardown by
-then. It is recorded `expired`, and the whole reservation is charged.
+Such a workspace settles once `paid_until` plus the remote backend's provider
+TTL grace (15 minutes, the same bound the job reaper relies on) has passed,
+because the provider guarantees teardown by then. It is recorded `expired`,
+and the whole reservation is charged. A workspace whose provider
+configuration cannot be loaded, and every `local` workspace (which has no
+provider deadline), stays `closing` until a teardown is confirmed.
+
+A `local` teardown stops every process recorded at exec start (PID and start
+time) and every process working inside the instance (compared on the
+canonical path), and reports the instance destroyed only after verifying
+they are all gone.
 
 ## Lifecycle
 

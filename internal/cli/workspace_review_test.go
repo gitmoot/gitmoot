@@ -15,10 +15,15 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	remoteexec "github.com/gitmoot/gitmoot/internal/execbackend/remote"
 )
 
 // Tests for the PR #2694 review: every ambiguous outcome keeps its
 // reservation, and the VM-side watchdog and cwd confinement hold.
+
+// workspaceTestProviderGrace is the E2B backend's provider TTL grace, the
+// bound an unconfirmed workspace settles by.
+var workspaceTestProviderGrace = (*remoteexec.Backend)(nil).ProviderTTLGrace()
 
 func workspaceCommittedUSD(t *testing.T, env *workspaceTestEnv) float64 {
 	t.Helper()
@@ -65,7 +70,7 @@ func TestWorkspaceLostCreateAnswerKeepsReservation(t *testing.T) {
 		t.Fatal("a refused open called create")
 	}
 	// Still held just before the provider's deadline guarantee...
-	env.advance(time.Hour + workspaceExpiryGrace - time.Minute)
+	env.advance(time.Hour + workspaceTestProviderGrace - time.Minute)
 	if _, err := closeWorkspaceForTest(env, lost.ID); err == nil {
 		t.Fatal("an unconfirmed close settled before the provider deadline")
 	}
@@ -132,7 +137,7 @@ func TestWorkspaceExpiredSandboxSettlesAfterProviderDeadline(t *testing.T) {
 	if got := env.record(opened.ID); got.State != db.WorkspaceStateClosing || got.CostReservedUSD != 1 {
 		t.Fatalf("before the deadline: %+v", got)
 	}
-	env.advance(time.Hour + workspaceExpiryGrace)
+	env.advance(time.Hour + workspaceTestProviderGrace)
 	env.sweep()
 	got := env.record(opened.ID)
 	if got.State != db.WorkspaceStateClosed || got.CloseReason != workspaceReasonExpired || got.CostAccruedUSD < got.CostReservedUSD-1e-9 {
