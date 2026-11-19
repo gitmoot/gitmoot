@@ -19,6 +19,11 @@ import (
 	"github.com/gitmoot/gitmoot/internal/credgw"
 )
 
+// enableReviewSourceGatewayFixture configures the remote credential gateway on
+// an ephemeral loopback port and starts it on the socket that chose the port.
+// Closing that socket and letting the dispatch bind the address later lost the
+// port to parallel tests ("bind: address already in use", #2673); the dispatch
+// now finds the gateway serving the configured coordinates and reuses it.
 func enableReviewSourceGatewayFixture(t *testing.T, paths config.Paths) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -26,11 +31,22 @@ func enableReviewSourceGatewayFixture(t *testing.T, paths config.Paths) {
 		t.Fatal(err)
 	}
 	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
+	appendConfig(t, paths, fmt.Sprintf("\ncredential_gateway_listen = %q\ncredential_gateway_url = %q\n", address, "https://"+address))
+	cfg, err := config.LoadRemoteExecConfig(paths)
+	if err != nil {
+		_ = listener.Close()
 		t.Fatal(err)
 	}
-	appendConfig(t, paths, fmt.Sprintf("\ncredential_gateway_listen = %q\ncredential_gateway_url = %q\n", address, "https://"+address))
+	gateway, err := credgw.DefaultRegistry.Gateway(paths.Home, credgw.DefaultLogf)
+	if err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = credgw.DefaultRegistry.CloseHome(context.Background(), paths.Home) })
+	// The same coordinates the dispatch requests, so it reuses this listener.
+	if err := gateway.ServeRemote(listener, credgw.RemoteListenerOptions{ListenAddress: cfg.CredentialGatewayListen, AdvertiseURLs: cfg.CredentialGatewayURLs()}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Keep the production broker pinned to github.com. Only its HTTP transport is

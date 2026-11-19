@@ -649,6 +649,12 @@ func TestLocalBackendReapsProcessKilledMidProvision(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		// The helper sleeps forever once ready; never orphan it if the test
+		// fails before the deliberate kill below.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
 	waitForPath(t, ready)
 	idBytes, err := os.ReadFile(ready)
 	if err != nil {
@@ -716,7 +722,13 @@ func TestLocalBackendExecRejectsDirectoryOutsideWorkspace(t *testing.T) {
 func runLocalBackendReapHelper(t *testing.T) {
 	backend := newTestLocalBackendAt(t, os.Getenv("GITMOOT_LOCAL_BACKEND_ROOT"))
 	backend.afterWorkspaceCreated = func(instance *Instance) {
-		if err := os.WriteFile(os.Getenv("GITMOOT_LOCAL_BACKEND_READY"), []byte(instance.ID), 0o600); err != nil {
+		// Write then rename so the parent, which waits only for the path to
+		// exist, never reads a created-but-not-yet-written (empty) file.
+		ready := os.Getenv("GITMOOT_LOCAL_BACKEND_READY")
+		if err := os.WriteFile(ready+".tmp", []byte(instance.ID), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(ready+".tmp", ready); err != nil {
 			t.Fatal(err)
 		}
 		for {
@@ -892,9 +904,13 @@ func tamperLocalMetadata(t *testing.T, root string, mutate func(map[string]any))
 	}
 }
 
+// waitForPath waits for path to exist. Writers that need the reader to see
+// complete content must create it atomically (write a temp file, rename).
+// The bound is generous because the path may be produced by a child process
+// that has to start and clone a repository on a loaded host.
 func waitForPath(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return

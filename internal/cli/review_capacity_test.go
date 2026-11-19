@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -114,6 +115,7 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 				return runtime.ShellAdapter{Dir: checkout, Runner: runner}, nil
 			}
 			worker.CommenterFactory = func(string) github.Client { return githubtest.NoopClient{} }
+			hideSeatStagingSources(t)
 			runCtx, cancel := context.WithCancel(ctx)
 			finished := make(chan struct{})
 			var runErr error
@@ -123,7 +125,7 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 			case <-runner.started:
 			case <-finished:
 				t.Fatalf("worker stopped before review delivery: %v", runErr)
-			case <-time.After(reviewCapacityTestStartWait):
+			case <-reviewCapacityTestEventWait(t):
 				observed, _ := store.GetJob(ctx, job.ID)
 				events, _ := store.ListJobEvents(ctx, job.ID)
 				t.Fatalf("local review never reached delivery under cleanup-only hold: job=%+v events=%+v", observed, events)
@@ -137,7 +139,7 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 			broken.Store(true)
 			select {
 			case <-finished:
-			case <-time.After(reviewCapacityTestStopWait):
+			case <-reviewCapacityTestEventWait(t):
 				t.Fatal("review kept running after its capacity evidence failed")
 			}
 			if runErr == nil || !strings.Contains(runErr.Error(), "janitor status is not valid JSON") {
@@ -165,16 +167,23 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 	}
 }
 
-// Event waits for the review-capacity monitor tests. They bound how long the
-// test waits for something that WILL happen (delivery starting, a fail-closed
-// cancel), so they only fail a hung run; they are not part of the behaviour.
-// CI's race shards took 44-57s to reach delivery under load (statfs_failed
-// failed at 56.66s against a 30s wait), so these are sized for that, while the
-// "still running" phases keep their exact monitor-interval sleeps.
-const (
-	reviewCapacityTestStartWait = 2 * time.Minute
-	reviewCapacityTestStopWait  = 30 * time.Second
-)
+// reviewCapacityTestEventWait bounds a wait for something that WILL happen
+// (delivery starting, a fail-closed cancel, a capacity log row), so it only
+// fails a hung run; it is not part of the behaviour. A fixed bound flaked on
+// loaded hosts (delivery took over 143s at load 55-150, #2676), so the wait
+// runs until shortly before the test binary's own deadline, leaving time to
+// report the state and unwind the worker. The "still running" phases keep
+// their exact monitor-interval sleeps.
+func reviewCapacityTestEventWait(t *testing.T) <-chan time.Time {
+	t.Helper()
+	const unwindMargin = 30 * time.Second
+	deadline, ok := t.Deadline()
+	if !ok {
+		// -timeout 0: nothing else bounds the run, so neither does this wait.
+		return nil
+	}
+	return time.After(max(time.Until(deadline)-unwindMargin, time.Second))
+}
 
 // Jarvis 380078/380099, owner disk policy: low space decides only where NEW
 // reviews start. A local review admitted above 20GB keeps running when free
@@ -277,6 +286,7 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 		return runtime.ShellAdapter{Dir: checkout, Runner: runner}, nil
 	}
 	worker.CommenterFactory = func(string) github.Client { return githubtest.NoopClient{} }
+	hideSeatStagingSources(t)
 	runCtx, cancel := context.WithCancel(ctx)
 	finished := make(chan struct{})
 	var runErr error
@@ -286,7 +296,7 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 	case <-runner.started:
 	case <-finished:
 		t.Fatalf("review did not start above the warning threshold: %v", runErr)
-	case <-time.After(reviewCapacityTestStartWait):
+	case <-reviewCapacityTestEventWait(t):
 		t.Fatal("review never reached delivery")
 	}
 	// Into the warning band, then below the hard floor while Janitor reports
@@ -360,7 +370,7 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 	}
 	select {
 	case <-finished:
-	case <-time.After(reviewCapacityTestStopWait):
+	case <-reviewCapacityTestEventWait(t):
 		t.Fatalf("review kept running after %s", trigger)
 	}
 	ended, err := store.GetJob(ctx, job.ID)
@@ -380,6 +390,70 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 	if reason == "" || !strings.Contains(reason, "review capacity monitor cancelled this run") || !strings.Contains(reason, wantReason) {
 		t.Fatalf("cancel has no recorded reason: %+v", events)
 	}
+}
+
+// #2676: stopping the runtime makes the worker record the run failed at once,
+// and the shared lifecycle lock the monitor holds does not hold that write
+// back. The monitor therefore stops the runtime only after the cancel is
+// committed; stopping it first let the worker's "failed" win under load, and
+// CancelJob then refused the finished job, so a fail-closed stop ended failed
+// with no recorded cause.
+func TestCancelMonitoredReviewCommitsCancelBeforeStoppingRuntime(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "monitored-review", Agent: "reviewer", Type: "review", State: string(workflow.JobRunning), Payload: `{"repo":"owner/repo"}`},
+		db.JobEvent{Kind: string(workflow.JobRunning), Message: "seed"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(ctx, "monitored-review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stateAtStop []string
+	stop := func() {
+		latest, err := store.GetJob(ctx, job.ID)
+		if err != nil {
+			t.Errorf("read job when the runtime was stopped: %v", err)
+			return
+		}
+		stateAtStop = append(stateAtStop, latest.State)
+	}
+	if err := cancelMonitoredReview(store, job.ID, job.LifecycleGeneration, "statfs failed", stop); err != nil {
+		t.Fatalf("cancelMonitoredReview: %v", err)
+	}
+	if len(stateAtStop) == 0 {
+		t.Fatal("cancelMonitoredReview never stopped the runtime")
+	}
+	for _, state := range stateAtStop {
+		if state != string(workflow.JobCancelled) {
+			t.Fatalf("runtime stopped while the job was %q (states at each stop: %v); the cancel must be committed first", state, stateAtStop)
+		}
+	}
+}
+
+// hideSeatStagingSources leaves only git on PATH for the worker run that
+// follows. Read-only seat setup copies every Go installation and provider
+// runtime it finds on PATH into the (fresh, per-test) home before delivery
+// starts: 220+ MB per subtest, measured at 37s to 2m33s on a loaded host, and
+// the cause of "review never reached delivery" (#2676). These tests are about
+// the capacity monitor, not staging, so each Go and runtime is published
+// unavailable instead (they declare no real adapter exec, so that does not
+// refuse the review) and delivery starts within a second.
+func hideSeatStagingSources(t *testing.T) {
+	t.Helper()
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := os.Symlink(git, filepath.Join(bin, "git")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
 }
 
 type reviewCapacityBlockingRunner struct {

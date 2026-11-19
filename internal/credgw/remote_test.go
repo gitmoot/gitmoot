@@ -586,6 +586,36 @@ func TestRegistryRemoteGatewayRejectsChangedCoordinates(t *testing.T) {
 	}
 }
 
+// A caller that bound the listener itself (so its port is never released
+// before serving) hands it over; a later RemoteGateway for the same
+// coordinates reuses it instead of binding the address a second time.
+func TestRegistryRemoteGatewayReusesHandedOverListener(t *testing.T) {
+	registry := NewRegistry()
+	home := t.TempDir()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	options := RemoteListenerOptions{ListenAddress: address, AdvertiseURLs: []string{"https://" + address}}
+	gateway, err := registry.Gateway(home, nil)
+	if err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	defer gateway.Close(context.Background())
+	if err := gateway.ServeRemote(listener, options); err != nil {
+		t.Fatal(err)
+	}
+	reused, err := registry.RemoteGateway(home, nil, options)
+	if err != nil || reused != gateway {
+		t.Fatalf("handed-over listener reuse gateway=%v err=%v", reused == gateway, err)
+	}
+	if got := gateway.RemoteURL(); got != "https://"+address {
+		t.Fatalf("RemoteURL = %q, want https://%s", got, address)
+	}
+}
+
 // One listener serves sandboxes of two providers that reach it through
 // different origins (a public IP for E2B, a reverse tunnel name for the Mac).
 // The server certificate must cover both, and a lease must stay bound to the
