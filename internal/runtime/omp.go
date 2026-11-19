@@ -440,7 +440,7 @@ func (a OmpAdapter) preflight() error {
 // for this runtime — Start and Deliver share it — so no flag can appear on one
 // path and go missing on the other. Shape (asserted byte-for-byte in tests):
 //
-//	omp -p --mode=json --approval-mode=<policy> --no-session [--add-dir <p>]…
+//	omp -p --mode=json --approval-mode=<policy> --no-session --wait-async [--add-dir <p>]…
 //	    [--model <M>] [--thinking <lvl>] [--max-time <s>]
 //	    [--plan-yolo [--plan-yolo-into <M>]] [@<staged>/prompt.md]
 //	    -- <single prompt token>
@@ -465,6 +465,12 @@ func (a OmpAdapter) preflight() error {
 //     host's tools.approvalMode.
 //   - `--no-session` keeps the run in memory: no per-worktree session .jsonl
 //     accretion, and nothing to accidentally resume (v1 never resumes).
+//   - `--wait-async` (async.printWake) makes print mode wait for the run's
+//     background jobs and wake the session with each result before exiting.
+//     Without it omp disposes the session on the first settle, cancels any
+//     backgrounded command and exits mid-run (#2705). It is emitted for every
+//     run, NoExecution seats included: one argv shape, and with no bash there is
+//     nothing to wait for, so it is a no-op there.
 //   - the prompt is exactly ONE token after `--`: multiple positionals become
 //     multiple sequential (separately billed) turns, a prompt starting with `-` is
 //     read as an unknown flag and exits 2, and one starting with `@` is read as a
@@ -486,6 +492,7 @@ var ompRuntimeContract = RuntimeContract{
 		{Kind: RuntimeRequirementFlag, Name: "flag --mode", Flag: "--mode", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --mode, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 		{Kind: RuntimeRequirementFlag, Name: "flag --approval-mode", Flag: "--approval-mode", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --approval-mode, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 		{Kind: RuntimeRequirementFlag, Name: "flag --no-session", Flag: "--no-session", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --no-session, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --wait-async", Flag: "--wait-async", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --wait-async, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 		{Kind: RuntimeRequirementFlag, Name: "flag --plan-yolo", Flag: "--plan-yolo", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --plan-yolo, or run the job on a runtime whose installed CLI satisfies its declared contract", PlanMode: true},
 		{Kind: RuntimeRequirementFlag, Name: "flag --plan-yolo-into", Flag: "--plan-yolo-into", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --plan-yolo-into, or run the job on a runtime whose installed CLI satisfies its declared contract", PlanMode: true},
 	},
@@ -552,7 +559,7 @@ func ompPlanTarget(model string, planInto string) string {
 
 func ompArgs(agent Agent, model string, thinking string, maxTime string, plan bool, planInto string, attachArgs []string, prompt string) []string {
 	approval := ompApprovalArgs(agent)
-	args := []string{"-p", "--mode=json", approval, "--no-session"}
+	args := []string{"-p", "--mode=json", approval, "--no-session", "--wait-async"}
 	args = append(args, ompWorkspaceArgs(agent)...)
 	args = append(args, ompNoExecutionArgs(agent)...)
 	if model != "" {
@@ -1118,6 +1125,10 @@ type ompStreamEvent struct {
 	// It is a *bool so an absent field reads as terminal — an omp build that stops
 	// tagging the event must not turn every run into a truncation error.
 	IsTerminal *bool `json:"isTerminal"`
+	// AwaitingAsyncWork is set on a non-terminal agent_end when the run yielded
+	// while background jobs were still running. If it is the LAST agent_end, omp
+	// exited before that work finished (#2705).
+	AwaitingAsyncWork bool `json:"awaitingAsyncWork"`
 	// Success is omp's own verdict on a retry saga, carried by auto_retry_end
 	// (agent-session-events.ts:42-47: `{type:"auto_retry_end"; success: boolean;
 	// attempt: number; finalError?: string; …}`). It is a *bool so a build that
@@ -1379,6 +1390,7 @@ func parseOmpStreamJSONWithProvider(output string) (string, string, ompUsage, st
 		rollupCount   int
 		agentEndCount int
 		lastTerminal  bool
+		lastAwaiting  bool
 		firstErr      error
 		turnFailed    bool
 		retryPending  bool
@@ -1536,6 +1548,7 @@ func parseOmpStreamJSONWithProvider(output string) (string, string, ompUsage, st
 			// first; on omp's normal print-mode wire the superseding logic collapses
 			// them and this is simply the final settle.
 			lastTerminal = event.IsTerminal == nil || *event.IsTerminal
+			lastAwaiting = event.AwaitingAsyncWork
 			if event.Telemetry != nil && event.Telemetry.Usage != nil {
 				rollupCount++
 				rollup.InputTokens += event.Telemetry.Usage.InputTokens
@@ -1568,6 +1581,9 @@ func parseOmpStreamJSONWithProvider(output string) (string, string, ompUsage, st
 	}
 	if agentEndCount == 0 {
 		return "", sessionID, usage, "", errors.New("omp stream ended without an agent_end event: the CLI died mid-stream or its --mode=json envelope changed")
+	}
+	if !lastTerminal && lastAwaiting {
+		return "", sessionID, usage, "", errors.New("omp stream ended while the run was waiting for background work (agent_end awaitingAsyncWork): omp exited before the background job finished")
 	}
 	if !lastTerminal {
 		return "", sessionID, usage, "", errors.New("omp stream ended on a non-terminal agent_end (isTerminal false): the run was scheduling a continuation (retry, model fallback or auto-compaction) and the stream stopped before it finished")

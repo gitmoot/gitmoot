@@ -173,6 +173,7 @@ Usage: omp [options]
   --mode
   --approval-mode
   --no-session
+  --wait-async
 EOF
     ;;
   --version)

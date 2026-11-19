@@ -148,6 +148,7 @@ Usage: omp [options]
   --mode
   --approval-mode
   --no-session
+  --wait-async
   --plan-yolo
   --plan-yolo-into
 EOF
