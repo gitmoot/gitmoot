@@ -84,14 +84,14 @@ def open_child(fd, part, what):
 
 
 def open_root(root):
-    """Open the workspace root itself without following a symlink.
+    """Open the workspace root and verify it by its recorded identity.
 
-    The root's parent (the guest home, or the local instance directory) sits
-    in a directory workspace commands cannot write, so it cannot itself be
-    swapped and is opened by path. Its entries can be: a command may replace
-    the root with a symlink. So the root is opened from the parent's
-    descriptor with O_NOFOLLOW, and a replaced root is refused rather than
-    resolved. Nothing on the path is resolved by name and reopened.
+    The parent is opened by path as a best-effort hint: it follows whatever
+    the path names now, including a parent that was replaced. The root's last
+    component is opened from it with O_NOFOLLOW, and the result is accepted
+    only if its (st_dev, st_ino) is the identity recorded at open. This stops
+    accidental misuse; it is not a boundary against a process already running
+    in the workspace (see the threat model in WORKSPACES.md).
     """
     root = os.path.normpath(root)
     parent, name = os.path.split(root)

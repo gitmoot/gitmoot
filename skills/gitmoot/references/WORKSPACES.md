@@ -103,10 +103,11 @@ stderr (and on stdout too with `--json`) and exits **125**. Codes:
   command can always move where later commands run. On E2B the VM is the
   boundary (it holds no token and nothing else); `local` has no isolation at
   all. As defence in depth against accidental misuse, `open` records the
-  root's identity (`st_dev`, `st_ino`), and the supervisor opens the root
-  without following a symlink, refuses it unless the identity matches, then
-  opens the cwd one component at a time without following symlinks and starts
-  the command in that pinned directory.
+  root's identity (`st_dev`, `st_ino`). The supervisor reaches the root by its
+  path as a best-effort hint (the last component without following a
+  symlink), refuses it unless the identity matches, then opens the cwd one
+  component at a time without following symlinks and starts the command in
+  that pinned directory.
 - **Environment:** exactly the base environment above plus `--env`. Nothing
   from the host is sent.
 - **Cancellation:** SIGINT/SIGTERM to the CLI forwards that signal to the
