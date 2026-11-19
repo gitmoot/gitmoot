@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -1325,13 +1324,17 @@ type retainedTranscript struct {
 const maxPartialLineBytes = 1 << 20
 
 // newRetainedTranscript attaches the phase instrument to an open transcript
-// file. A job whose runtime is unknown, or whose runtime emits no tool events,
+// log. A job whose runtime is unknown, or whose runtime emits no tool events,
 // still gets a profile row - tagged opaque, because a silent absence is
 // indistinguishable from a fast run.
-func newRetainedTranscript(file *os.File, jobID, jobType, runtimeName string, attempt int64, store *db.Store) *retainedTranscript {
+//
+// log is the bounded job log (#2686), and the instrument observes every byte
+// handed to it, including the omp update lines the log drops: those are not
+// tool events, so the profile is the same either way.
+func newRetainedTranscript(log io.WriteCloser, jobID, jobType, runtimeName string, attempt int64, store *db.Store) *retainedTranscript {
 	handle := &retainedTranscript{
-		sink:          file,
-		closer:        file,
+		sink:          log,
+		closer:        log,
 		store:         store,
 		jobID:         jobID,
 		attempt:       attempt,
@@ -1340,10 +1343,6 @@ func newRetainedTranscript(file *os.File, jobID, jobType, runtimeName string, at
 		nonShellCalls: map[string]struct{}{},
 		bucketNS:      map[string]int64{},
 		bucketCount:   map[string]int{},
-	}
-	if file == nil {
-		handle.sink = nil
-		handle.closer = nil
 	}
 	// #1824 asks where a REVIEW's wall time goes, and the profile is appended
 	// after a job's terminal events. Emitting it for every job type would change

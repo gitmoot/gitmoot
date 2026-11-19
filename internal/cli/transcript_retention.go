@@ -60,7 +60,9 @@ func openRetainedTranscriptLog(home, jobID, jobType, runtimeName string, attempt
 		return nil, err
 	}
 	path := transcript.JobLogPath(paths.Logs, jobID)
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// Read as well as append: the bounded writer reads the tail once to learn
+	// whether an earlier attempt already capped this log.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +70,14 @@ func openRetainedTranscriptLog(home, jobID, jobType, runtimeName string, attempt
 		_ = file.Close()
 		return nil, err
 	}
-	return newRetainedTranscript(file, jobID, jobType, runtimeName, attempt, store), nil
+	// Every runtime's log is bounded (#2686); only omp's `--mode=json` stream
+	// has streaming update events to drop.
+	log, err := transcript.NewJobLogWriter(file, strings.TrimSpace(runtimeName) == runtime.OmpRuntime)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return newRetainedTranscript(log, jobID, jobType, runtimeName, attempt, store), nil
 }
 
 // appendDeliveryAdapterOutput adds a writer at the existing runner base instead
