@@ -81,6 +81,7 @@ type fakeWorkspaceSandbox struct {
 	deleted  bool
 	timeouts []int
 	metadata map[string]string
+	template string
 }
 
 type fakeWorkspaceProc struct {
@@ -141,7 +142,7 @@ func (c *fakeWorkspaceCloud) sandbox(id string) fakeWorkspaceSandbox {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if sandbox := c.sandboxes[id]; sandbox != nil {
-		return fakeWorkspaceSandbox{deleted: sandbox.deleted, timeouts: append([]int(nil), sandbox.timeouts...), metadata: sandbox.metadata}
+		return fakeWorkspaceSandbox{deleted: sandbox.deleted, timeouts: append([]int(nil), sandbox.timeouts...), metadata: sandbox.metadata, template: sandbox.template}
 	}
 	return fakeWorkspaceSandbox{}
 }
@@ -203,7 +204,7 @@ func (c *fakeWorkspaceCloud) serveControl(w http.ResponseWriter, r *http.Request
 		c.mu.Lock()
 		c.created++
 		id = fmt.Sprintf("sbx-%d", c.created)
-		c.sandboxes[id] = &fakeWorkspaceSandbox{timeouts: []int{request.Timeout}, metadata: request.Metadata}
+		c.sandboxes[id] = &fakeWorkspaceSandbox{timeouts: []int{request.Timeout}, metadata: request.Metadata, template: request.TemplateID}
 		c.events = append(c.events, "create:"+id)
 		lostAnswer := c.createLost
 		if lostAnswer {
@@ -683,9 +684,14 @@ func (e *workspaceTestEnv) runWithStdin(stdin io.Reader, args ...string) workspa
 	full := append([]string(nil), args...)
 	full = append(full[:2:2], append([]string{"--home", e.home}, full[2:]...)...)
 	var code int
-	if args[0] == "workspace" && args[1] == "exec" {
+	switch {
+	case args[0] == "workspace" && args[1] == "exec":
 		code = runWorkspaceExec(full[2:], stdin, &stdout, &stderr)
-	} else {
+	case args[0] == "workspace" && args[1] == "write":
+		code = runWorkspaceWrite(full[2:], stdin, &stdout, &stderr)
+	case args[0] == "workspace" && args[1] == "push":
+		code = runWorkspacePush(full[2:], stdin, &stdout, &stderr)
+	default:
 		code = Run(full, &stdout, &stderr)
 	}
 	return workspaceCLIResult{code: code, stdout: stdout.String(), stderr: stderr.String()}

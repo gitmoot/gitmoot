@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"strings"
@@ -230,6 +231,20 @@ func (w *Workspace) SendInput(ctx context.Context, pid int, data []byte) error {
 		return errors.New("workspace is not attached")
 	}
 	return w.envd.SendInput(ctx, pid, data)
+}
+
+// UploadHomeFile streams reader into a file named name directly in the guest
+// home, through envd's file upload, for a workspace file operation to read
+// and unlink. name is one plain file name chosen by gitmoot, never a path a
+// caller supplied, so the upload cannot name a place in the work tree.
+func (w *Workspace) UploadHomeFile(ctx context.Context, name string, reader io.Reader) error {
+	if w == nil || w.envd == nil {
+		return errors.New("workspace is not attached")
+	}
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\x00") {
+		return fmt.Errorf("workspace upload name %q is not one plain file name", name)
+	}
+	return w.envd.Upload(ctx, path.Join(w.GuestHome, name), reader)
 }
 
 // Home is the guest home the workspace lives under.

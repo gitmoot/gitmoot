@@ -39,13 +39,15 @@ func TestWorkspaceOpenShowListCloseRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw.stdout), &keys); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"id", "seat", "repo", "issue", "pr", "branch", "base", "root", "provider", "state", "created_at", "last_active_at", "env"} {
+	for _, key := range []string{"id", "seat", "repo", "issue", "pr", "branch", "base", "root", "provider", "state", "created_at", "last_active_at", "closed_at", "close_reason", "env"} {
 		if _, ok := keys[key]; !ok {
 			t.Errorf("show --json lacks %q: %s", key, raw.stdout)
 		}
 	}
-	if string(keys["pr"]) != "null" {
-		t.Errorf("pr = %s, want null", keys["pr"])
+	for _, key := range []string{"pr", "closed_at", "close_reason"} {
+		if string(keys[key]) != "null" {
+			t.Errorf("%s = %s, want null on an open workspace", key, keys[key])
+		}
 	}
 	var shown workspaceJSON
 	_ = json.Unmarshal([]byte(raw.stdout), &shown)
@@ -89,6 +91,22 @@ func TestWorkspaceOpenShowListCloseRoundTrip(t *testing.T) {
 	record := env.record(opened.ID)
 	if record.State != db.WorkspaceStateClosed || record.CloseReason != "done for now" || record.ClosedAt.IsZero() || !env.cloud.sandbox(sandboxID).deleted {
 		t.Fatalf("closed record = %+v, sandbox = %+v", record, env.cloud.sandbox(sandboxID))
+	}
+	// #2697: show --json and ls --json carry the recorded close reason.
+	for _, args := range [][]string{{"workspace", "show", opened.ID, "--json"}, {"workspace", "ls", "--all", "--json"}} {
+		out := env.run(args...)
+		text := strings.TrimSpace(out.stdout)
+		if strings.HasPrefix(text, "[") {
+			text = strings.TrimSuffix(strings.TrimPrefix(text, "["), "]")
+		}
+		var after map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(text), &after); err != nil {
+			t.Fatalf("%v printed %q: %v", args, out.stdout, err)
+		}
+		var closedAt string
+		if string(after["close_reason"]) != `"done for now"` || json.Unmarshal(after["closed_at"], &closedAt) != nil || closedAt == "" {
+			t.Fatalf("%v close_reason = %s closed_at = %s, want the record's", args, after["close_reason"], after["closed_at"])
+		}
 	}
 	if list := env.run("workspace", "ls", "--json"); strings.TrimSpace(list.stdout) != "[]" {
 		t.Fatalf("ls after close = %s", list.stdout)

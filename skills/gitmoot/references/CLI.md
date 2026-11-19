@@ -137,11 +137,18 @@ disagrees, trust its live `--help`.
 - [gitmoot update](#gitmoot-update)
 - [gitmoot version](#gitmoot-version)
 - [gitmoot workspace](#gitmoot-workspace)
+- [gitmoot workspace changes](#gitmoot-workspace-changes)
 - [gitmoot workspace close](#gitmoot-workspace-close)
 - [gitmoot workspace exec](#gitmoot-workspace-exec)
 - [gitmoot workspace ls](#gitmoot-workspace-ls)
+- [gitmoot workspace mirror](#gitmoot-workspace-mirror)
 - [gitmoot workspace open](#gitmoot-workspace-open)
+- [gitmoot workspace pull](#gitmoot-workspace-pull)
+- [gitmoot workspace push](#gitmoot-workspace-push)
+- [gitmoot workspace read](#gitmoot-workspace-read)
 - [gitmoot workspace show](#gitmoot-workspace-show)
+- [gitmoot workspace stat](#gitmoot-workspace-stat)
+- [gitmoot workspace write](#gitmoot-workspace-write)
 - [gitmoot ws](#gitmoot-ws)
 - [gitmoot ws sh](#gitmoot-ws-sh)
 
@@ -1918,12 +1925,33 @@ Usage:
   gitmoot workspace ls [--all] [--json]
   gitmoot workspace exec <id> [--cwd REL] [--env K=V]... [--timeout S] [--stdin] [--status-file HOSTPATH] -- <argv...>
   gitmoot workspace close <id> [--reason TEXT] [--json]
+  gitmoot workspace read <id> <rel>
+  gitmoot workspace write <id> <rel> [--mode OCTAL]
+  gitmoot workspace stat <id> <rel> [--json]
+  gitmoot workspace changes <id> --since <token|start> [--json]
+  gitmoot workspace pull <id> -- <paths...>
+  gitmoot workspace push <id> --files
+  gitmoot workspace push <id>
+  gitmoot workspace mirror <id> <dir>
   gitmoot ws sh [--cwd REL] '<command>'
 
 The seat is the acting org role (GITMOOT_ORG_ROLE or the calling pane's seat).
 Requires [workspaces] enabled = true. A failure prints
-{"error":{"code","message"}} on stderr (and stdout with --json) and exits 125.
+{"error":{"code","message"}} on stderr (and stdout with --json) and exits 125;
+read, write and stat exit 3 for a missing path and 4 for a directory.
 See skills/gitmoot/references/WORKSPACES.md.
+```
+
+## gitmoot workspace changes
+
+```text
+Usage of workspace changes:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print JSON
+  -since string
+    	a token from an earlier changes, or "start" for the whole tree
 ```
 
 ## gitmoot workspace close
@@ -1968,6 +1996,16 @@ Usage of workspace ls:
     	print the workspaces as a JSON array
 ```
 
+## gitmoot workspace mirror
+
+```text
+Usage of workspace mirror:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print JSON
+```
+
 ## gitmoot workspace open
 
 ```text
@@ -1984,6 +2022,38 @@ Usage of workspace open:
     	repository as owner/repo (registered with gitmoot)
 ```
 
+## gitmoot workspace pull
+
+```text
+Usage of workspace pull:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print JSON
+```
+
+## gitmoot workspace push
+
+```text
+Usage of workspace push:
+  -files
+    	apply a tar stream from stdin to the work tree instead of pushing commits
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print JSON
+```
+
+## gitmoot workspace read
+
+```text
+Usage of workspace read:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print JSON
+```
+
 ## gitmoot workspace show
 
 ```text
@@ -1992,6 +2062,28 @@ Usage of workspace show:
     	home directory to use instead of the current user's home
   -json
     	print the workspace as JSON
+```
+
+## gitmoot workspace stat
+
+```text
+Usage of workspace stat:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print JSON
+```
+
+## gitmoot workspace write
+
+```text
+Usage of workspace write:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print JSON
+  -mode string
+    	octal permission bits for the file (default: keep an existing file's mode, 0644 for a new one)
 ```
 
 ## gitmoot ws

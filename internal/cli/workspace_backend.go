@@ -50,6 +50,9 @@ type workspaceSandbox interface {
 	Start(ctx context.Context, request e2b.StartRequest) (workspaceStream, error)
 	Run(ctx context.Context, request e2b.StartRequest) (execbackend.ExecResult, error)
 	SendInput(ctx context.Context, pid int, data []byte) error
+	// UploadHomeFile writes a new file named name (one plain name gitmoot
+	// chose) directly in the guest home, for a file operation's input.
+	UploadHomeFile(ctx context.Context, name string, reader io.Reader) error
 }
 
 type workspaceStream interface {
@@ -321,6 +324,10 @@ func (s *localWorkspaceSandbox) Run(ctx context.Context, request e2b.StartReques
 		return execbackend.ExecResult{}, err
 	}
 	return stream.Wait()
+}
+
+func (s *localWorkspaceSandbox) UploadHomeFile(_ context.Context, name string, reader io.Reader) error {
+	return s.backend.WriteWorkspaceHomeFile(s.instance, name, reader)
 }
 
 func (s *localWorkspaceSandbox) SendInput(_ context.Context, pid int, data []byte) error {

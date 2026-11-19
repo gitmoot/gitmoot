@@ -30,6 +30,11 @@ type WorkspacesPolicy struct {
 	MaxWorkspaceUSD float64
 	// IdleTimeout closes a ready workspace this long after its last exec.
 	IdleTimeout time.Duration
+	// Template is the provider template workspaces are created from. Empty
+	// falls back to the provider's [remote_exec] e2b_template, which remote
+	// jobs also use, so a workspace image (with the Go toolchain) can differ
+	// from the job image without changing it for everyone.
+	Template string
 }
 
 // WorkspacesLocalProvider runs workspaces on the local execution backend.
@@ -121,6 +126,16 @@ func applyWorkspacesField(policy *WorkspacesPolicy, key, value string) error {
 			policy.MaxWorkspaceUSD = parsed
 		}
 		return nil
+	case "template":
+		parsed, err := parseConfigString(value)
+		if err != nil {
+			return err
+		}
+		if !validWorkspacesTemplate(parsed) {
+			return fmt.Errorf("invalid template %q: 1-128 characters of letters, digits and . _ - : /, starting with a letter or digit", parsed)
+		}
+		policy.Template = parsed
+		return nil
 	case "idle_timeout":
 		parsed, err := parseConfigDuration(value)
 		if err != nil {
@@ -134,4 +149,23 @@ func applyWorkspacesField(policy *WorkspacesPolicy, key, value string) error {
 	default:
 		return errors.New("unknown key")
 	}
+}
+
+// validWorkspacesTemplate accepts a provider template name or ID (E2B:
+// "gitmoot-omp-go126-2c4g-v1", an ID, or "team/name:tag"): 1-128 letters,
+// digits and . _ - : /, starting with a letter or digit. Whitespace, quotes
+// and control characters are refused, so a typo cannot reach the provider.
+func validWorkspacesTemplate(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case i > 0 && (r == '.' || r == '_' || r == '-' || r == ':' || r == '/'):
+		default:
+			return false
+		}
+	}
+	return true
 }
