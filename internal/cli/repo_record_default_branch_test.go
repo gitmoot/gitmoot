@@ -64,6 +64,46 @@ func TestRepoRecordForCheckoutPrefersRemoteDefaultOverCheckedOutBranch(t *testin
 	}
 }
 
+// A checkout whose configured origin is the forge URL but whose fetches are
+// redirected by url.*.insteadOf (a local mirror) is that forge repository: the
+// identity check must read the configured URL, not the rewritten transport. This
+// is what lets a built binary register a test repo with no network.
+func TestRepoRecordForCheckoutUsesConfiguredOriginNotInsteadOfRewrite(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	mirror := t.TempDir()
+	runGit(t, mirror, "init", "-b", "main")
+	runGit(t, mirror, "config", "user.email", "gitmoot@example.com")
+	runGit(t, mirror, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(mirror, "README.md"), []byte("# mirror\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mirror, "add", "README.md")
+	runGit(t, mirror, "commit", "-m", "init")
+
+	clone := filepath.Join(t.TempDir(), "clone")
+	runGit(t, t.TempDir(), "clone", mirror, clone)
+	runGit(t, clone, "remote", "set-url", "origin", "https://github.com/acme/widget.git")
+	runGit(t, clone, "config", "url."+mirror+".insteadOf", "https://github.com/acme/widget.git")
+
+	// Control: the rewrite is active, so get-url really returns the local path.
+	rewritten, err := gitutil.NewHostClient(clone).OriginRemote(context.Background())
+	if err != nil || rewritten != mirror {
+		t.Fatalf("OriginRemote = %q err=%v, want the insteadOf target %q; fixture does not exercise the rewrite", rewritten, err, mirror)
+	}
+
+	record, _, err := repoRecordForCheckout(context.Background(),
+		github.Repository{Owner: "acme", Name: "widget"},
+		gitutil.NewHostClient(clone))
+	if err != nil {
+		t.Fatalf("repoRecordForCheckout returned error %v; a checkout whose configured origin is acme/widget must register as acme/widget", err)
+	}
+	if record.FullName() != "acme/widget" {
+		t.Fatalf("FullName() = %q, want acme/widget", record.FullName())
+	}
+}
+
 // With origin/HEAD unresolvable the checked-out branch is the only source, and
 // dropping it would register a repository with no base branch at all - which
 // repo doctor reports as a missing branch and dispatch reads as an empty
