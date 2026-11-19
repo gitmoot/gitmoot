@@ -34,7 +34,43 @@ the toolchain your seat builds with, without changing the jobs' template. It
 must be 1-128 letters, digits and `. _ - : /`, starting with a letter or
 digit.
 
-The section is read on every command and every daemon pass, so edits apply
+### Per-repository template and required tools
+
+```toml
+[repos."owner/repo".workspace]
+template = "gitmoot-omp-go126-2c4g-v1"     # optional
+require = ["go version", "make --version"]  # optional, at most 16
+```
+
+- `template` is the template this repository's workspaces start from. Open
+  takes the repository's `template`, else `[workspaces] template`, else the
+  provider's `[remote_exec] e2b_template`. Same format as `[workspaces]
+  template`. Ignored by `provider = "local"`, which has no template.
+- `require` are shell commands `open` runs, in order, once the branch is
+  checked out: each as `bash -lc '<command>'` in the workspace root, through
+  the same path as `workspace exec` (the base environment, the supervisor),
+  each with a 60 s timeout. Entries must be non-blank double-quoted strings.
+  The first command that exits non-zero or times out fails `open` with
+  `requirements_unmet` (exit 125) and closes the workspace with reason
+  `requirements_unmet: <command>` through the normal close, so its spend
+  settles; it is never left open. When all pass, `open` lists them.
+- The workspace stays `opening` while the checks run and is marked `ready`
+  only once all pass. Open moves `last_active_at` before each check, so the
+  daemon's abandoned-open sweep (below) keeps a live open whose checks run
+  long and reaps one whose process died mid-check. The sandbox needs no
+  renewal meanwhile: its create funds one hour, and an open reaches its first
+  check within the 15-minute bound, after which 16 checks take about 20
+  minutes at most.
+- The repository key matches case-insensitively. Unknown keys are ignored,
+  as in the other `[repos."owner/repo".*]` tables. An invalid table refuses
+  `open` for that repository only. A `.workspace` header whose repository
+  name does not read (a broken quote, no name) refuses `open` for every
+  repository, since which one it meant is unknown.
+
+`open` records what it used in `<home>/workspaces/<id>/open.json`; `show`
+reports it as `template` and `checks`.
+
+The sections are read on every command and every daemon pass, so edits apply
 without a restart. An invalid section refuses `open`; the daemon then keeps
 enforcing the default caps.
 
@@ -59,9 +95,9 @@ registered seat.
 
 | Command | Contract |
 |---|---|
-| `gitmoot workspace open --repo O/R (--issue N \| --pr N) [--json]` | Provisions the VM and checks out the branch. `--pr`: the PR's head branch at its head commit. `--issue`: a new branch `ws/<seat>/<N>` from the default branch. One non-closed workspace per (seat, repo, issue\|pr). |
-| `gitmoot workspace show <id> [--json]` | The record, plus `env`, the VM's base environment. |
-| `gitmoot workspace ls [--all] [--json]` | Open workspaces (`--all`: closed and failed too): the `show` keys without `env`, plus `cost_reserved_usd` and `cost_accrued_usd`. |
+| `gitmoot workspace open --repo O/R (--issue N \| --pr N) [--json]` | Provisions the VM, checks out the branch and runs the repository's `require` checks. `--pr`: the PR's head branch at its head commit. `--issue`: a new branch `ws/<seat>/<N>` from the default branch. One non-closed workspace per (seat, repo, issue\|pr). |
+| `gitmoot workspace show <id> [--json]` | The record, plus `env`, the VM's base environment, and `template` and `checks`, how open created it. |
+| `gitmoot workspace ls [--all] [--json]` | Open workspaces (`--all`: closed and failed too): the `show` keys without `env`, `template` and `checks`, plus `cost_reserved_usd` and `cost_accrued_usd`. |
 | `gitmoot workspace exec <id> [--cwd REL] [--env K=V]... [--timeout S] [--stdin] [--status-file HOSTPATH] -- argv...` | Runs argv in the VM. |
 | `gitmoot ws sh [--cwd REL] [--status-file HOSTPATH] '<cmd>'` | `exec $GITMOOT_WORKSPACE --cwd REL -- bash -lc '<cmd>'`. Exactly one command string; more is `invalid_args`. |
 | `gitmoot workspace close <id> [--reason TEXT] [--json]` | Copies the logs out, destroys the VM, settles the ledger. Default reason `manual`. |
@@ -70,7 +106,10 @@ registered seat.
 
 `open`, `show --json` and `close --json` print exactly these keys (`issue` and
 `pr` are `null` when unset, `closed_at` and `close_reason` until the workspace
-closes; `env` is in `show` only):
+closes; `env` is in `show` only). `open --json` and `show --json` add
+`template` (the provider template the sandbox was created from; `null` for
+`provider = "local"` and for a workspace opened before #2704) and `checks`
+(the `require` commands open ran, `[]` for none):
 
 ```json
 {"id":"ws-1a2b3c4d5e6f","seat":"intern","repo":"o/r","issue":12,"pr":null,
@@ -78,7 +117,8 @@ closes; `env` is in `show` only):
  "provider":"e2b","state":"ready","created_at":"2026-11-19T12:00:00Z",
  "last_active_at":"2026-11-19T12:00:00Z","closed_at":null,"close_reason":null,
  "env":{"PATH":"/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "HOME":"/home/user","LANG":"C.UTF-8","GITMOOT_WORKSPACE_ROOT":"/home/user/work"}}
+        "HOME":"/home/user","LANG":"C.UTF-8","GITMOOT_WORKSPACE_ROOT":"/home/user/work"},
+ "template":"gitmoot-omp-go126-2c4g-v1","checks":["go version"]}
 ```
 
 - `root` is the absolute work tree inside the VM. `base` is the commit the
@@ -93,10 +133,25 @@ Every failure prints one line `{"error":{"code":"<code>","message":"…"}}` on
 stderr (and on stdout too with `--json`) and exits **125**. Codes:
 `not_found`, `not_ready`, `cost_cap`, `provider_unavailable`,
 `cwd_outside_root`, `already_open`, `invalid_args`, `disabled`, `internal`,
-and for the file commands `is_directory`, `not_empty`, `push_refused` and
-`nothing_to_push`. `read`, `write` and `stat` exit **3** (`not_found`) for a
-path that does not exist and **4** (`is_directory`) for a directory where a
-file was wanted, with the same error line.
+`requirements_unmet` (open only), and for the file commands `is_directory`,
+`not_empty`, `push_refused` and `nothing_to_push`. `read`, `write` and `stat`
+exit **3** (`not_found`) for a path that does not exist and **4**
+(`is_directory`) for a directory where a file was wanted, with the same error
+line.
+
+`requirements_unmet` adds `failed_check` (the command), `exit_code` (its
+status, 124 on timeout) and `output_tail` (at most the last 2 KiB of its
+combined stdout and stderr, with tokens, keys and passwords redacted). Only
+the last 64 KiB of output is kept; when more was printed, the partial first
+line of what remains is dropped before redacting, since a secret cut there
+may have lost the prefix that identifies it. Redaction is a courtesy, not a
+boundary: the same seat can run the check with `workspace exec` and read its
+raw output):
+
+```json
+{"error":{"code":"requirements_unmet","message":"require check \"go version\" exited 127",
+ "failed_check":"go version","exit_code":127,"output_tail":"bash: line 1: go: command not found\n"}}
+```
 
 ### exec and ws sh
 
@@ -316,9 +371,11 @@ The daemon (every 30 s, once per process however many repos it watches):
   from `last_active_at`;
 - settles and renews (above), closing on `cost_cap`, `expired` (past
   `paid_until`) or `provider_gone` (`local` only);
-- fails an `open` that never finished within 15 minutes (`open_abandoned`) and
-  retries any close whose teardown the provider did not confirm, settling it
-  as `expired` once the provider deadline guarantee covers it.
+- fails an `open` whose `last_active_at` is 15 minutes old (`open_abandoned`):
+  its process died before the workspace was ready. `last_active_at` is the
+  open's start until a `require` check moves it. It also retries any close
+  whose teardown the provider did not confirm, settling it as `expired` once
+  the provider deadline guarantee covers it.
 
 It keeps nothing in memory: every pass re-reads the `workspaces` table and
 re-attaches to each sandbox by its recorded id, so a restarted daemon carries

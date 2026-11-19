@@ -224,6 +224,14 @@ max_consecutive_missed_wakes = 0
 # max_total_usd = 50
 # max_workspace_usd = 10
 # template = "gitmoot-omp-go126-2c4g-v1"
+#
+# [repos."owner/repo".workspace] (#2704) overrides template for one repository
+# and lists require, shell commands "gitmoot workspace open" runs in the new
+# workspace (bash -lc, 60s each, at most 16). The first that fails or times out
+# fails the open with requirements_unmet and closes the workspace.
+# [repos."owner/repo".workspace]
+# template = "gitmoot-omp-go126-2c4g-v1"
+# require = ["go version"]
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool

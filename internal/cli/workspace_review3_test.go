@@ -72,7 +72,7 @@ func TestWorkspaceRootIdentityRefusesNonDirectory(t *testing.T) {
 
 func workspaceTestLocalSandbox(env *workspaceTestEnv, id string) (workspaceSandbox, error) {
 	record := env.record(id)
-	provider, err := newWorkspaceProvider(env.paths, record.Provider)
+	provider, err := newWorkspaceProvider(env.paths, record.Provider, "")
 	if err != nil {
 		return nil, err
 	}

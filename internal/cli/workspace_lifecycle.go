@@ -35,7 +35,9 @@ const (
 	// accrued cost and reserves the next period.
 	workspaceRenewLead = 10 * time.Minute
 	// workspaceOpenAbandonedAfter fails an `open` that never finished: its
-	// process died between the reservation and ready.
+	// process died between the reservation and ready. It is measured from
+	// last_active_at, which is created_at until open moves it before each
+	// require check (#2704), so a live open whose checks run long is kept.
 	workspaceOpenAbandonedAfter = 15 * time.Minute
 	// workspaceLogCopyLimit bounds what close copies to the host.
 	workspaceLogCopyLimit = 1 << 30
@@ -89,6 +91,9 @@ const (
 	workspaceReasonExpired       = "expired"
 	workspaceReasonOpenFailed    = "open_failed"
 	workspaceReasonOpenAbandoned = "open_abandoned"
+	// workspaceReasonRequirementsUnmet prefixes "<reason>: <command>", the
+	// require check that failed open (#2704).
+	workspaceReasonRequirementsUnmet = "requirements_unmet"
 )
 
 // workspaceAccruedUSD is a workspace's spend at t: its sandbox time up to t,
@@ -173,7 +178,7 @@ func closeWorkspace(ctx context.Context, store *db.Store, paths config.Paths, id
 		}
 		return store.FinishWorkspaceClose(ctx, id, outcome, accrued, now, finalReason)
 	}
-	provider, err := newWorkspaceProvider(paths, workspace.Provider)
+	provider, err := newWorkspaceProvider(paths, workspace.Provider, "")
 	if err != nil {
 		// Without the provider there is no deadline guarantee to settle by.
 		return fmt.Errorf("close workspace %s: still reserved until its provider is reachable: %w", id, err)
@@ -417,7 +422,7 @@ func sweepWorkspaces(ctx context.Context, store *db.Store, paths config.Paths, s
 		case db.WorkspaceStateClosing:
 			closeFor(w, w.CloseReason)
 		case db.WorkspaceStateOpening:
-			if now.Sub(w.CreatedAt) >= workspaceOpenAbandonedAfter {
+			if now.Sub(w.LastActiveAt) >= workspaceOpenAbandonedAfter {
 				closeFor(w, workspaceReasonOpenAbandoned)
 			}
 		case db.WorkspaceStateReady:
@@ -429,7 +434,7 @@ func sweepWorkspaces(ctx context.Context, store *db.Store, paths config.Paths, s
 			case w.PaidUntil.Sub(now) <= workspaceRenewLead:
 				provider := providers[w.Provider]
 				if provider == nil {
-					if provider, err = newWorkspaceProvider(paths, w.Provider); err != nil {
+					if provider, err = newWorkspaceProvider(paths, w.Provider, ""); err != nil {
 						errs = append(errs, fmt.Errorf("renew workspace %s: %w", w.ID, err))
 						continue
 					}
