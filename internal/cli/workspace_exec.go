@@ -267,7 +267,7 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 	if err := store.TouchWorkspace(ctx, workspace.ID, workspaceNow()); err != nil {
 		return workspaceExecStatus{}, asWorkspaceError(err, wsErrInternal)
 	}
-	sandbox, state, err := provider.backend.AttachWorkspace(ctx, workspace.ProviderInstanceID)
+	sandbox, state, err := provider.backend.attach(ctx, workspace.ProviderInstanceID)
 	if err != nil {
 		if state == e2b.Gone {
 			// The provider retired the sandbox (its deadline passed, or it was
@@ -278,7 +278,7 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 		}
 		return workspaceExecStatus{}, wsErrorf(wsErrProviderUnavailable, "%v", err)
 	}
-	env := workspaceBaseEnv(provider.guestHome, workspace.Root)
+	env := workspaceBaseEnv(sandbox.Home(), workspace.Root)
 	for _, entry := range request.Env {
 		name, value, _ := strings.Cut(entry, "=")
 		env[name] = value
@@ -292,7 +292,7 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 		"timeout": request.Timeout.Seconds(),
 		"grace":   workspaceWatchdogGrace.Seconds(),
 		"stdin":   request.Stdin,
-		"log":     path.Join(remoteexec.WorkspaceLogDir(provider.guestHome), logName),
+		"log":     path.Join(remoteexec.WorkspaceLogDir(sandbox.Home()), logName),
 	}
 	encodedConfig, err := json.Marshal(config)
 	if err != nil {
@@ -312,7 +312,7 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 	stream, err := sandbox.Start(sessionCtx, e2b.StartRequest{
 		Name:           "python3",
 		Args:           []string{"-c", workspaceSupervisorScript, string(encodedConfig)},
-		Dir:            provider.guestHome,
+		Dir:            sandbox.Home(),
 		Output:         stdout,
 		ErrOutput:      trailer,
 		MaxOutputBytes: 64 << 10,

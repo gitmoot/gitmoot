@@ -240,3 +240,9 @@ func (w *Workspace) SendSignal(ctx context.Context, pid int, signal e2b.Signal) 
 	}
 	return w.envd.SendSignal(ctx, pid, signal)
 }
+
+// Home is the guest home the workspace lives under.
+func (w *Workspace) Home() string { return w.GuestHome }
+
+// Root is the workspace's work tree inside the guest.
+func (w *Workspace) Root() string { return WorkspaceRoot(w.GuestHome) }

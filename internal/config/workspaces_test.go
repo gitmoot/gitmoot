@@ -40,4 +40,7 @@ func TestLoadWorkspacesPolicyRefusesInvalidValues(t *testing.T) {
 	if policy != want {
 		t.Fatalf("policy = %+v, want %+v", policy, want)
 	}
+	if policy, err := LoadWorkspacesPolicy(writeGateConfig(t, "[workspaces]\nprovider = \"local\"\n")); err != nil || policy.Provider != WorkspacesLocalProvider {
+		t.Fatalf("local provider = %+v %v", policy, err)
+	}
 }

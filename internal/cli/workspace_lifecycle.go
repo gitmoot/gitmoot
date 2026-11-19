@@ -121,7 +121,7 @@ func closeWorkspace(ctx context.Context, store *db.Store, paths config.Paths, id
 		if err != nil {
 			return fmt.Errorf("close workspace %s: %w", id, err)
 		}
-		sandbox, state, attachErr := provider.backend.AttachWorkspace(ctx, workspace.ProviderInstanceID)
+		sandbox, state, attachErr := provider.backend.attach(ctx, workspace.ProviderInstanceID)
 		switch {
 		case attachErr == nil:
 			if err := copyWorkspaceLogs(ctx, sandbox, workspace, hostDir); err != nil {
@@ -139,7 +139,7 @@ func closeWorkspace(ctx context.Context, store *db.Store, paths config.Paths, id
 			writeLine(log, "workspace %s: cannot reach the sandbox to copy logs: %v", id, attachErr)
 		}
 		if state != e2b.Gone {
-			destroyed, err := provider.backend.DestroyWorkspace(ctx, workspace.ProviderInstanceID)
+			destroyed, err := provider.backend.destroy(ctx, workspace.ProviderInstanceID)
 			if err != nil || destroyed != e2b.Gone {
 				return fmt.Errorf("close workspace %s: the provider did not confirm teardown (%s): %v", id, destroyed, err)
 			}
@@ -174,7 +174,7 @@ tar -czf - logs close-summary.txt`
 
 // copyWorkspaceLogs extracts the VM's exec logs and work-tree summary into
 // hostDir. Only regular files and directories under hostDir are written.
-func copyWorkspaceLogs(ctx context.Context, sandbox *remoteexec.Workspace, workspace db.Workspace, hostDir string) error {
+func copyWorkspaceLogs(ctx context.Context, sandbox workspaceSandbox, workspace db.Workspace, hostDir string) error {
 	reader, writer := io.Pipe()
 	extracted := make(chan error, 1)
 	go func() {
@@ -182,11 +182,11 @@ func copyWorkspaceLogs(ctx context.Context, sandbox *remoteexec.Workspace, works
 		_ = reader.CloseWithError(err)
 		extracted <- err
 	}()
-	stateDir := path.Dir(remoteexec.WorkspaceLogDir(sandbox.GuestHome))
+	stateDir := path.Dir(remoteexec.WorkspaceLogDir(sandbox.Home()))
 	result, runErr := sandbox.Run(ctx, e2b.StartRequest{
 		Name:           "sh",
 		Args:           []string{"-c", workspaceLogScript, "gitmoot-ws-logs", stateDir, workspace.Root},
-		Dir:            sandbox.GuestHome,
+		Dir:            sandbox.Home(),
 		Output:         writer,
 		ErrOutput:      io.Discard,
 		MaxOutputBytes: 4 << 10,
@@ -381,7 +381,7 @@ func renewWorkspace(ctx context.Context, store *db.Store, provider *workspacePro
 	if err != nil {
 		return "", fmt.Errorf("renew workspace %s: %w", w.ID, err)
 	}
-	state, err := provider.backend.SetWorkspaceTimeout(ctx, w.ProviderInstanceID, paidUntil.Sub(now))
+	state, err := provider.backend.extend(ctx, w.ProviderInstanceID, paidUntil.Sub(now))
 	if state == e2b.Gone {
 		return workspaceReasonProviderGone, nil
 	}

@@ -19,6 +19,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
 	remoteexec "github.com/gitmoot/gitmoot/internal/execbackend/remote"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -370,7 +371,7 @@ func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, req
 	workspace := db.Workspace{
 		ID: id, Seat: request.Seat, Repo: repoName, Issue: request.Issue, PR: request.PR,
 		Branch: plan.Branch, Base: plan.Head, BaseRef: plan.BaseRef,
-		Provider: provider.name, Root: remoteexec.WorkspaceRoot(provider.guestHome),
+		Provider:  provider.name,
 		CreatedAt: now, LastActiveAt: now,
 		RateUSDPerHour: provider.rate, CostReservedUSD: reserve, PaidUntil: now.Add(workspaceReservePeriod),
 	}
@@ -383,12 +384,12 @@ func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, req
 		closeErr := closeWorkspace(context.WithoutCancel(ctx), store, paths, workspace.ID, "open_failed", io.Discard)
 		return db.Workspace{}, errors.Join(asWorkspaceError(cause, wsErrProviderUnavailable), closeErr)
 	}
-	sandbox, err := provider.backend.ProvisionWorkspace(ctx, workspace.ID, workspaceReservePeriod)
+	instanceID, sandbox, err := provider.backend.provision(ctx, workspace.ID, workspaceReservePeriod)
 	if err != nil {
 		return fail(err)
 	}
-	if err := store.SetWorkspaceInstance(ctx, workspace.ID, sandbox.ID); err != nil {
-		_, _ = provider.backend.DestroyWorkspace(context.WithoutCancel(ctx), sandbox.ID)
+	if err := store.SetWorkspaceInstance(ctx, workspace.ID, instanceID, sandbox.Root()); err != nil {
+		_, _ = provider.backend.destroy(context.WithoutCancel(ctx), instanceID)
 		return fail(err)
 	}
 	hostDir, err := workspaceHostDir(paths, workspace.ID)
@@ -508,17 +509,33 @@ func workspaceGit(ctx context.Context, dir string, args ...string) (string, erro
 	return strings.TrimSpace(string(output)), nil
 }
 
-// workspaceProvider is the remote exec stack for one provider: the same E2B
-// client and remote backend reviews use, without the job attempt ledger
-// (workspaces are ledgered in the workspaces table).
+// workspaceProvider is the execution stack for one provider: the remote
+// backend reviews use (E2B, sandboxd), without the job attempt ledger
+// (workspaces are ledgered in the workspaces table), or the local backend.
 type workspaceProvider struct {
-	backend   *remoteexec.Backend
-	name      string
-	rate      float64
-	guestHome string
+	backend workspaceBackend
+	name    string
+	rate    float64
 }
 
 func newWorkspaceProvider(paths config.Paths, providerName string) (*workspaceProvider, error) {
+	if providerName == workspaceLocalProvider {
+		root := filepath.Join(paths.Home, "execbackends", string(execbackend.Local))
+		var identity *execbackend.LocalIdentity
+		if cfg, err := config.LoadRemoteExecConfig(paths); err == nil {
+			if cfg.LocalRoot != "" {
+				root = filepath.Clean(cfg.LocalRoot)
+			}
+			identity = cfg.LocalIdentity()
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, wsErrorf(wsErrProviderUnavailable, "read [remote_exec]: %v", err)
+		}
+		local, err := execbackend.NewLocalBackend(root, identity)
+		if err != nil {
+			return nil, wsErrorf(wsErrProviderUnavailable, "%v", err)
+		}
+		return &workspaceProvider{backend: localWorkspaceBackend{backend: local}, name: workspaceLocalProvider}, nil
+	}
 	remoteCfg, err := config.LoadRemoteExecConfig(paths)
 	if err != nil {
 		return nil, wsErrorf(wsErrProviderUnavailable, "read [remote_exec]: %v", err)
@@ -550,7 +567,7 @@ func newWorkspaceProvider(paths config.Paths, providerName string) (*workspacePr
 	if err != nil {
 		return nil, wsErrorf(wsErrProviderUnavailable, "%v", err)
 	}
-	return &workspaceProvider{backend: backend, name: cfg.Provider, rate: rate, guestHome: workspaceGuestHome}, nil
+	return &workspaceProvider{backend: remoteWorkspaceBackend{backend: backend}, name: cfg.Provider, rate: rate}, nil
 }
 
 func runWorkspaceShow(args []string, stdout, stderr io.Writer) int {

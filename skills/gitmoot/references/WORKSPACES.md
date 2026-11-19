@@ -20,7 +20,7 @@ cost_per_hour_usd = 0.2                       # required: the cap is priced by i
 
 [workspaces]
 enabled = true          # default false
-provider = "e2b"        # or a configured sandboxd provider
+provider = "e2b"        # a configured sandboxd provider, or "local" (below)
 max_total_usd = 50      # every workspace ever: settled cost + open reservations
 max_workspace_usd = 10  # one workspace's reservations over its life
 idle_timeout = "4h"     # close after this long without an exec
@@ -29,6 +29,20 @@ idle_timeout = "4h"     # close after this long without an exec
 The section is read on every command and every daemon pass, so edits apply
 without a restart. An invalid section refuses `open`; the daemon then keeps
 enforcing the default caps.
+
+### `provider = "local"`: development and tests only
+
+`provider = "local"` runs workspaces on the host through gitmoot's local
+execution backend, one instance per workspace under
+`<home>/execbackends/local/<instance>/` (`root` is its `workspace/`
+directory, `HOME` the instance directory). It needs no `[remote_exec]`
+section, costs `$0` and **gives no isolation**: commands run as the gitmoot
+user (or `[remote_exec] local_uid`/`local_gid`) on the host. The contract is
+otherwise identical (JSON shapes, exit 125, `--status-file`, cwd
+confinement, a clean environment of the base variables plus `--env`, the
+supervisor and its watchdog), so it is how integration tests drive the real
+binary without spending. `show --json` reports `"provider":"local"`. The
+default provider stays `e2b`.
 
 The seat is the acting org role: `GITMOOT_ORG_ROLE`, else the calling pane's
 registered seat.

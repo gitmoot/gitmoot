@@ -204,8 +204,8 @@ func (s *Store) ListWorkspaces(ctx context.Context, includeTerminal bool) ([]Wor
 // SetWorkspaceInstance records the provider sandbox of an opening workspace
 // as soon as the provider returns it, so a crash after create still leaves
 // the daemon a handle to destroy.
-func (s *Store) SetWorkspaceInstance(ctx context.Context, id, instanceID string) error {
-	return s.updateOneWorkspace(ctx, `UPDATE workspaces SET provider_instance_id = ? WHERE id = ? AND state = 'opening'`, instanceID, id)
+func (s *Store) SetWorkspaceInstance(ctx context.Context, id, instanceID, root string) error {
+	return s.updateOneWorkspace(ctx, `UPDATE workspaces SET provider_instance_id = ?, root = ? WHERE id = ? AND state = 'opening'`, instanceID, root, id)
 }
 
 // MarkWorkspaceReady finishes open: the branch is checked out at base.

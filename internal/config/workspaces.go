@@ -32,6 +32,9 @@ type WorkspacesPolicy struct {
 	IdleTimeout time.Duration
 }
 
+// WorkspacesLocalProvider runs workspaces on the local execution backend.
+const WorkspacesLocalProvider = "local"
+
 // DefaultWorkspacesPolicy is the policy of a config without [workspaces].
 func DefaultWorkspacesPolicy() WorkspacesPolicy {
 	return WorkspacesPolicy{
@@ -97,8 +100,10 @@ func applyWorkspacesField(policy *WorkspacesPolicy, key, value string) error {
 			return err
 		}
 		parsed = strings.TrimSpace(parsed)
-		if !IsRemoteExecProvider(parsed) {
-			return fmt.Errorf("unknown provider %q (allowed: %s)", parsed, RemoteExecProviderChoices())
+		// "local" runs workspaces on the local execution backend: no cost and no
+		// isolation, for development and tests.
+		if parsed != WorkspacesLocalProvider && !IsRemoteExecProvider(parsed) {
+			return fmt.Errorf("unknown provider %q (allowed: %q or %s)", parsed, WorkspacesLocalProvider, RemoteExecProviderChoices())
 		}
 		policy.Provider = parsed
 		return nil
