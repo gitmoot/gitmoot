@@ -738,7 +738,12 @@ func repoRecordForCheckout(ctx context.Context, repo github.Repository, client g
 	if err != nil {
 		return db.Repo{}, false, fmt.Errorf("resolve repo checkout: %w", err)
 	}
-	remote, err := client.OriginRemote(ctx)
+	// The checkout's IDENTITY is the configured forge URL. `git remote get-url`
+	// applies url.*.insteadOf, which rewrites only transport (a local mirror, an
+	// SSH alias), so it would reject a correctly named checkout whose fetches go
+	// elsewhere, and could accept a wrong name that a rewrite maps onto a GitHub
+	// URL. Read the literal value instead, as disposable clones already do.
+	remote, err := client.OriginRemoteConfigured(ctx)
 	if err != nil {
 		return db.Repo{}, false, fmt.Errorf("resolve repo checkout remote: %w", err)
 	}

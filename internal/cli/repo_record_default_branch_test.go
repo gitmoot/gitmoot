@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
@@ -61,6 +62,91 @@ func TestRepoRecordForCheckoutPrefersRemoteDefaultOverCheckedOutBranch(t *testin
 	current, err := gitutil.NewHostClient(clone).CurrentBranch(context.Background())
 	if err != nil || current != "fix/lan-address-portability" {
 		t.Fatalf("CurrentBranch = %q err=%v, want the feature branch; fixture does not separate the sources", current, err)
+	}
+}
+
+// A checkout whose configured origin is the forge URL but whose fetches are
+// redirected by url.*.insteadOf (a local mirror) is that forge repository: the
+// identity check must read the configured URL, not the rewritten transport. This
+// is what lets a built binary register a test repo with no network.
+func TestRepoRecordForCheckoutUsesConfiguredOriginNotInsteadOfRewrite(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	mirror := t.TempDir()
+	runGit(t, mirror, "init", "-b", "main")
+	runGit(t, mirror, "config", "user.email", "gitmoot@example.com")
+	runGit(t, mirror, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(mirror, "README.md"), []byte("# mirror\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mirror, "add", "README.md")
+	runGit(t, mirror, "commit", "-m", "init")
+
+	clone := filepath.Join(t.TempDir(), "clone")
+	runGit(t, t.TempDir(), "clone", mirror, clone)
+	runGit(t, clone, "remote", "set-url", "origin", "https://github.com/acme/widget.git")
+	runGit(t, clone, "config", "url."+mirror+".insteadOf", "https://github.com/acme/widget.git")
+
+	// Control: the rewrite is active, so get-url really returns the local path.
+	rewritten, err := gitutil.NewHostClient(clone).OriginRemote(context.Background())
+	if err != nil || rewritten != mirror {
+		t.Fatalf("OriginRemote = %q err=%v, want the insteadOf target %q; fixture does not exercise the rewrite", rewritten, err, mirror)
+	}
+
+	record, _, err := repoRecordForCheckout(context.Background(),
+		github.Repository{Owner: "acme", Name: "widget"},
+		gitutil.NewHostClient(clone))
+	if err != nil {
+		t.Fatalf("repoRecordForCheckout returned error %v; a checkout whose configured origin is acme/widget must register as acme/widget", err)
+	}
+	if record.FullName() != "acme/widget" {
+		t.Fatalf("FullName() = %q, want acme/widget", record.FullName())
+	}
+}
+
+// Origin can carry several url entries, directly or through an include. Git
+// fetches from the first, so that is the repository the checkout IS: it must
+// register as the first and refuse the last (which `git config --get` returns).
+func TestRepoRecordForCheckoutUsesFirstOfSeveralOriginURLs(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	for _, viaInclude := range []bool{false, true} {
+		name := "direct"
+		if viaInclude {
+			name = "include"
+		}
+		t.Run(name, func(t *testing.T) {
+			repo := t.TempDir()
+			runGit(t, repo, "init", "-b", "main")
+			runGit(t, repo, "remote", "add", "origin", "https://github.com/acme/actual.git")
+			if viaInclude {
+				extra := filepath.Join(t.TempDir(), "extra.gitconfig")
+				if err := os.WriteFile(extra, []byte("[remote \"origin\"]\n\turl = https://github.com/acme/other.git\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				runGit(t, repo, "config", "--add", "include.path", extra)
+			} else {
+				runGit(t, repo, "config", "--add", "remote.origin.url", "https://github.com/acme/other.git")
+			}
+			// Control: git really sees two URLs and fetches from the first.
+			client := gitutil.NewHostClient(repo)
+			if fetched, err := client.OriginRemote(context.Background()); err != nil || fetched != "https://github.com/acme/actual.git" {
+				t.Fatalf("git remote get-url = %q err=%v; fixture should fetch acme/actual", fetched, err)
+			}
+			out, err := exec.Command("git", "-C", repo, "config", "--get", "remote.origin.url").Output()
+			if err != nil || strings.TrimSpace(string(out)) != "https://github.com/acme/other.git" {
+				t.Fatalf("git config --get = %q err=%v; fixture should have acme/other last", out, err)
+			}
+
+			if _, _, err := repoRecordForCheckout(context.Background(), github.Repository{Owner: "acme", Name: "actual"}, client); err != nil {
+				t.Fatalf("registering as the fetched repository acme/actual failed: %v", err)
+			}
+			if _, _, err := repoRecordForCheckout(context.Background(), github.Repository{Owner: "acme", Name: "other"}, client); err == nil {
+				t.Fatal("registering as acme/other succeeded, but origin fetches acme/actual")
+			}
+		})
 	}
 }
 
