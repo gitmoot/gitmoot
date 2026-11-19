@@ -368,6 +368,16 @@ gitmoot org await list
   `gitmoot org await review --repo owner/repo --pr <n> --head <sha> --ttl 12h`.
   End a wait you no longer need with
   `gitmoot org await withdraw --reason "why" <await-id>`.
+- A role can be bound to an agent on another fleet machine that dev2306 reaches
+  through Herdr federation:
+  `gitmoot org seat bind --name <role> --agent <machine>/<agent>`, where
+  `<machine>` is the saved Herdr machine's label or id (`herdr machine list`).
+  It is stored as `pane = "agent:<machine>/<agent>"`. `org chart` and
+  `org validate` show that agent's live state. Messages to the role stay
+  `queued` with the reason "recipient is on another machine; delivery waits for
+  that machine's gitmoot client": gitmoot never types into a remote pane. They
+  are delivered once that machine runs a gitmoot client (#2710). An unqualified
+  `agent:<name>` binding never matches an agent on another machine.
 
 ## 6. When something is stuck
 

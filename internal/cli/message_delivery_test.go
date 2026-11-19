@@ -102,3 +102,45 @@ func TestMessageDaemonDefersUnreachableRecipientsAndNeverReplaysUnknown(t *testi
 		})
 	}
 }
+
+// A role bound to an agent on another machine (agent:<machine>/<name>) is held
+// pending with a reason naming that, even while its agent is idle and OMP: the
+// local transport cannot reach it, and nothing is typed into a remote pane.
+func TestMessageDaemonHoldsRemoteBoundRecipientPending(t *testing.T) {
+	ctx := context.Background()
+	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}, {"remote", "agent:hetzner2/gm-remote-test"}})
+	remotePane := "9b0df6f6a46cc3e557f6840a1cde0a67/w1:p1"
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+		States:       map[string]org.RoleLiveState{"remote": {State: org.StateIdle}},
+		PaneBindings: map[string]org.PaneBinding{"remote": {PaneID: remotePane}},
+		Sessions:     map[string]org.SessionActivity{"remote": {PaneID: remotePane, Agent: "omp"}},
+	}})
+	wake.labelToPane = map[string]string{"agent:hetzner2/gm-remote-test": remotePane}
+	note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{WorkflowID: "safety", Author: "owner", Body: "[org:message to=remote from=owner wf=safety] hello", AddressedTarget: "remote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := defaultJobWorker(store, io.Discard, home)
+	installReplyWakeProductionSink(t, worker, sink.sink)
+	var diagnostic bytes.Buffer
+	now := time.Now().UTC().Add(time.Hour)
+	for range 2 {
+		runReplyWakeOutboxDrainOnce(ctx, store, worker, &diagnostic, now, nil)
+	}
+	rows, err := store.ListWakeOutbox(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var own []db.WakeOutboxEntry
+	for _, row := range rows {
+		if row.TargetRole == "remote" {
+			own = append(own, row)
+		}
+	}
+	if len(own) != 1 || own[0].State != db.WakeOutboxStatePending || own[0].AttemptCount != 0 || own[0].LastError != cockpit.NotificationRemotePending || wake.promptCalls != 0 {
+		t.Fatalf("remote recipient not held pending with %q: rows=%+v calls=%d log=%s", cockpit.NotificationRemotePending, own, wake.promptCalls, diagnostic.String())
+	}
+	if _, err := store.GetMessage(ctx, note.ID, "remote"); err != nil {
+		t.Fatalf("durable inbox lost: %v", err)
+	}
+}

@@ -128,7 +128,7 @@ func (c *Cockpit) ResolveNotificationTarget(ctx context.Context, binding string)
 	if selector == "" {
 		selector = agent.PaneID
 	}
-	return NotificationTarget{Selector: selector, PaneID: agent.PaneID, Kind: agent.Agent}, true
+	return NotificationTarget{Selector: selector, PaneID: agent.PaneID, Kind: agent.Agent, Machine: agent.MachineID}, true
 }
 
 // StableAgentBinding returns the unique local identity currently occupying a

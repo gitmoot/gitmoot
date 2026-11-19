@@ -868,7 +868,7 @@ Usage of org seat add:
 ```text
 Usage of org seat bind:
   -agent string
-    	exact registered local Herdr agent name
+    	exact registered Herdr agent name; MACHINE/NAME for an agent on a federated Herdr machine (saved machine id or label)
   -home string
     	home directory
   -name string
