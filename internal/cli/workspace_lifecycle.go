@@ -89,6 +89,9 @@ const (
 	workspaceReasonExpired       = "expired"
 	workspaceReasonOpenFailed    = "open_failed"
 	workspaceReasonOpenAbandoned = "open_abandoned"
+	// workspaceReasonRequirementsUnmet prefixes "<reason>: <command>", the
+	// require check that failed open (#2704).
+	workspaceReasonRequirementsUnmet = "requirements_unmet"
 )
 
 // workspaceAccruedUSD is a workspace's spend at t: its sandbox time up to t,
@@ -173,7 +176,7 @@ func closeWorkspace(ctx context.Context, store *db.Store, paths config.Paths, id
 		}
 		return store.FinishWorkspaceClose(ctx, id, outcome, accrued, now, finalReason)
 	}
-	provider, err := newWorkspaceProvider(paths, workspace.Provider)
+	provider, err := newWorkspaceProvider(paths, workspace.Provider, "")
 	if err != nil {
 		// Without the provider there is no deadline guarantee to settle by.
 		return fmt.Errorf("close workspace %s: still reserved until its provider is reachable: %w", id, err)
@@ -429,7 +432,7 @@ func sweepWorkspaces(ctx context.Context, store *db.Store, paths config.Paths, s
 			case w.PaidUntil.Sub(now) <= workspaceRenewLead:
 				provider := providers[w.Provider]
 				if provider == nil {
-					if provider, err = newWorkspaceProvider(paths, w.Provider); err != nil {
+					if provider, err = newWorkspaceProvider(paths, w.Provider, ""); err != nil {
 						errs = append(errs, fmt.Errorf("renew workspace %s: %w", w.ID, err))
 						continue
 					}

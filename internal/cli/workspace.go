@@ -16,6 +16,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -23,6 +24,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
 	remoteexec "github.com/gitmoot/gitmoot/internal/execbackend/remote"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // Remote workspaces (#2678): a provider sandbox bound to one seat and one
@@ -47,6 +49,9 @@ const (
 	wsErrIsDirectory         = "is_directory"
 	wsErrPushRefused         = "push_refused"
 	wsErrNotEmpty            = "not_empty"
+	// wsErrRequirementsUnmet: a [repos."o/r".workspace] require check failed
+	// at open, which then closed the workspace.
+	wsErrRequirementsUnmet = "requirements_unmet"
 )
 
 // workspaceCLIFailure is the exit status of a workspace command that failed
@@ -85,6 +90,12 @@ var (
 type workspaceError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// FailedCheck, ExitCode and OutputTail are set for requirements_unmet:
+	// the require command that failed, its exit status (124 on timeout) and
+	// the redacted last workspaceRequireTailBytes of its combined output.
+	FailedCheck string  `json:"failed_check,omitempty"`
+	ExitCode    *int    `json:"exit_code,omitempty"`
+	OutputTail  *string `json:"output_tail,omitempty"`
 	// exit overrides workspaceCLIFailure: a file command's missing path (3)
 	// or directory (4).
 	exit int
@@ -159,6 +170,27 @@ type workspaceListJSON struct {
 	workspaceJSON
 	CostReservedUSD float64 `json:"cost_reserved_usd"`
 	CostAccruedUSD  float64 `json:"cost_accrued_usd"`
+}
+
+// workspaceDetailJSON is the `open --json` / `show --json` shape: the pinned
+// fields plus how open created the workspace (#2704). Template is the
+// provider template the sandbox was created from, null for the local
+// provider and for a workspace opened before it was recorded. Checks are the
+// [repos."o/r".workspace] require commands open ran; a workspace open
+// returned passed every one.
+type workspaceDetailJSON struct {
+	workspaceJSON
+	Template *string  `json:"template"`
+	Checks   []string `json:"checks"`
+}
+
+func newWorkspaceDetailJSON(w db.Workspace, record workspaceOpenRecord) workspaceDetailJSON {
+	out := workspaceDetailJSON{workspaceJSON: newWorkspaceJSON(w), Checks: append([]string{}, record.Checks...)}
+	if record.Template != "" {
+		template := record.Template
+		out.Template = &template
+	}
+	return out
 }
 
 func newWorkspaceJSON(w db.Workspace) workspaceJSON {
@@ -337,18 +369,25 @@ func runWorkspaceOpen(args []string, stdout, stderr io.Writer) int {
 		return reportWorkspaceError(stdout, stderr, *jsonOutput, wsErrorf(wsErrInvalidArgs, "no acting seat: set GITMOOT_ORG_ROLE or run from a registered seat's pane"))
 	}
 	var opened db.Workspace
+	var record workspaceOpenRecord
 	err = withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		var openErr error
-		opened, openErr = openWorkspace(ctx, store, paths, workspaceOpenRequest{Seat: seat, Repo: repo, Issue: *issue, PR: *pr})
+		opened, record, openErr = openWorkspace(ctx, store, paths, workspaceOpenRequest{Seat: seat, Repo: repo, Issue: *issue, PR: *pr})
 		return openErr
 	})
 	if err != nil {
 		return reportWorkspaceError(stdout, stderr, *jsonOutput, err)
 	}
 	if *jsonOutput {
-		return writeWorkspaceJSON(stdout, stderr, newWorkspaceJSON(opened))
+		return writeWorkspaceJSON(stdout, stderr, newWorkspaceDetailJSON(opened, record))
 	}
 	fmt.Fprintf(stdout, "workspace %s ready: %s %s at %s (%s)\n", opened.ID, opened.Repo, opened.Branch, shortSHA(opened.Base), opened.Root)
+	if record.Template != "" {
+		fmt.Fprintf(stdout, "template: %s\n", record.Template)
+	}
+	for _, check := range record.Checks {
+		fmt.Fprintf(stdout, "check passed: %s\n", check)
+	}
 	return 0
 }
 
@@ -385,39 +424,59 @@ type workspaceSourcePlan struct {
 	BaseRef  string
 }
 
-func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, request workspaceOpenRequest) (db.Workspace, error) {
+// openWorkspace provisions, checks out and then checks the workspace: each
+// [repos."o/r".workspace] require command runs in order in the ready
+// workspace through the exec path. The first that fails closes the workspace
+// (reason "requirements_unmet: <command>", through closeWorkspace, so its
+// spend settles like any close) and open fails with requirements_unmet.
+func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, request workspaceOpenRequest) (db.Workspace, workspaceOpenRecord, error) {
 	policy, err := config.LoadWorkspacesPolicy(paths)
 	if err != nil {
-		return db.Workspace{}, wsErrorf(wsErrInvalidArgs, "invalid [workspaces] config: %v", err)
+		return db.Workspace{}, workspaceOpenRecord{}, wsErrorf(wsErrInvalidArgs, "invalid [workspaces] config: %v", err)
 	}
 	if !policy.Enabled {
-		return db.Workspace{}, wsErrorf(wsErrDisabled, "remote workspaces are off: set [workspaces] enabled = true")
+		return db.Workspace{}, workspaceOpenRecord{}, wsErrorf(wsErrDisabled, "remote workspaces are off: set [workspaces] enabled = true")
 	}
 	repoName := request.Repo.FullName()
+	repoTables, err := config.LoadRepoWorkspaces(paths)
+	if err != nil {
+		return db.Workspace{}, workspaceOpenRecord{}, wsErrorf(wsErrInvalidArgs, "invalid [repos.\"owner/repo\".workspace] config: %v", err)
+	}
+	repoWorkspace, err := repoTables.For(repoName)
+	if err != nil {
+		return db.Workspace{}, workspaceOpenRecord{}, wsErrorf(wsErrInvalidArgs, "invalid config: %v", err)
+	}
 	if existing, err := store.FindActiveWorkspace(ctx, request.Seat, repoName, request.Issue, request.PR); err == nil {
-		return db.Workspace{}, &db.WorkspaceAlreadyOpenError{ID: existing.ID}
+		return db.Workspace{}, workspaceOpenRecord{}, &db.WorkspaceAlreadyOpenError{ID: existing.ID}
 	} else if !errors.Is(err, db.ErrWorkspaceNotFound) {
-		return db.Workspace{}, err
+		return db.Workspace{}, workspaceOpenRecord{}, err
 	}
 	record, err := store.GetRepo(ctx, repoName)
 	if err != nil {
-		return db.Workspace{}, wsErrorf(wsErrNotFound, "repository %s is not registered with gitmoot: %v", repoName, err)
+		return db.Workspace{}, workspaceOpenRecord{}, wsErrorf(wsErrNotFound, "repository %s is not registered with gitmoot: %v", repoName, err)
 	}
-	provider, err := newWorkspaceProvider(paths, policy.Provider)
+	// The repository's template, else [workspaces] template, else (inside
+	// newWorkspaceProvider) the provider's [remote_exec] e2b_template.
+	template := repoWorkspace.Template
+	if template == "" {
+		template = policy.Template
+	}
+	provider, err := newWorkspaceProvider(paths, policy.Provider, template)
 	if err != nil {
-		return db.Workspace{}, err
+		return db.Workspace{}, workspaceOpenRecord{}, err
 	}
+	opened := workspaceOpenRecord{Template: provider.template, Checks: repoWorkspace.Require}
 	reserve := sandboxHoursCostUSD(workspaceReservePeriod, provider.rate)
 	if reserve > policy.MaxWorkspaceUSD {
-		return db.Workspace{}, wsErrorf(wsErrCostCap, "one reserved hour ($%.2f at $%.2f/h) passes [workspaces].max_workspace_usd $%.2f", reserve, provider.rate, policy.MaxWorkspaceUSD)
+		return db.Workspace{}, workspaceOpenRecord{}, wsErrorf(wsErrCostCap, "one reserved hour ($%.2f at $%.2f/h) passes [workspaces].max_workspace_usd $%.2f", reserve, provider.rate, policy.MaxWorkspaceUSD)
 	}
 	plan, err := resolveWorkspaceSource(ctx, record, request)
 	if err != nil {
-		return db.Workspace{}, err
+		return db.Workspace{}, workspaceOpenRecord{}, err
 	}
 	id, err := newWorkspaceID()
 	if err != nil {
-		return db.Workspace{}, err
+		return db.Workspace{}, workspaceOpenRecord{}, err
 	}
 	now := workspaceNow().UTC()
 	workspace := db.Workspace{
@@ -430,11 +489,11 @@ func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, req
 	// The reservation is written before the provider is called: a refused
 	// cap or a second open for the same seat and subject spends nothing.
 	if err := store.CreateWorkspace(ctx, workspace, policy.MaxTotalUSD); err != nil {
-		return db.Workspace{}, err
+		return db.Workspace{}, workspaceOpenRecord{}, err
 	}
-	fail := func(cause error) (db.Workspace, error) {
+	fail := func(cause error) (db.Workspace, workspaceOpenRecord, error) {
 		closeErr := closeWorkspace(context.WithoutCancel(ctx), store, paths, workspace.ID, "open_failed", io.Discard)
-		return db.Workspace{}, errors.Join(asWorkspaceError(cause, wsErrProviderUnavailable), closeErr)
+		return db.Workspace{}, workspaceOpenRecord{}, errors.Join(asWorkspaceError(cause, wsErrProviderUnavailable), closeErr)
 	}
 	// The create's deadline derives from paid_until, recorded above before the
 	// provider is called, so even a create whose answer is lost is bounded.
@@ -450,10 +509,10 @@ func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, req
 			// releases the reservation at once. Every other failure is
 			// ambiguous and stays reserved (closeWorkspace).
 			if _, beginErr := store.BeginWorkspaceClose(context.WithoutCancel(ctx), workspace.ID, workspaceReasonOpenFailed); beginErr != nil {
-				return db.Workspace{}, errors.Join(asWorkspaceError(err, wsErrProviderUnavailable), beginErr)
+				return db.Workspace{}, workspaceOpenRecord{}, errors.Join(asWorkspaceError(err, wsErrProviderUnavailable), beginErr)
 			}
 			finishErr := store.FinishWorkspaceClose(context.WithoutCancel(ctx), workspace.ID, db.WorkspaceStateFailed, 0, workspaceNow(), "")
-			return db.Workspace{}, errors.Join(asWorkspaceError(err, wsErrProviderUnavailable), finishErr)
+			return db.Workspace{}, workspaceOpenRecord{}, errors.Join(asWorkspaceError(err, wsErrProviderUnavailable), finishErr)
 		}
 		return fail(err)
 	}
@@ -463,6 +522,9 @@ func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, req
 	}
 	hostDir, err := workspaceHostDir(paths, workspace.ID)
 	if err != nil {
+		return fail(err)
+	}
+	if err := writeWorkspaceOpenRecord(hostDir, opened); err != nil {
 		return fail(err)
 	}
 	if _, err := sandbox.Sync(ctx, hostDir, remoteexec.WorkspaceSource{
@@ -477,7 +539,109 @@ func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, req
 	if err := store.MarkWorkspaceReady(ctx, workspace.ID, plan.Branch, plan.Head, plan.BaseRef, int64(rootDev), int64(rootIno), workspaceNow()); err != nil {
 		return fail(err)
 	}
-	return store.GetWorkspace(ctx, workspace.ID)
+	ready, err := store.GetWorkspace(ctx, workspace.ID)
+	if err != nil {
+		return fail(err)
+	}
+	// The checks run in the ready workspace, so the daemon renews and settles
+	// it like any other while they run; open returns it only once all pass.
+	for _, check := range opened.Checks {
+		unmet, failure := runWorkspaceRequire(ctx, store, ready, sandbox, check)
+		if failure != nil {
+			return fail(failure)
+		}
+		if unmet != nil {
+			closeErr := closeWorkspace(context.WithoutCancel(ctx), store, paths, workspace.ID, workspaceReasonRequirementsUnmet+": "+check, io.Discard)
+			return db.Workspace{}, workspaceOpenRecord{}, errors.Join(unmet, closeErr)
+		}
+	}
+	return ready, opened, nil
+}
+
+// workspaceOpenRecord is <home>/workspaces/<id>/open.json (#2704): what open
+// created the workspace from, beside close.json. Template is the provider
+// template the sandbox was created from ("" for the local provider); Checks
+// are the require commands open ran.
+type workspaceOpenRecord struct {
+	Template string   `json:"template"`
+	Checks   []string `json:"checks"`
+}
+
+func writeWorkspaceOpenRecord(hostDir string, record workspaceOpenRecord) error {
+	encoded, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(hostDir, "open.json"), append(encoded, '\n'), 0o600)
+}
+
+// readWorkspaceOpenRecord reads a workspace's open.json. A workspace opened
+// before #2704 (or whose open failed before provisioning) has none: that is
+// the zero record.
+func readWorkspaceOpenRecord(paths config.Paths, id string) (workspaceOpenRecord, error) {
+	data, err := os.ReadFile(filepath.Join(paths.Workspaces, id, "open.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return workspaceOpenRecord{}, nil
+	}
+	if err != nil {
+		return workspaceOpenRecord{}, err
+	}
+	var record workspaceOpenRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return workspaceOpenRecord{}, fmt.Errorf("read %s: %w", filepath.Join(paths.Workspaces, id, "open.json"), err)
+	}
+	return record, nil
+}
+
+// Require checks (#2704). Each command gets workspaceRequireTimeout (a
+// variable only so the offline tests can shorten it); a failure reports the
+// redacted last workspaceRequireTailBytes of the command's combined output,
+// cut from at most workspaceRequireCaptureBytes kept while it runs.
+var workspaceRequireTimeout = 60 * time.Second
+
+const (
+	workspaceRequireTailBytes    = 2 << 10
+	workspaceRequireCaptureBytes = 16 << 10
+)
+
+// runWorkspaceRequire runs one require command as `bash -lc '<command>'` in
+// the workspace root through runWorkspaceCommand, the exec path. It returns
+// the requirements_unmet error for a command that exited non-zero or timed
+// out (exit 124), or the session's own failure.
+func runWorkspaceRequire(ctx context.Context, store *db.Store, workspace db.Workspace, sandbox workspaceSandbox, command string) (unmet, failure *workspaceError) {
+	output := &workspaceTail{max: workspaceRequireCaptureBytes}
+	status, failure := runWorkspaceCommand(ctx, store, workspace, sandbox, workspaceExecRequest{
+		ID: workspace.ID, Cwd: ".", Timeout: workspaceRequireTimeout, Argv: []string{"bash", "-lc", command},
+	}, nil, output, output)
+	if failure != nil {
+		return nil, failure
+	}
+	if status.ExitCode == 0 && !status.TimedOut {
+		return nil, nil
+	}
+	exitCode := status.ExitCode
+	message := fmt.Sprintf("require check %q exited %d", command, exitCode)
+	if status.TimedOut {
+		exitCode = 124
+		message = fmt.Sprintf("require check %q timed out after %s", command, workspaceRequireTimeout)
+	}
+	tail := workspaceRequireTail(output.String())
+	return &workspaceError{Code: wsErrRequirementsUnmet, Message: message, FailedCheck: command, ExitCode: &exitCode, OutputTail: &tail}, nil
+}
+
+// workspaceRequireTail redacts output with the job-output redactor before it
+// cuts the tail, so a secret split by the cut cannot leak, and advances the
+// cut to a rune boundary.
+func workspaceRequireTail(output string) string {
+	tail := workflow.RedactCommentText(output)
+	if len(tail) <= workspaceRequireTailBytes {
+		return tail
+	}
+	tail = tail[len(tail)-workspaceRequireTailBytes:]
+	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+		tail = tail[1:]
+	}
+	return tail
 }
 
 func newWorkspaceID() (string, error) {
@@ -589,9 +753,16 @@ type workspaceProvider struct {
 	backend workspaceBackend
 	name    string
 	rate    float64
+	// template is the template a create on this provider uses; "" for the
+	// local provider, which has none.
+	template string
 }
 
-func newWorkspaceProvider(paths config.Paths, providerName string) (*workspaceProvider, error) {
+// newWorkspaceProvider builds the provider's stack. template, when set,
+// replaces the provider's [remote_exec] e2b_template; only open passes one
+// (the repository's or [workspaces] template), since only create uses it,
+// and attach, renew and close keep working whatever the sections say.
+func newWorkspaceProvider(paths config.Paths, providerName, template string) (*workspaceProvider, error) {
 	if providerName == workspaceLocalProvider {
 		root := filepath.Join(paths.Home, "execbackends", string(execbackend.Local))
 		var identity *execbackend.LocalIdentity
@@ -617,11 +788,8 @@ func newWorkspaceProvider(paths config.Paths, providerName string) (*workspacePr
 	if err != nil {
 		return nil, wsErrorf(wsErrProviderUnavailable, "%v", err)
 	}
-	// [workspaces] template, else the provider's e2b_template. Only create
-	// uses it; a [workspaces] section open has already refused as invalid
-	// falls back here, so attach, renew and close keep working.
-	if policy, err := config.LoadWorkspacesPolicy(paths); err == nil && policy.Template != "" {
-		cfg.E2BTemplate = policy.Template
+	if template != "" {
+		cfg.E2BTemplate = template
 	}
 	if err := cfg.ValidateE2BProvider(); err != nil {
 		return nil, wsErrorf(wsErrProviderUnavailable, "%v", err)
@@ -646,7 +814,7 @@ func newWorkspaceProvider(paths config.Paths, providerName string) (*workspacePr
 	if err != nil {
 		return nil, wsErrorf(wsErrProviderUnavailable, "%v", err)
 	}
-	return &workspaceProvider{backend: remoteWorkspaceBackend{backend: backend}, name: cfg.Provider, rate: rate}, nil
+	return &workspaceProvider{backend: remoteWorkspaceBackend{backend: backend}, name: cfg.Provider, rate: rate, template: cfg.E2BTemplate}, nil
 }
 
 func runWorkspaceShow(args []string, stdout, stderr io.Writer) int {
@@ -660,9 +828,13 @@ func runWorkspaceShow(args []string, stdout, stderr io.Writer) int {
 		return reportWorkspaceError(stdout, stderr, *jsonOutput, wsErrorf(wsErrInvalidArgs, "workspace show takes exactly one workspace id"))
 	}
 	var workspace db.Workspace
-	err = withStore(*home, func(store *db.Store) error {
+	var opened workspaceOpenRecord
+	err = withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		var getErr error
-		workspace, getErr = store.GetWorkspace(context.Background(), positionals[0])
+		if workspace, getErr = store.GetWorkspace(context.Background(), positionals[0]); getErr != nil {
+			return getErr
+		}
+		opened, getErr = readWorkspaceOpenRecord(paths, workspace.ID)
 		return getErr
 	})
 	if err != nil {
@@ -671,15 +843,22 @@ func runWorkspaceShow(args []string, stdout, stderr io.Writer) int {
 		}
 		return reportWorkspaceError(stdout, stderr, *jsonOutput, err)
 	}
-	out := newWorkspaceJSON(workspace)
+	out := newWorkspaceDetailJSON(workspace, opened)
 	out.Env = workspaceBaseEnv(workspaceGuestHomeFor(workspace), workspace.Root)
 	if *jsonOutput {
 		return writeWorkspaceJSON(stdout, stderr, out)
 	}
+	template := opened.Template
+	if template == "" {
+		template = "-"
+	}
 	writer := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(writer, "id\t%s\nseat\t%s\nrepo\t%s\nsubject\t%s\nbranch\t%s\nbase\t%s\nroot\t%s\nprovider\t%s\nstate\t%s\ncreated\t%s\nlast active\t%s\ncost\t$%.2f accrued, $%.2f reserved\n",
+	fmt.Fprintf(writer, "id\t%s\nseat\t%s\nrepo\t%s\nsubject\t%s\nbranch\t%s\nbase\t%s\nroot\t%s\nprovider\t%s\ntemplate\t%s\nstate\t%s\ncreated\t%s\nlast active\t%s\ncost\t$%.2f accrued, $%.2f reserved\n",
 		workspace.ID, workspace.Seat, workspace.Repo, workspaceSubject(workspace), workspace.Branch, workspace.Base, workspace.Root,
-		workspace.Provider, workspace.State, out.CreatedAt, out.LastActiveAt, workspace.CostAccruedUSD, workspace.CostReservedUSD)
+		workspace.Provider, template, workspace.State, out.CreatedAt, out.LastActiveAt, workspace.CostAccruedUSD, workspace.CostReservedUSD)
+	for _, check := range opened.Checks {
+		fmt.Fprintf(writer, "check\t%s\n", check)
+	}
 	if workspace.CloseReason != "" {
 		fmt.Fprintf(writer, "close reason\t%s\n", workspace.CloseReason)
 	}

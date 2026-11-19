@@ -52,6 +52,7 @@ var (
 		"review_router.go::LoadReviewRouterSettings",
 		"runtime_registry.go::LoadRuntimeOverrides",
 		"transcripts.go::LoadTranscriptsConfig",
+		"workspaces.go::LoadRepoWorkspaces",   // TestLoadRepoWorkspacesRefusesMalformedHeader (#2704)
 		"workspaces.go::LoadWorkspacesPolicy", // TestLoadWorkspacesPolicyRefusesInvalidValues (#2678)
 	}
 

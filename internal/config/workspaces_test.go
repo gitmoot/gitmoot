@@ -1,6 +1,8 @@
 package config
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -60,5 +62,89 @@ func TestLoadWorkspacesPolicyTemplate(t *testing.T) {
 	// Unset means the provider's [remote_exec] template (resolved by the CLI).
 	if policy, err := LoadWorkspacesPolicy(writeGateConfig(t, "[workspaces]\nenabled = true\n")); err != nil || policy.Template != "" {
 		t.Fatalf("no template = %+v, %v", policy, err)
+	}
+}
+
+func TestLoadRepoWorkspaces(t *testing.T) {
+	cfg, err := LoadRepoWorkspaces(writeGateConfig(t, `[workspaces]
+template = "global-tmpl"
+
+[repos."Acme/Widget".workspace]
+template = "team/widget:v2"
+require = ["go version", "test -f go.mod && echo \"a,b\"" ]
+
+[repos."acme/widget".review]
+require = ["not this one"]
+
+[repos."acme/other".workspace]
+require = ["make -v",]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Repository names match case-insensitively.
+	for _, repo := range []string{"acme/widget", "ACME/WIDGET", " Acme/Widget "} {
+		got, err := cfg.For(repo)
+		if err != nil || got.Template != "team/widget:v2" || !reflect.DeepEqual(got.Require, []string{"go version", `test -f go.mod && echo "a,b"`}) {
+			t.Fatalf("For(%q) = %+v, %v", repo, got, err)
+		}
+	}
+	if got, err := cfg.For("acme/other"); err != nil || got.Template != "" || !reflect.DeepEqual(got.Require, []string{"make -v"}) {
+		t.Fatalf("acme/other = %+v, %v", got, err)
+	}
+	if got, err := cfg.For("acme/none"); err != nil || got.Template != "" || got.Require != nil {
+		t.Fatalf("a repository without a table = %+v, %v", got, err)
+	}
+	if got, err := LoadRepoWorkspaces(writeGateConfig(t, "[workspaces]\nenabled = true\n")); err != nil || len(got.repos) != 0 {
+		t.Fatalf("no tables = %+v, %v", got, err)
+	}
+}
+
+func TestLoadRepoWorkspacesRefusesInvalidValues(t *testing.T) {
+	sixteen := strings.TrimSuffix(strings.Repeat(`"true", `, MaxWorkspaceRequire), ", ")
+	for _, body := range []string{
+		`template = ""`,
+		`template = "has space"`,
+		`template = "-leading-dash"`,
+		`template = base`,
+		`require = "go version"`,
+		`require = [""]`,
+		`require = ["go version", "   "]`,
+		`require = ["\t"]`,
+		`require = [go]`,
+		`require = ["go" "make"]`,
+		`require = ["unterminated]`,
+		`require = ["nul\u0000byte"]`,
+		`require = ["go version",`,
+		`require = [` + sixteen + `, "one too many"]`,
+	} {
+		cfg, err := LoadRepoWorkspaces(writeGateConfig(t, "[repos.\"acme/widget\".workspace]\n"+body+"\n[repos.\"acme/other\".workspace]\nrequire = [\"true\"]\n"))
+		if err != nil {
+			t.Fatalf("%q refused the whole file: %v", body, err)
+		}
+		if got, err := cfg.For("Acme/Widget"); err == nil {
+			t.Fatalf("[repos.\"acme/widget\".workspace] %s accepted: %+v", body, got)
+		}
+		// One repository's invalid table never refuses another's.
+		if got, err := cfg.For("acme/other"); err != nil || len(got.Require) != 1 {
+			t.Fatalf("after %q acme/other = %+v, %v", body, got, err)
+		}
+	}
+	cfg, err := LoadRepoWorkspaces(writeGateConfig(t, "[repos.\"acme/widget\".workspace]\nrequire = ["+sixteen+"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := cfg.For("acme/widget"); err != nil || len(got.Require) != MaxWorkspaceRequire {
+		t.Fatalf("%d checks = %+v, %v", MaxWorkspaceRequire, got, err)
+	}
+}
+
+func TestLoadRepoWorkspacesRefusesMalformedHeader(t *testing.T) {
+	if _, err := LoadRepoWorkspaces(writeGateConfig(t, "[repos.\"acme/widget\".workspace\nrequire = [\"true\"]\n")); err == nil {
+		t.Fatal("LoadRepoWorkspaces accepted a malformed [repos.\"o/r\".workspace header")
+	}
+	// A typo in an unrelated section is not this loader's to refuse.
+	if _, err := LoadRepoWorkspaces(writeGateConfig(t, "[disk_guard\nmin_free_bytes = 1\n[workspaces\n")); err != nil {
+		t.Fatalf("an unrelated malformed header refused: %v", err)
 	}
 }

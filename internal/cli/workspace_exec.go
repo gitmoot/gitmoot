@@ -281,7 +281,7 @@ func attachReadyWorkspace(ctx context.Context, store *db.Store, paths config.Pat
 	if workspace.State != db.WorkspaceStateReady {
 		return db.Workspace{}, nil, wsErrorf(wsErrNotReady, "workspace %s is %s", workspace.ID, workspace.State)
 	}
-	provider, err := newWorkspaceProvider(paths, workspace.Provider)
+	provider, err := newWorkspaceProvider(paths, workspace.Provider, "")
 	if err != nil {
 		return db.Workspace{}, nil, asWorkspaceError(err, wsErrProviderUnavailable)
 	}
@@ -308,6 +308,13 @@ func runWorkspaceSession(store *db.Store, paths config.Paths, request workspaceE
 	if failure != nil {
 		return workspaceExecStatus{}, failure
 	}
+	return runWorkspaceCommand(ctx, store, workspace, sandbox, request, stdin, stdout, stderr)
+}
+
+// runWorkspaceCommand runs request.Argv in an attached workspace under the
+// supervisor: the one exec path, shared by `workspace exec`, `ws sh` and
+// open's require checks.
+func runWorkspaceCommand(ctx context.Context, store *db.Store, workspace db.Workspace, sandbox workspaceSandbox, request workspaceExecRequest, stdin io.Reader, stdout, stderr io.Writer) (workspaceExecStatus, *workspaceError) {
 	env := workspaceBaseEnv(sandbox.Home(), workspace.Root)
 	for _, entry := range request.Env {
 		name, value, _ := strings.Cut(entry, "=")
