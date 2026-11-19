@@ -530,32 +530,61 @@ def remove_parts(rel):
     return parts, what
 
 
+def check_removal(parts, what, planned):
+    """Check one path before anything is removed: confinement (a symlink on
+    the way is refused), and a directory must be empty once the paths listed
+    before it in the batch are gone. Returns False for a missing path."""
+    try:
+        dir_fd = open_dirs(root_fd(), parts[:-1], what)
+    except Missing:
+        return False
+    try:
+        try:
+            info = os.lstat(parts[-1], dir_fd=dir_fd)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISDIR(info.st_mode):
+            child = open_child(dir_fd, parts[-1], what)
+            with os.scandir(child) as listing:
+                left = [item.name for item in listing if tuple(parts) + (item.name,) not in planned]
+            os.close(child)
+            if left:
+                fail(EXIT_FAILED, "not_empty", "%s is a directory that is not empty (%s); list its entries before it" % (what, left[0]))
+        return True
+    finally:
+        os.close(dir_fd)
+
+
 def op_remove():
-    # Every path is checked before anything is removed.
+    # All or nothing: every path is checked (confinement, .git, non-empty
+    # directories) before any is removed; the first failure removes nothing.
     targets = [remove_parts(rel) for rel in cfg["paths"]]
-    removed = 0
+    planned = set()
+    present = []
     for parts, what in targets:
+        if check_removal(parts, what, planned):
+            present.append((parts, what))
+        planned.add(tuple(parts))
+    removed = 0
+    for parts, what in present:
         try:
             dir_fd = open_dirs(root_fd(), parts[:-1], what)
         except Missing:
-            continue  # a missing parent: nothing to remove
+            continue
         name = parts[-1]
         try:
             try:
                 info = os.lstat(name, dir_fd=dir_fd)
-            except FileNotFoundError:
-                continue
-            try:
                 if stat.S_ISDIR(info.st_mode):
                     os.rmdir(name, dir_fd=dir_fd)
                 else:
                     # A symlink is unlinked itself; its target is never touched.
                     os.unlink(name, dir_fd=dir_fd)
             except FileNotFoundError:
-                continue
+                continue  # listed twice, or removed meanwhile
             except OSError as error:
                 if error.errno in (errno.ENOTEMPTY, errno.EEXIST):
-                    fail(EXIT_FAILED, "not_empty", "%s is a directory that is not empty; remove its entries first" % what)
+                    fail(EXIT_FAILED, "not_empty", "%s is a directory that is not empty" % what)
                 raise
             removed += 1
         finally:

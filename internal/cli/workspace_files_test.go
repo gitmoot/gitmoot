@@ -857,8 +857,30 @@ func TestWorkspaceRemove(t *testing.T) {
 		}
 
 		env.expectFailure(workspaceCLIFailure, wsErrNotEmpty, nil, "workspace", "remove", id, "--", "full")
+		// All or nothing: a batch with a non-empty directory removes nothing,
+		// not even the file listed before it.
+		if err := os.WriteFile(filepath.Join(root, "b.txt"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		result := env.run("workspace", "remove", id, "--", "b.txt", "full")
+		if result.code != workspaceCLIFailure || workspaceErrorCode(t, result.stderr) != wsErrNotEmpty || !strings.Contains(result.stderr, "path full") {
+			t.Fatalf("remove [file, non-empty dir] = %+v", result)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "b.txt")); err != nil {
+			t.Fatalf("a refused batch removed b.txt: %v", err)
+		}
 		if _, err := os.Lstat(filepath.Join(root, "full", "inside.txt")); err != nil {
 			t.Fatalf("a refused remove touched full/: %v", err)
+		}
+		// A directory whose entries are listed before it in the batch goes too.
+		if out := env.mustRun(nil, "workspace", "remove", id, "--", "full/inside.txt", "full", "b.txt"); strings.TrimSpace(out) != `{"removed":3}` {
+			t.Fatalf("remove [entries, dir] printed %q", out)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "full")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("full survived: %v", err)
+		}
+		if out := env.mustRun(nil, "workspace", "remove", id, "--", "missing.txt"); strings.TrimSpace(out) != `{"removed":0}` {
+			t.Fatalf("remove of a missing path printed %q", out)
 		}
 		for _, bad := range []string{"../x", filepath.Join(root, "full"), "full/../../x"} {
 			env.expectFailure(workspaceCLIFailure, wsErrCwdOutsideRoot, nil, "workspace", "remove", id, "--", bad)
