@@ -22,6 +22,8 @@
 #   basediff base           NUL-separated paths whose content or mode differs
 #                           from commit base (git diff), for mirror
 #   bundle   branch, base   a git bundle of branch's commits past base
+#   remove   paths          unlink files and symlinks (never followed), rmdir
+#                           empty directories; {"removed": N}
 import base64
 import errno
 import io
@@ -518,6 +520,50 @@ def op_push():
     write_all(1, json.dumps({"applied": applied}).encode())
 
 
+def remove_parts(rel):
+    what = "path %s" % rel
+    parts = relative_parts(rel, what)
+    if not parts:
+        fail(EXIT_FAILED, "invalid_args", "%s names the workspace root" % what)
+    if parts[0] == ".git":
+        fail(EXIT_FAILED, "invalid_args", "%s is in .git, which workspace remove never touches" % what)
+    return parts, what
+
+
+def op_remove():
+    # Every path is checked before anything is removed.
+    targets = [remove_parts(rel) for rel in cfg["paths"]]
+    removed = 0
+    for parts, what in targets:
+        try:
+            dir_fd = open_dirs(root_fd(), parts[:-1], what)
+        except Missing:
+            continue  # a missing parent: nothing to remove
+        name = parts[-1]
+        try:
+            try:
+                info = os.lstat(name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                continue
+            try:
+                if stat.S_ISDIR(info.st_mode):
+                    os.rmdir(name, dir_fd=dir_fd)
+                else:
+                    # A symlink is unlinked itself; its target is never touched.
+                    os.unlink(name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                if error.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                    fail(EXIT_FAILED, "not_empty", "%s is a directory that is not empty; remove its entries first" % what)
+                raise
+            removed += 1
+        finally:
+            os.close(dir_fd)
+    write_all(1, json.dumps({"removed": removed}).encode())
+
+
+
 # commits out
 
 
@@ -565,6 +611,7 @@ OPS = {
     "pull": op_pull,
     "push": op_push,
     "basediff": op_basediff,
+    "remove": op_remove,
     "bundle": op_bundle,
 }
 

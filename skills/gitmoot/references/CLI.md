@@ -146,6 +146,7 @@ disagrees, trust its live `--help`.
 - [gitmoot workspace pull](#gitmoot-workspace-pull)
 - [gitmoot workspace push](#gitmoot-workspace-push)
 - [gitmoot workspace read](#gitmoot-workspace-read)
+- [gitmoot workspace remove](#gitmoot-workspace-remove)
 - [gitmoot workspace show](#gitmoot-workspace-show)
 - [gitmoot workspace stat](#gitmoot-workspace-stat)
 - [gitmoot workspace write](#gitmoot-workspace-write)
@@ -1932,6 +1933,7 @@ Usage:
   gitmoot workspace pull <id> -- <paths...>
   gitmoot workspace push <id> --files
   gitmoot workspace push <id>
+  gitmoot workspace remove <id> -- <paths...>
   gitmoot workspace mirror <id> <dir>
   gitmoot ws sh [--cwd REL] '<command>'
 
@@ -2048,6 +2050,16 @@ Usage of workspace push:
 
 ```text
 Usage of workspace read:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print JSON
+```
+
+## gitmoot workspace remove
+
+```text
+Usage of workspace remove:
   -home string
     	home directory to use instead of the current user's home
   -json

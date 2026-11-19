@@ -46,6 +46,7 @@ const (
 	wsErrInternal            = "internal"
 	wsErrIsDirectory         = "is_directory"
 	wsErrPushRefused         = "push_refused"
+	wsErrNotEmpty            = "not_empty"
 )
 
 // workspaceCLIFailure is the exit status of a workspace command that failed
@@ -231,6 +232,8 @@ func runWorkspace(args []string, stdout, stderr io.Writer) int {
 		return runWorkspacePull(args[1:], stdout, stderr)
 	case "push":
 		return runWorkspacePush(args[1:], os.Stdin, stdout, stderr)
+	case "remove":
+		return runWorkspaceRemove(args[1:], stdout, stderr)
 	case "mirror":
 		return runWorkspaceMirror(args[1:], stdout, stderr)
 	default:
@@ -256,6 +259,7 @@ func printWorkspaceUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot workspace pull <id> -- <paths...>")
 	fmt.Fprintln(w, "  gitmoot workspace push <id> --files")
 	fmt.Fprintln(w, "  gitmoot workspace push <id>")
+	fmt.Fprintln(w, "  gitmoot workspace remove <id> -- <paths...>")
 	fmt.Fprintln(w, "  gitmoot workspace mirror <id> <dir>")
 	fmt.Fprintln(w, "  gitmoot ws sh [--cwd REL] '<command>'")
 	fmt.Fprintln(w)

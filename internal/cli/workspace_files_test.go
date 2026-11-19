@@ -812,3 +812,69 @@ func TestWorkspaceTemplateFallsBackToRemoteExecTemplate(t *testing.T) {
 		t.Fatalf("with [workspaces] template the sandbox template = %q", got)
 	}
 }
+
+func TestWorkspaceRemove(t *testing.T) {
+	forEachWorkspaceProvider(t, func(t *testing.T, env *workspaceTestEnv, opened workspaceJSON) {
+		id, root := opened.ID, opened.Root
+		outside := filepath.Join(t.TempDir(), "target.txt")
+		if err := os.WriteFile(outside, []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, dir := range []string{"empty", "full", " spaced dir "} {
+			if err := os.Mkdir(filepath.Join(root, dir), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, file := range []string{"a.txt", "full/inside.txt", " spaced dir / f.txt ", "spaced dir.txt"} {
+			if err := os.WriteFile(filepath.Join(root, file), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Symlink(outside, filepath.Join(root, "out-link")); err != nil {
+			t.Fatal(err)
+		}
+		token := decodeWorkspaceChanges(t, env.mustRun(nil, "workspace", "changes", id, "--since", "start", "--json")).Token
+
+		out := env.mustRun(nil, "workspace", "remove", id, "--", "a.txt", "out-link", "empty", " spaced dir / f.txt ", "missing.txt", "nodir/missing.txt")
+		if strings.TrimSpace(out) != `{"removed":4}` {
+			t.Fatalf("remove printed %q", out)
+		}
+		for _, gone := range []string{"a.txt", "out-link", "empty", " spaced dir / f.txt "} {
+			if _, err := os.Lstat(filepath.Join(root, gone)); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("%q survived remove", gone)
+			}
+		}
+		if data, err := os.ReadFile(outside); err != nil || string(data) != "keep" {
+			t.Fatalf("the symlink's target = %q, %v; it must survive", data, err)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "spaced dir.txt")); err != nil {
+			t.Fatalf("the untrimmed name removed the trimmed one: %v", err)
+		}
+		next := decodeWorkspaceChanges(t, env.mustRun(nil, "workspace", "changes", id, "--since", token, "--json"))
+		sort.Strings(next.Deleted)
+		if next.Reset || strings.Join(next.Deleted, "|") != " spaced dir / f.txt |a.txt|empty|out-link" {
+			t.Fatalf("changes after remove = %+v", next)
+		}
+
+		env.expectFailure(workspaceCLIFailure, wsErrNotEmpty, nil, "workspace", "remove", id, "--", "full")
+		if _, err := os.Lstat(filepath.Join(root, "full", "inside.txt")); err != nil {
+			t.Fatalf("a refused remove touched full/: %v", err)
+		}
+		for _, bad := range []string{"../x", filepath.Join(root, "full"), "full/../../x"} {
+			env.expectFailure(workspaceCLIFailure, wsErrCwdOutsideRoot, nil, "workspace", "remove", id, "--", bad)
+		}
+		if err := os.Symlink(filepath.Dir(outside), filepath.Join(root, "out-dir")); err != nil {
+			t.Fatal(err)
+		}
+		env.expectFailure(workspaceCLIFailure, wsErrCwdOutsideRoot, nil, "workspace", "remove", id, "--", "out-dir/target.txt")
+		if _, err := os.Stat(outside); err != nil {
+			t.Fatalf("remove through a symlink reached %s: %v", outside, err)
+		}
+		for _, bad := range []string{".git", ".git/HEAD", "", "."} {
+			env.expectFailure(workspaceCLIFailure, wsErrInvalidArgs, nil, "workspace", "remove", id, "--", bad)
+		}
+		if _, err := os.Stat(filepath.Join(root, ".git", "HEAD")); err != nil {
+			t.Fatalf(".git/HEAD: %v", err)
+		}
+	})
+}

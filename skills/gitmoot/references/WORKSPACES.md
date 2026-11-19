@@ -8,7 +8,7 @@ edits code. The VM gets no GitHub token and none of the host's environment.
 
 Commands: `open`, `show`, `ls`, `exec`, `ws sh` and `close`; file sync for a
 host mirror (`read`, `write`, `stat`, `changes`, `pull`, `push --files`,
-`mirror`); and `push <id>`, commits out, pushed from the host.
+`remove`, `mirror`); and `push <id>`, commits out, pushed from the host.
 
 ## Setup
 
@@ -65,7 +65,7 @@ registered seat.
 | `gitmoot workspace exec <id> [--cwd REL] [--env K=V]... [--timeout S] [--stdin] [--status-file HOSTPATH] -- argv...` | Runs argv in the VM. |
 | `gitmoot ws sh [--cwd REL] [--status-file HOSTPATH] '<cmd>'` | `exec $GITMOOT_WORKSPACE --cwd REL -- bash -lc '<cmd>'`. Exactly one command string; more is `invalid_args`. |
 | `gitmoot workspace close <id> [--reason TEXT] [--json]` | Copies the logs out, destroys the VM, settles the ledger. Default reason `manual`. |
-| `gitmoot workspace read\|write\|stat\|changes\|pull\|mirror …`, `push <id> --files` | Files in the VM and the host mirror: see [Files](#files-read-write-stat-changes-pull-push---files-mirror). |
+| `gitmoot workspace read\|write\|stat\|changes\|pull\|remove\|mirror …`, `push <id> --files` | Files in the VM and the host mirror: see [Files](#files-read-write-stat-changes-pull-push---files-remove-mirror). |
 | `gitmoot workspace push <id>` | Commits out, pushed from the host: see [Commits out](#commits-out-push). |
 
 `open`, `show --json` and `close --json` print exactly these keys (`issue` and
@@ -93,7 +93,7 @@ Every failure prints one line `{"error":{"code":"<code>","message":"…"}}` on
 stderr (and on stdout too with `--json`) and exits **125**. Codes:
 `not_found`, `not_ready`, `cost_cap`, `provider_unavailable`,
 `cwd_outside_root`, `already_open`, `invalid_args`, `disabled`, `internal`,
-and for the file commands `is_directory`, `push_refused` and
+and for the file commands `is_directory`, `not_empty`, `push_refused` and
 `nothing_to_push`. `read`, `write` and `stat` exit **3** (`not_found`) for a
 path that does not exist and **4** (`is_directory`) for a directory where a
 file was wanted, with the same error line.
@@ -151,7 +151,7 @@ group is killed too, so nothing outlives the exec. The supervisor's exit
 status is the command's, and it reports `{exit_code, signal, timed_out,
 error}` as a trailer on stderr that the CLI strips.
 
-## Files: read, write, stat, changes, pull, push --files, mirror
+## Files: read, write, stat, changes, pull, push --files, remove, mirror
 
 omp's file tools run on a host mirror of the work tree; these commands read
 and write the VM side. Every `<rel>` is relative to `root`, taken exactly as
@@ -168,6 +168,7 @@ which reports it as `symlink`).
 | `gitmoot workspace changes <id> --since <token\|start> --json` | `{"reset":bool,"token":"ws1.…","changed":[{"path","type","size","mtime","mode"}],"deleted":[path]}` (below). |
 | `gitmoot workspace pull <id> -- <paths...>` | A tar stream of those paths on stdout: regular files with their permission bits, directories (the entry only) and symlinks (never followed). A path that is missing, special or behind a symlink is left out. |
 | `gitmoot workspace push <id> --files` | A tar stream on stdin (files, directories, symlinks), each entry applied atomically with its permission bits, parents created. The whole stream is checked first: an absolute name, a `..` component, or a symlink whose target leaves the root refuses it (`cwd_outside_root`) before anything is applied. Prints `applied N entries` (`--json`: `{"applied":N}`). |
+| `gitmoot workspace remove <id> -- <paths...>` | Unlinks files and symlinks (a symlink itself, never its target) and removes empty directories; a non-empty directory is refused with `not_empty`. A missing path is not an error; `.git` and anything under it are refused (`invalid_args`). Every path is checked before anything is removed. Prints `{"removed":N}`, what was actually removed. The next `changes` reports them in `deleted`. |
 | `gitmoot workspace mirror <id> <dir>` | Fills `<dir>` (absent or empty) with the work tree and prints the `changes` token it is current at (`--json`: `{"token","dir"}`). |
 
 ### changes

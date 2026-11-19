@@ -401,6 +401,47 @@ func runWorkspacePull(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// runWorkspaceRemove unlinks files and symlinks (a symlink itself, never its
+// target) and removes empty directories, under the same confinement as the
+// other file commands. A missing path is not an error; .git is refused.
+func runWorkspaceRemove(args []string, stdout, stderr io.Writer) int {
+	positionals, home, jsonOutput, code := workspaceFileArgs("workspace remove", args, stdout, stderr, nil)
+	if code >= 0 {
+		return code
+	}
+	if len(positionals) < 1 {
+		return reportWorkspaceError(stdout, stderr, jsonOutput, wsErrorf(wsErrInvalidArgs, "usage: gitmoot workspace remove <id> -- <paths...>"))
+	}
+	paths := make([]string, 0, len(positionals)-1)
+	for _, raw := range positionals[1:] {
+		rel, failure := workspaceRelativePath("path", raw)
+		if failure != nil {
+			return reportWorkspaceError(stdout, stderr, jsonOutput, failure)
+		}
+		if rel == "." {
+			return reportWorkspaceError(stdout, stderr, jsonOutput, wsErrorf(wsErrInvalidArgs, "path %q names the workspace root", raw))
+		}
+		if rel == ".git" || strings.HasPrefix(rel, ".git/") {
+			return reportWorkspaceError(stdout, stderr, jsonOutput, wsErrorf(wsErrInvalidArgs, "path %q is in .git, which workspace remove never touches", raw))
+		}
+		paths = append(paths, rel)
+	}
+	var output bytes.Buffer
+	err := withReadyWorkspace(home, positionals[0], func(ctx context.Context, _ *db.Store, _ config.Paths, workspace db.Workspace, sandbox workspaceSandbox) *workspaceError {
+		return runWorkspaceFileOp(ctx, sandbox, workspace, map[string]any{"op": "remove", "paths": paths}, nil, &output)
+	})
+	if err != nil {
+		return reportWorkspaceError(stdout, stderr, jsonOutput, err)
+	}
+	var removed struct {
+		Removed int `json:"removed"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &removed); err != nil {
+		return reportWorkspaceError(stdout, stderr, jsonOutput, wsErrorf(wsErrInternal, "workspace remove printed %q: %v", output.String(), err))
+	}
+	return writeWorkspaceJSON(stdout, stderr, removed)
+}
+
 func runWorkspacePush(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	var files *bool
 	positionals, home, jsonOutput, code := workspaceFileArgs("workspace push", args, stdout, stderr, func(fs *flag.FlagSet) {
