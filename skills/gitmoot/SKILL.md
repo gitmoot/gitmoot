@@ -289,9 +289,11 @@ suggested next command:
 "Green" means every required check of the base branch passed (every reported
 check, when the required set cannot be read). Gitmoot's own `gitmoot/*`
 statuses are not CI, and a head with more than 100 checks is listed as
-"checks truncated" and never judged green. A base branch with no workflow file
-and no required check runs no CI: its pull requests are listed as "no CI
-configured" and never flagged `no_ci_on_head`; the other states still apply.
+"checks truncated" and never judged green. A pull request no CI can run for
+(no `.github/workflows/*.yml` on its base branch, its head or the default
+branch, and a base known to require no check) is listed as "no CI configured"
+and never flagged `no_ci_on_head`; the other states still apply. If any of
+those can't be read, it is treated as having CI.
 
 The owning seat is the role the pull request's records name (review requester,
 implement run, PR owner) while it is live. When that seat is gone the row says

@@ -75,9 +75,11 @@ func classifyStalledPR(f prStallFacts, policy config.PRStalledPolicy, now time.T
 	}
 	ref := fmt.Sprintf("%d --repo %s", pr.Number, f.Repo)
 	checks := prCIChecks(pr.Checks)
-	// A base branch with no workflow file and no required check runs no CI:
-	// no check will ever report, so the head is judged on the later states.
-	if len(checks) == 0 && !pr.NoCIConfigured() {
+	// A repository whose PR can trigger no workflow and whose base requires
+	// no check runs no CI: no check will ever report, so the head is judged
+	// on the later states.
+	noCI := prNoCIConfigured(pr)
+	if len(checks) == 0 && !noCI {
 		since := firstNonZeroTime(pr.HeadCommittedAt, pr.CreatedAt)
 		if now.Sub(since) < policy.NoCIAfter {
 			return prStall{}, false
@@ -174,17 +176,46 @@ func (f prStallFacts) mergeGateProgressing(policy config.PRStalledPolicy, now ti
 	return !updated.IsZero() && now.Sub(updated) < policy.GreenNotMergedAfter
 }
 
-// prCIChecks drops gitmoot's own bookkeeping statuses (gitmoot/merge-gate,
-// gitmoot/review-level): they are not CI, and the merge gate's progress is
-// read from its store row instead.
+// isCIContext reports whether a check or required-check context is CI.
+// Gitmoot's own bookkeeping statuses (gitmoot/merge-gate, gitmoot/review-level)
+// are not: the merge gate's progress is read from its store row instead.
+func isCIContext(name string) bool {
+	return !strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "gitmoot/")
+}
+
+// prCIChecks keeps the checks that are CI (isCIContext).
 func prCIChecks(checks []github.PullRequestCheckFact) []github.PullRequestCheckFact {
 	out := make([]github.PullRequestCheckFact, 0, len(checks))
 	for _, check := range checks {
-		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(check.Name)), "gitmoot/") {
+		if isCIContext(check.Name) {
 			out = append(out, check)
 		}
 	}
 	return out
+}
+
+// prNoCIConfigured reports a pull request no CI will ever report on (#2683):
+// the base's required set is known and has no CI context, and the three
+// workflow trees that can start a run for it (the base branch's, the head's,
+// whose pull_request workflows run from the merge commit, and the default
+// branch's, whose pull_request_target workflows run whatever the base) were
+// all read and hold no workflow file. Anything unread is unknown, which is
+// not "no CI".
+func prNoCIConfigured(pr github.PullRequestFacts) bool {
+	if !pr.RequiredKnown {
+		return false
+	}
+	for _, name := range pr.Required {
+		if strings.TrimSpace(name) != "" && isCIContext(name) {
+			return false
+		}
+	}
+	for _, dir := range []github.WorkflowDir{pr.BaseWorkflows, pr.HeadWorkflows, pr.DefaultBranchWorkflows} {
+		if !dir.Known || dir.Files > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 type prCheckSummary struct {
@@ -202,7 +233,7 @@ func summarizePRChecks(checks []github.PullRequestCheckFact, required []string, 
 	var summary prCheckSummary
 	requiredSet := make(map[string]bool, len(required))
 	for _, name := range required {
-		if name = strings.TrimSpace(name); name != "" && !strings.HasPrefix(strings.ToLower(name), "gitmoot/") {
+		if name = strings.TrimSpace(name); name != "" && isCIContext(name) {
 			requiredSet[name] = true
 		}
 	}
@@ -286,8 +317,8 @@ type prStalledRow struct {
 	Next        string    `json:"next"`
 	// ChecksTruncated: the head has more check contexts than one page read.
 	ChecksTruncated bool `json:"checks_truncated,omitempty"`
-	// NoCIConfigured: the base branch has no workflow file and no required
-	// check, so the PR is judged without CI.
+	// NoCIConfigured: no CI can report on the PR (prNoCIConfigured), so it is
+	// judged without CI.
 	NoCIConfigured bool `json:"no_ci_configured,omitempty"`
 	// OwnerGone is the attributed role when it is no longer a live role; the
 	// alert then goes to the repo's coordinator.
@@ -317,8 +348,8 @@ type prStalledReport struct {
 	// ChecksTruncated lists the open pull requests whose head has more check
 	// contexts than one page read; none of them is judged green.
 	ChecksTruncated []int `json:"checks_truncated"`
-	// NoCIConfigured lists the open pull requests whose base branch has no
-	// workflow file and no required check: none is flagged no_ci_on_head.
+	// NoCIConfigured lists the open pull requests no CI can report on
+	// (prNoCIConfigured): none is flagged no_ci_on_head.
 	NoCIConfigured []int `json:"no_ci_configured"`
 	// open maps every open pull request read to its head.
 	open map[int]string
@@ -395,7 +426,8 @@ func evaluateStalledPullRequests(ctx context.Context, store *db.Store, env *prSt
 		if pr.ChecksTruncated {
 			report.ChecksTruncated = append(report.ChecksTruncated, pr.Number)
 		}
-		if pr.NoCIConfigured() {
+		noCI := prNoCIConfigured(pr)
+		if noCI {
 			report.NoCIConfigured = append(report.NoCIConfigured, pr.Number)
 		}
 		f.ReviewRunning, f.Verdict, f.VerdictAt = review.running, review.verdict, review.verdictAt
@@ -415,7 +447,7 @@ func evaluateStalledPullRequests(ctx context.Context, store *db.Store, env *prSt
 		}
 		row := prStalledRow{Repo: repo, PullRequest: pr.Number, Title: pr.Title, Head: pr.HeadSHA, State: stall.State,
 			Since: stall.Since, Age: formatStallAge(now.Sub(stall.Since)), Level: prStallLevelLabel(f.Level),
-			Cause: stall.Cause, Next: stall.Next, ChecksTruncated: pr.ChecksTruncated, NoCIConfigured: pr.NoCIConfigured()}
+			Cause: stall.Cause, Next: stall.Next, ChecksTruncated: pr.ChecksTruncated, NoCIConfigured: noCI}
 		if row.NoCIConfigured {
 			row.Cause += " (no CI configured)"
 		}

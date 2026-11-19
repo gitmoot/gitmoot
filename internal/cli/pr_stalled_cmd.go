@@ -204,7 +204,7 @@ func printPRStalled(w io.Writer, reports []prStalledReport) {
 			for i, number := range report.NoCIConfigured {
 				numbers[i] = "#" + strconv.Itoa(number)
 			}
-			fmt.Fprintf(w, "%s: no CI configured (no workflow files, no required checks), not flagged no_ci_on_head: %s\n", report.Repo, strings.Join(numbers, ", "))
+			fmt.Fprintf(w, "%s: no CI configured (no workflow files on the base, head or default branch, no required checks), not flagged no_ci_on_head: %s\n", report.Repo, strings.Join(numbers, ", "))
 		}
 	}
 	fmt.Fprintf(w, "%d stalled of %d open pull requests in %d repositories\n", len(stalled), open, len(reports))

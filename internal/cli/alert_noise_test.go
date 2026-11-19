@@ -18,15 +18,45 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// prFactsWithBase decodes one PR whose base branch has the given
-// .github/workflows tree (null: the directory does not exist) and no checks.
-func prFactsWithBase(t *testing.T, workflowsFile string) github.PullRequestFacts {
+// noCIBody is the GraphQL answer for one PR with no check at its head, as raw
+// JSON fragments. noCIFacts fills every empty field with a repo the reader
+// administers, an unprotected base with no ruleset, and no .github/workflows
+// on the base, the head or the default branch.
+type noCIBody struct {
+	Perm          string // viewerPermission
+	DefaultBranch string // repository.defaultBranchRef
+	BaseTarget    string // baseRef.target
+	Rules         string // baseRef.rules
+	HeadOid       string // commits(last:1) commit oid
+	HeadFile      string // that commit's file(path: ".github/workflows")
+	Commits       string // commits.nodes, overriding HeadOid/HeadFile
+}
+
+const (
+	noWorkflowsDir = `null`
+	ciWorkflowDir  = `{"object":{"entries":[{"name":"ci.yml"}]}}`
+)
+
+func noCIFacts(t *testing.T, body noCIBody) github.PullRequestFacts {
 	t.Helper()
 	at := stallNow.Add(-7 * time.Hour).Format(time.RFC3339)
-	body := `{"data":{"rateLimit":{"cost":1},"repository":{"pullRequests":{"totalCount":1,"nodes":[{"number":13,"mergeable":"MERGEABLE","headRefOid":"` + stallHeadA + `","baseRefName":"main","createdAt":"` + at + `",
-"baseRef":{"target":{"file":` + workflowsFile + `},"branchProtectionRule":null,"rules":{"pageInfo":{"hasNextPage":false},"nodes":[]}},
-"commits":{"nodes":[{"commit":{"oid":"` + stallHeadA + `","committedDate":"` + at + `","statusCheckRollup":null}}]}}]}}}}`
-	client := github.NewClientWithRunner(t.TempDir(), fixedResultRunner{result: subprocess.Result{Stdout: body}})
+	fill := func(value *string, fallback string) {
+		if *value == "" {
+			*value = fallback
+		}
+	}
+	fill(&body.Perm, "ADMIN")
+	fill(&body.DefaultBranch, `{"target":{"oid":"dddddddddddddddddddddddddddddddddddddddd","file":null}}`)
+	fill(&body.BaseTarget, `{"oid":"cccccccccccccccccccccccccccccccccccccccc","file":null}`)
+	fill(&body.Rules, `{"pageInfo":{"hasNextPage":false},"nodes":[]}`)
+	fill(&body.HeadOid, stallHeadA)
+	fill(&body.HeadFile, noWorkflowsDir)
+	fill(&body.Commits, `[{"commit":{"oid":"`+body.HeadOid+`","committedDate":"`+at+`","file":`+body.HeadFile+`,"statusCheckRollup":null}}]`)
+	raw := `{"data":{"rateLimit":{"cost":1},"repository":{"viewerPermission":"` + body.Perm + `","defaultBranchRef":` + body.DefaultBranch + `,
+"pullRequests":{"totalCount":1,"nodes":[{"number":13,"mergeable":"MERGEABLE","headRefOid":"` + stallHeadA + `","baseRefName":"main","createdAt":"` + at + `",
+"baseRef":{"target":` + body.BaseTarget + `,"branchProtectionRule":null,"rules":` + body.Rules + `},
+"commits":{"nodes":` + body.Commits + `}}]}}}}`
+	client := github.NewClientWithRunner(t.TempDir(), fixedResultRunner{result: subprocess.Result{Stdout: raw}})
 	facts, err := client.OpenPullRequestFacts(context.Background(), github.Repository{Owner: "owner", Name: "repo"})
 	if err != nil {
 		t.Fatal(err)
@@ -34,22 +64,23 @@ func prFactsWithBase(t *testing.T, workflowsFile string) github.PullRequestFacts
 	return facts.PullRequests[0]
 }
 
-// TestPRStalledNoCIConfiguredIsNotNoCIOnHead covers #2683: a base branch with
-// no workflow file and no required check never reports a check, so its PRs
-// are not no_ci_on_head; a repo with workflows and no check at the head is.
+// TestPRStalledNoCIConfiguredIsNotNoCIOnHead covers #2683: a PR that no
+// workflow can run for (none on the base, the head or the default branch) and
+// whose base requires no check is not no_ci_on_head. Any workflow, any
+// required check, or any of those facts unread keeps it flagged.
 func TestPRStalledNoCIConfiguredIsNotNoCIOnHead(t *testing.T) {
 	policy := config.DefaultPRStalledPolicy()
 	classify := func(pr github.PullRequestFacts) (prStall, bool) {
 		return classifyStalledPR(prStallFacts{Repo: "owner/repo", PR: pr, Level: reviewlevel.LevelBackground}, policy, stallNow)
 	}
-	for name, file := range map[string]string{
-		"no workflows directory":       `null`,
-		"workflows directory is empty": `{"object":{"entries":[]}}`,
-		"only non-workflow files":      `{"object":{"entries":[{"name":"README.md"}]}}`,
+	for name, body := range map[string]noCIBody{
+		"no workflows directory anywhere":   {},
+		"base workflows directory is empty": {BaseTarget: `{"oid":"cccccccccccccccccccccccccccccccccccccccc","file":{"object":{"entries":[]}}}`},
+		"only non-workflow files":           {HeadFile: `{"object":{"entries":[{"name":"README.md"}]}}`},
 	} {
 		t.Run(name, func(t *testing.T) {
-			pr := prFactsWithBase(t, file)
-			if !pr.NoCIConfigured() {
+			pr := noCIFacts(t, body)
+			if !prNoCIConfigured(pr) {
 				t.Fatalf("facts %+v: want no CI configured", pr)
 			}
 			if stall, ok := classify(pr); ok && stall.State == prStallNoCIOnHead {
@@ -57,25 +88,45 @@ func TestPRStalledNoCIConfiguredIsNotNoCIOnHead(t *testing.T) {
 			}
 		})
 	}
-	t.Run("workflows and no check run", func(t *testing.T) {
-		pr := prFactsWithBase(t, `{"object":{"entries":[{"name":"ci.yml"}]}}`)
-		if pr.NoCIConfigured() || pr.Workflows != 1 {
-			t.Fatalf("facts %+v: want one workflow", pr)
-		}
+	for name, body := range map[string]noCIBody{
+		"workflow on the base":                   {BaseTarget: `{"oid":"cccccccccccccccccccccccccccccccccccccccc","file":` + ciWorkflowDir + `}`},
+		"workflow only on the head commit":       {HeadFile: ciWorkflowDir},
+		"workflow only on the default branch":    {DefaultBranch: `{"target":{"oid":"dddddddddddddddddddddddddddddddddddddddd","file":` + ciWorkflowDir + `}}`},
+		"required checks unknown: not an admin":  {Perm: "WRITE"},
+		"required checks unknown: rulesets null": {Rules: `null`},
+		"head commit unread: no node":            {Commits: `[]`},
+		"head commit unread: head moved":         {HeadOid: stallHeadB},
+		"default branch unread: null ref":        {DefaultBranch: `null`},
+		"default branch unread: null target":     {DefaultBranch: `{"target":null}`},
+		"base branch unread: null target":        {BaseTarget: `null`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pr := noCIFacts(t, body)
+			if prNoCIConfigured(pr) {
+				t.Fatalf("facts %+v: want CI not ruled out", pr)
+			}
+			if stall, ok := classify(pr); !ok || stall.State != prStallNoCIOnHead {
+				t.Fatalf("classified %+v (stalled=%v), want no_ci_on_head", stall, ok)
+			}
+		})
+	}
+	t.Run("no workflows but a required check", func(t *testing.T) {
+		pr := noCIFacts(t, noCIBody{})
+		pr.Required = []string{"external-ci"}
 		if stall, ok := classify(pr); !ok || stall.State != prStallNoCIOnHead {
 			t.Fatalf("classified %+v (stalled=%v), want no_ci_on_head", stall, ok)
 		}
 	})
-	t.Run("no workflows but a required check", func(t *testing.T) {
-		pr := prFactsWithBase(t, `null`)
-		pr.Required, pr.RequiredKnown = []string{"external-ci"}, true
-		if stall, ok := classify(pr); !ok || stall.State != prStallNoCIOnHead {
-			t.Fatalf("classified %+v (stalled=%v), want no_ci_on_head", stall, ok)
+	t.Run("only gitmoot statuses required", func(t *testing.T) {
+		pr := noCIFacts(t, noCIBody{})
+		pr.Required = []string{"gitmoot/merge-gate"}
+		if !prNoCIConfigured(pr) {
+			t.Fatalf("facts %+v: gitmoot's own status is not CI", pr)
 		}
 	})
 	t.Run("pr stalled reports it", func(t *testing.T) {
 		home, store, gh := stalledSweepFixture(t)
-		gh.pulls = []github.PullRequestFacts{prFactsWithBase(t, `null`)}
+		gh.pulls = []github.PullRequestFacts{noCIFacts(t, noCIBody{})}
 		report, err := evaluateStalledPullRequests(context.Background(), store, newPRStalledEnv(context.Background(), store, home, gh),
 			"gitmoot/gitmoot", policy, stallNow)
 		if err != nil {
@@ -306,5 +357,44 @@ func TestPRDismissRefusesAnUnrelatedRole(t *testing.T) {
 	}
 	if task, err := store.GetTask(context.Background(), "task-1"); err != nil || task.State != string(workflow.TaskBlocked) {
 		t.Fatalf("task = %+v, err=%v; want still blocked", task, err)
+	}
+}
+
+// TestPRDismissRefusesASettlingJob covers the liveness FindLiveTaskJob shares
+// with the closed-PR retire path: a settled job still owing its parent an
+// advance, and a cancellation of a running job not yet settled, keep the task
+// live although neither is queued or running.
+func TestPRDismissRefusesASettlingJob(t *testing.T) {
+	for name, job := range map[string]struct {
+		state  string
+		events []db.JobEvent
+	}{
+		"settled job with advance debt": {state: string(workflow.JobSucceeded),
+			events: []db.JobEvent{{Kind: "advance_started", Message: "advancing the parent"}}},
+		"unsettled cancellation from running": {state: string(workflow.JobCancelled),
+			events: []db.JobEvent{{Kind: string(workflow.JobCancelled), Message: "cancel requested from running: by owner"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home, store := prDismissFixture(t)
+			ctx := context.Background()
+			if err := store.CreateJob(ctx, db.Job{
+				ID: "impl-settling", Agent: "coder", Type: "implement", State: job.state,
+				Payload: mustJobPayload(t, workflow.JobPayload{Repo: "gitmoot/gitmoot", TaskID: "task-1", ActingOrgRole: "lane"}),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, event := range job.events {
+				event.JobID = "impl-settling"
+				if err := store.AddJobEvent(ctx, event); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if code, _, stderr := runPRDismissCommand(t, home, "lane"); code == 0 || !strings.Contains(stderr, "impl-settling is "+job.state+" but still settling") {
+				t.Fatalf("pr dismiss exited %d: %s; want refused for a settling job", code, stderr)
+			}
+			if task, err := store.GetTask(ctx, "task-1"); err != nil || task.State != string(workflow.TaskBlocked) {
+				t.Fatalf("task = %+v, err=%v; want still blocked", task, err)
+			}
+		})
 	}
 }

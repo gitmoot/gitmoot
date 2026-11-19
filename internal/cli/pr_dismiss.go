@@ -108,6 +108,17 @@ func runPRDismiss(args []string, stdout, stderr io.Writer) int {
 			owner := firstNonEmpty(attributed, "no recorded role")
 			return fmt.Errorf("role %q may not dismiss %s: only its owner (%s), that owner's coordinator chain or the repo owner may", role, task.ID, owner)
 		}
+		// The transactional guard below sees only queued and running jobs; a
+		// settled job still owing its parent an advance, or a cancellation of
+		// a running job not yet settled, keeps the task live too.
+		if job, live, err := workflow.FindLiveTaskJob(ctx, store, task); err != nil {
+			return err
+		} else if live {
+			if workflow.IsFinalJobState(job.State) {
+				return fmt.Errorf("pr %s has a live job: %s is %s but still settling (advance or cancellation pending); wait for it to settle", task.ID, job.ID, job.State)
+			}
+			return fmt.Errorf("pr %s has a live job: %s is %s; cancel it or wait for it to finish", task.ID, job.ID, job.State)
+		}
 		changed, current, err := store.TransitionTaskStateWithEventIfNoActiveJob(ctx, task.ID, []string{task.State},
 			string(workflow.TaskDismissed), TaskEventDismissedManual, fmt.Sprintf("dismissed by %s: %s", role, text))
 		if errors.Is(err, db.ErrTaskHasActiveJob) {
