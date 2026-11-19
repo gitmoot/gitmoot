@@ -1,20 +1,13 @@
 package credgw
 
 import (
-	"crypto"
-	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/hex"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/mtlsca"
 )
 
 // RemoteListenerOptions configures the independently authenticated listener
@@ -67,11 +62,12 @@ func (m RemoteMaterial) CurlConfig(caPath, certificatePath, privateKeyPath strin
 	return []byte(strings.Join(lines, "\n") + "\n")
 }
 
-type certificateAuthority struct {
-	certificate    *x509.Certificate
-	privateKey     crypto.Signer
-	certificatePEM []byte
-}
+// Remote leaves: the server leaf lasts a month and the process authority a
+// year; both die with the gateway process, whose lifetime is far shorter.
+const (
+	remoteAuthorityValidity = 365 * 24 * time.Hour
+	remoteServerValidity    = 30 * 24 * time.Hour
+)
 
 // EnableRemote adds the mTLS listener without changing the loopback listener.
 // Client certificates are issued from an in-memory process CA and are useful
@@ -116,7 +112,7 @@ func (g *Gateway) serveRemote(listener net.Listener, configuredOptions RemoteLis
 		_ = listener.Close()
 		return err
 	}
-	ca, err := newCertificateAuthority()
+	ca, err := mtlsca.New("gitmoot credential gateway", remoteAuthorityValidity)
 	if err != nil {
 		_ = listener.Close()
 		return err
@@ -125,13 +121,12 @@ func (g *Gateway) serveRemote(listener net.Listener, configuredOptions RemoteLis
 	for index, origin := range origins {
 		hosts[index] = origin.Hostname()
 	}
-	serverCertificate, err := ca.issueServer(hosts)
+	serverCertificate, err := ca.IssueServer(hosts, remoteServerValidity)
 	if err != nil {
 		_ = listener.Close()
 		return err
 	}
-	clientRoots := x509.NewCertPool()
-	clientRoots.AddCert(ca.certificate)
+	clientRoots := ca.Pool()
 	tlsListener := tls.NewListener(listener, &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{serverCertificate},
@@ -331,98 +326,15 @@ func remoteAdvertiseURL(raw string) (*url.URL, error) {
 	return parsed, nil
 }
 
-func newCertificateAuthority() (*certificateAuthority, error) {
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate remote credential gateway CA: %w", err)
-	}
-	now := time.Now().UTC()
-	template := &x509.Certificate{
-		SerialNumber: newCertificateSerial(), Subject: pkix.Name{CommonName: "gitmoot credential gateway"},
-		NotBefore: now.Add(-time.Minute), NotAfter: now.AddDate(1, 0, 0),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true, IsCA: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
-	if err != nil {
-		return nil, fmt.Errorf("create remote credential gateway CA: %w", err)
-	}
-	certificate, err := x509.ParseCertificate(der)
-	if err != nil {
-		return nil, fmt.Errorf("parse remote credential gateway CA: %w", err)
-	}
-	return &certificateAuthority{certificate: certificate, privateKey: privateKey,
-		certificatePEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}, nil
-}
-
-// issueServer issues one leaf covering every advertised host: an IP SAN for
-// addresses and a DNS SAN otherwise. The first host is the subject name.
-func (ca *certificateAuthority) issueServer(hosts []string) (tls.Certificate, error) {
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate remote credential gateway server key: %w", err)
-	}
-	now := time.Now().UTC()
-	template := &x509.Certificate{
-		SerialNumber: newCertificateSerial(), Subject: pkix.Name{CommonName: hosts[0]},
-		NotBefore: now.Add(-time.Minute), NotAfter: now.AddDate(0, 1, 0),
-		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	for _, host := range hosts {
-		if ip := net.ParseIP(host); ip != nil {
-			if !slices.ContainsFunc(template.IPAddresses, ip.Equal) {
-				template.IPAddresses = append(template.IPAddresses, ip)
-			}
-		} else if !slices.ContainsFunc(template.DNSNames, func(name string) bool { return strings.EqualFold(name, host) }) {
-			template.DNSNames = append(template.DNSNames, host)
-		}
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, ca.certificate, publicKey, ca.privateKey)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("create remote credential gateway server certificate: %w", err)
-	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("encode remote credential gateway server key: %w", err)
-	}
-	return tls.X509KeyPair(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
-	)
-}
-
-func (ca *certificateAuthority) issueClient(sandboxID, runtimeName string, expiresAt time.Time) (RemoteMaterial, [sha256.Size]byte, error) {
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return RemoteMaterial{}, [sha256.Size]byte{}, fmt.Errorf("generate remote credential gateway client key: %w", err)
-	}
-	now := time.Now().UTC()
+func issueRemoteClient(ca *mtlsca.Authority, sandboxID, runtimeName string, expiresAt time.Time) (RemoteMaterial, [sha256.Size]byte, error) {
 	identity, _ := url.Parse("spiffe://gitmoot/sandbox/" + url.PathEscape(sandboxID) + "/runtime/" + url.PathEscape(runtimeName))
-	template := &x509.Certificate{
-		SerialNumber: newCertificateSerial(), Subject: pkix.Name{CommonName: sandboxID + ":" + runtimeName},
-		NotBefore: now.Add(-time.Minute), NotAfter: expiresAt.UTC(),
-		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		URIs: []*url.URL{identity},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, ca.certificate, publicKey, ca.privateKey)
+	leaf, err := ca.IssueClient(sandboxID+":"+runtimeName, identity, expiresAt)
 	if err != nil {
-		return RemoteMaterial{}, [sha256.Size]byte{}, fmt.Errorf("create remote credential gateway client certificate: %w", err)
-	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
-	if err != nil {
-		return RemoteMaterial{}, [sha256.Size]byte{}, fmt.Errorf("encode remote credential gateway client key: %w", err)
+		return RemoteMaterial{}, [sha256.Size]byte{}, fmt.Errorf("remote credential gateway: %w", err)
 	}
 	return RemoteMaterial{
-		CACertificate:     append([]byte(nil), ca.certificatePEM...),
-		ClientCertificate: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
-		ClientPrivateKey:  pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
-	}, sha256.Sum256(der), nil
-}
-
-func newCertificateSerial() *big.Int {
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return big.NewInt(time.Now().UnixNano())
-	}
-	return serial
+		CACertificate:     ca.CertificatePEM(),
+		ClientCertificate: leaf.CertificatePEM,
+		ClientPrivateKey:  leaf.PrivateKeyPEM,
+	}, leaf.Fingerprint, nil
 }

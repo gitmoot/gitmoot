@@ -233,6 +233,17 @@ max_consecutive_missed_wakes = 0
 # template = "gitmoot-omp-go126-2c4g-v1"
 # require = ["go version"]
 
+# [hub] (#2710) is the API gitmoot clients on other machines call over
+# Tailscale. Off by default. listen must be an address on the Tailscale network
+# (100.64.0.0/10 or fd7a:115c:a1e0::/48); any other address is refused. Every
+# request needs a client certificate from the hub's own authority, issued with
+# "gitmoot hub machine add". advertise adds names (such as the MagicDNS name)
+# to the server certificate. The daemon reads [hub] at start; a change needs a
+# restart. See the skill's references/HUB.md.
+# [hub]
+# listen = "100.64.0.1:7711"
+# advertise = ["host.tailnet.ts.net"]
+
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool
 # and the per-repo checkout / runtime-session locks (issue #365). With both caps

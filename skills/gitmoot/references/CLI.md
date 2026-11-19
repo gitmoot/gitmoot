@@ -30,6 +30,7 @@ disagrees, trust its live `--help`.
 - [gitmoot dashboard](#gitmoot-dashboard)
 - [gitmoot doctor](#gitmoot-doctor)
 - [gitmoot findings](#gitmoot-findings)
+- [gitmoot hub](#gitmoot-hub)
 - [gitmoot init](#gitmoot-init)
 - [gitmoot key](#gitmoot-key)
 - [gitmoot key list](#gitmoot-key-list)
@@ -169,6 +170,7 @@ Commands:
   config     show local Gitmoot config paths
   org        org registry, attribution, and brief/chart/status (RFC #1042)
   message    send, read and reply to durable fleet messages
+  hub        manage machines allowed to call the hub API from other machines
   key        manage keycard registry metadata
   update     check for and apply Gitmoot releases
   setup      register a repo and initial reviewer
@@ -445,6 +447,23 @@ Usage of findings:
     	with --repo, the pull request whose findings to list
   -repo string
     	with --pr, list individual findings for this owner/repo instead of the per-repository summary
+```
+
+## gitmoot hub
+
+```text
+The hub API: gitmoot clients on other machines, over Tailscale with client certificates (#2710).
+
+Usage:
+  gitmoot hub machine add NAME --role ROLE [--role ROLE]... --out DIR [--days 365] [--json] [--home DIR]
+  gitmoot hub machine ls [--all] [--json] [--home DIR]
+  gitmoot hub machine revoke NAME [--home DIR]
+
+add issues a client certificate from the hub's authority and writes ca.pem,
+NAME.pem and NAME.key (mode 600) into DIR, a new or empty directory. Copy them
+to the machine; the private key exists nowhere else. The machine may act as
+the listed org roles only. revoke stops the certificate on its next request.
+The daemon serves the hub when [hub] listen is set.
 ```
 
 ## gitmoot init

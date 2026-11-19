@@ -288,6 +288,11 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		defer stopPprof()
 	}
 
+	// The hub API for other machines (#2710), only when [hub] listen is set.
+	// Read at start; a [hub] change needs a restart, not a SIGHUP.
+	stopHub := startDaemonHub(*home, stdout)
+	defer stopHub()
+
 	// Warm-reconfigure path (#577): the live supervisor settings (poll, worker-pool
 	// size, scheduler mode) are held behind a mutex so a SIGHUP can re-read the
 	// [daemon] config section and apply the changes WITHOUT a `daemon restart`. A

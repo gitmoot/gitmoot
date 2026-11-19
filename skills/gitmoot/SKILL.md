@@ -421,6 +421,8 @@ once every note is triaged.
   guarantees.
 - [references/WORKSPACES.md](references/WORKSPACES.md): remote workspaces, a
   VM per seat and issue or PR, and the `workspace` / `ws sh` CLI contract.
+- [references/HUB.md](references/HUB.md): the hub API that gitmoot on other
+  machines calls over Tailscale, its client certificates, and `gitmoot hub machine`.
 - [references/CLI.md](references/CLI.md): every command's `--help`.
 - The dashboard: `gitmoot dashboard` prints a snapshot,
   `gitmoot dashboard --web --addr 127.0.0.1:8080` serves the read-only web view.

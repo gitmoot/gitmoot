@@ -25,6 +25,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/mtlsca"
 )
 
 const DefaultAnthropicUpstream = "https://api.anthropic.com"
@@ -116,7 +118,7 @@ type Gateway struct {
 	remoteListener net.Listener
 	remoteServer   *http.Server
 	remoteOrigins  []*url.URL
-	remoteCA       *certificateAuthority
+	remoteCA       *mtlsca.Authority
 	remoteOptions  RemoteListenerOptions
 	client         *http.Client
 	logf           LogFunc
@@ -263,7 +265,7 @@ func (g *Gateway) RegisterProxy(jobID string, policy ProxyPolicy, resolver Crede
 			return nil, err
 		}
 		expiresAt = validated.ExpiresAt
-		remoteMaterial, clientCertificate, err = g.remoteCA.issueClient(validated.SandboxID, validated.Runtime, expiresAt)
+		remoteMaterial, clientCertificate, err = issueRemoteClient(g.remoteCA, validated.SandboxID, validated.Runtime, expiresAt)
 		if err != nil {
 			return nil, err
 		}
