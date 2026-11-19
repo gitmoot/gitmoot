@@ -17,20 +17,34 @@ const OpenPullRequestFactsLimit = 100
 // requests, each with its head, draft and mergeable state, the head commit's
 // time and check rollup, and the base branch's required checks (classic
 // protection and rulesets), so no REST lookup is needed.
+//
+// It also reads the .github/workflows tree of three commits (#2683): the base
+// branch's tip and the PR head (pull_request workflows run from the merge
+// commit, so a PR can add its first one), per pull request, and the default
+// branch's tip once (pull_request_target workflows run from it, whatever the
+// base). Each is read through Commit.file on a commit already selected, so
+// the tree adds no connection and no cost. viewerPermission tells an
+// unprotected base (readable, null rule) from an unreadable one.
 const openPullRequestFactsQuery = `query($owner: String!, $name: String!) {
   rateLimit { cost }
   repository(owner: $owner, name: $name) {
+    viewerPermission
+    defaultBranchRef {
+      target { ... on Commit { oid file(path: ".github/workflows") { object { ... on Tree { entries { name } } } } } }
+    }
     pullRequests(states: OPEN, first: 100, orderBy: {field: CREATED_AT, direction: DESC}) {
       totalCount
       nodes {
         number title isDraft mergeable headRefOid baseRefName createdAt
         baseRef {
+          target { ... on Commit { oid file(path: ".github/workflows") { object { ... on Tree { entries { name } } } } } }
           branchProtectionRule { requiredStatusCheckContexts requiredStatusChecks { context } }
           rules(first: 50) { pageInfo { hasNextPage } nodes { type parameters {
             ... on RequiredStatusChecksParameters { requiredStatusChecks { context } }
           } } }
         }
         commits(last: 1) { nodes { commit { oid committedDate
+          file(path: ".github/workflows") { object { ... on Tree { entries { name } } } }
           statusCheckRollup { state contexts(first: 100) { totalCount nodes {
             __typename
             ... on CheckRun { name status conclusion startedAt completedAt }
@@ -70,10 +84,25 @@ type PullRequestFacts struct {
 	ChecksTruncated bool
 	// Required is the base branch's required status checks, the union of its
 	// classic protection and its rulesets. RequiredKnown is false when that
-	// set cannot be determined: no readable classic protection (unprotected
-	// and unreadable look alike) or more ruleset rules than one page.
+	// set cannot be determined: a null classic protection the reader is not
+	// an admin for (unprotected and unreadable look alike), null rulesets, or
+	// more ruleset rules than one page.
 	Required      []string
 	RequiredKnown bool
+	// BaseWorkflows, HeadWorkflows and DefaultBranchWorkflows are the
+	// .github/workflows trees of the base branch's tip, the head commit and
+	// the repository's default branch's tip.
+	BaseWorkflows          WorkflowDir
+	HeadWorkflows          WorkflowDir
+	DefaultBranchWorkflows WorkflowDir
+}
+
+// WorkflowDir is one commit's .github/workflows directory: Files counts its
+// .yml and .yaml entries (a commit without the directory has none). Known is
+// false when the commit itself was not read.
+type WorkflowDir struct {
+	Files int
+	Known bool
 }
 
 // PullRequestCheckFact is one check run or commit status on a head. Bucket is
@@ -135,12 +164,55 @@ type graphQLBaseRef struct {
 			} `json:"parameters"`
 		} `json:"nodes"`
 	} `json:"rules"`
+	Target *graphQLWorkflowCommit `json:"target"`
+}
+
+// graphQLWorkflowFile is Commit.file(path: ".github/workflows"): null when
+// the commit has no such path.
+type graphQLWorkflowFile struct {
+	Object *struct {
+		Entries []struct {
+			Name string `json:"name"`
+		} `json:"entries"`
+	} `json:"object"`
+}
+
+// graphQLWorkflowCommit is a ref target read as a Commit with its workflows
+// tree. A non-commit target decodes with an empty oid.
+type graphQLWorkflowCommit struct {
+	Oid  string               `json:"oid"`
+	File *graphQLWorkflowFile `json:"file"`
+}
+
+// workflowDir counts a read commit's .yml/.yaml workflow files. A nil or
+// non-commit target was not read, so its tree is unknown; a read commit
+// without the directory has none.
+func (c *graphQLWorkflowCommit) workflowDir() WorkflowDir {
+	if c == nil || strings.TrimSpace(c.Oid) == "" {
+		return WorkflowDir{}
+	}
+	return workflowDirFromFile(c.File)
+}
+
+func workflowDirFromFile(file *graphQLWorkflowFile) WorkflowDir {
+	dir := WorkflowDir{Known: true}
+	if file == nil || file.Object == nil {
+		return dir
+	}
+	for _, entry := range file.Object.Entries {
+		name := strings.ToLower(entry.Name)
+		if strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".yaml") {
+			dir.Files++
+		}
+	}
+	return dir
 }
 
 // requiredChecks unions the classic and ruleset required contexts. The set is
-// known only when the classic protection is readable (a null rule is either
-// unprotected or unreadable) and the rulesets were read (non-null) in full.
-func (ref *graphQLBaseRef) requiredChecks() ([]string, bool) {
+// known only when the classic protection is known (a non-null rule, or a null
+// one read by an admin, who can read any rule, so null means unprotected) and
+// the rulesets were read (non-null) in full.
+func (ref *graphQLBaseRef) requiredChecks(admin bool) ([]string, bool) {
 	if ref == nil {
 		return nil, false
 	}
@@ -160,7 +232,7 @@ func (ref *graphQLBaseRef) requiredChecks() ([]string, bool) {
 			}
 		}
 	}
-	known := ref.BranchProtectionRule != nil && ref.Rules != nil && !ref.Rules.PageInfo.HasNextPage
+	known := (ref.BranchProtectionRule != nil || admin) && ref.Rules != nil && !ref.Rules.PageInfo.HasNextPage
 	return compactUniqueStrings(contexts), known
 }
 
@@ -171,6 +243,10 @@ func decodeOpenPullRequestFacts(body []byte) (OpenPullRequestFacts, error) {
 				Cost int `json:"cost"`
 			} `json:"rateLimit"`
 			Repository *struct {
+				ViewerPermission string `json:"viewerPermission"`
+				DefaultBranchRef *struct {
+					Target *graphQLWorkflowCommit `json:"target"`
+				} `json:"defaultBranchRef"`
 				PullRequests struct {
 					TotalCount int `json:"totalCount"`
 					Nodes      []struct {
@@ -185,8 +261,9 @@ func decodeOpenPullRequestFacts(body []byte) (OpenPullRequestFacts, error) {
 						Commits     struct {
 							Nodes []struct {
 								Commit struct {
-									Oid               string `json:"oid"`
-									CommittedDate     string `json:"committedDate"`
+									Oid               string               `json:"oid"`
+									CommittedDate     string               `json:"committedDate"`
+									File              *graphQLWorkflowFile `json:"file"`
 									StatusCheckRollup *struct {
 										Contexts struct {
 											TotalCount int                   `json:"totalCount"`
@@ -213,7 +290,13 @@ func decodeOpenPullRequestFacts(body []byte) (OpenPullRequestFacts, error) {
 	if response.Data.Repository == nil {
 		return OpenPullRequestFacts{}, fmt.Errorf("open pull request facts: repository not found")
 	}
-	pulls := response.Data.Repository.PullRequests
+	repository := response.Data.Repository
+	pulls := repository.PullRequests
+	admin := strings.EqualFold(strings.TrimSpace(repository.ViewerPermission), "ADMIN")
+	var defaultWorkflows WorkflowDir
+	if repository.DefaultBranchRef != nil {
+		defaultWorkflows = repository.DefaultBranchRef.Target.workflowDir()
+	}
 	out := OpenPullRequestFacts{Total: pulls.TotalCount, Cost: response.Data.RateLimit.Cost,
 		PullRequests: make([]PullRequestFacts, 0, len(pulls.Nodes))}
 	for _, node := range pulls.Nodes {
@@ -226,14 +309,23 @@ func decodeOpenPullRequestFacts(body []byte) (OpenPullRequestFacts, error) {
 			BaseRef:   node.BaseRefName,
 			CreatedAt: parseGraphQLTime(node.CreatedAt),
 		}
-		facts.Required, facts.RequiredKnown = node.BaseRef.requiredChecks()
+		facts.Required, facts.RequiredKnown = node.BaseRef.requiredChecks(admin)
+		if node.BaseRef != nil {
+			facts.BaseWorkflows = node.BaseRef.Target.workflowDir()
+		}
+		facts.DefaultBranchWorkflows = defaultWorkflows
 		if len(node.Commits.Nodes) > 0 {
 			commit := node.Commits.Nodes[0].Commit
 			facts.HeadCommittedAt = parseGraphQLTime(commit.CommittedDate)
 			// The last commit IS the head; a mismatch means the head moved
 			// between the two fields' resolution, so its checks are not the
-			// head's and are dropped rather than misattributed.
-			if rollup := commit.StatusCheckRollup; rollup != nil && strings.EqualFold(commit.Oid, facts.HeadSHA) {
+			// head's and are dropped rather than misattributed; its workflows
+			// tree stays unknown for the same reason.
+			isHead := facts.HeadSHA != "" && strings.EqualFold(commit.Oid, facts.HeadSHA)
+			if isHead {
+				facts.HeadWorkflows = workflowDirFromFile(commit.File)
+			}
+			if rollup := commit.StatusCheckRollup; rollup != nil && isHead {
 				facts.ChecksTruncated = rollup.Contexts.TotalCount > len(rollup.Contexts.Nodes)
 				for _, item := range rollup.Contexts.Nodes {
 					facts.Checks = append(facts.Checks, item.checkFact())

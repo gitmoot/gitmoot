@@ -79,7 +79,9 @@ status` shows that it is running.
    draft), `gitmoot pr stalled --repo owner/repo` names the state, the owning
    seat and the next command; with `[pr_stalled]` enabled the daemon tells
    your seat itself. `gitmoot pr hold owner/repo#42 --reason TEXT` silences a
-   pull request that waits on purpose, until its head moves.
+   pull request that waits on purpose, until its head moves. A pull request
+   closed on purpose leaves its task blocked but silent; retire the task with
+   `gitmoot pr dismiss <pr> --reason TEXT`.
 
 ## A review with no model, on a throwaway home
 

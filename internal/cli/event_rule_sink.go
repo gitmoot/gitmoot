@@ -312,13 +312,14 @@ func eventRuleMatchesAddressee(rule db.EventRule, event events.Event) bool {
 
 // addressBlockedEvent enriches every blocked event at the event-sink source
 // boundary before durable routing. Persisted job attribution
-// remains strongest only while that role belongs to the current live roster.
-// Archived or removed attribution falls back to the current live role selected
-// for the event repository. A blocked-since digest names tasks, not a job; its
-// producer addresses it to the tasks' own attributed role (#2668), which is
-// treated as persisted attribution: honoured while live, else the repo owner.
-// A stalled-PR alert (#2677) carries its pull request's attributed role the
-// same way.
+// remains strongest only while that role belongs to the current live roster;
+// otherwise a job's event falls back to the repository's most specific owner.
+// A blocked-since digest names tasks, not a job; its producer addresses it to
+// the tasks' own attributed role (#2668), which is treated as persisted
+// attribution. A stalled-PR alert (#2677) carries its pull request's
+// attributed role the same way. For those two, a recorded role that is gone
+// falls back to the repository's coordinator (the shallowest live role
+// scoping it, #2685) through resolveAttributedOrgOwner.
 func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Event) events.Event {
 	if event.Type != events.EventJobBlocked {
 		return event
@@ -345,14 +346,17 @@ func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Ev
 		roster = loadOrgRoster(ctx, s.store, cfg)
 	}
 	targetRole = ""
-	if cfgOK && orgRosterHasMember(roster, persistedRole) {
-		targetRole = persistedRole
-	}
-	if targetRole == "" && cfgOK {
-		resolution := resolveRepoOrgOwner(roster, cfg, event.Repo)
+	if cfgOK {
+		attributed := persistedRole
+		if event.Cause != "blocked_since" && event.Cause != prStallCause && !orgRosterHasMember(roster, attributed) {
+			// A blocked job whose acting role is gone keeps the repo-owner
+			// fallback; the coordinator rule is for the PR and task alerts.
+			attributed = ""
+		}
+		resolution := resolveAttributedOrgOwner(roster, cfg, attributed, event.Repo)
 		targetRole = resolution.Owner
 		if targetRole == "" {
-			s.recordUnownedBlockedEvent(ctx, event, resolution)
+			s.recordUnownedBlockedEvent(ctx, event, resolution.repoOwnerResolution)
 		}
 	}
 	event.WakeTargetRole = targetRole
