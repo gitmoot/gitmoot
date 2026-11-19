@@ -46,7 +46,7 @@ type livenessLogSample struct {
 type daemonLivenessSweep struct {
 	mu        sync.Mutex
 	samples   map[string]livenessLogSample
-	stat      func(string) (os.FileInfo, error)
+	stat      func(string) (transcript.JobLogInfo, error)
 	probe     func(int, string) runtimePIDState
 	identity  func(int) string
 	signal    func(int, syscall.Signal) error
@@ -56,7 +56,7 @@ type daemonLivenessSweep struct {
 func newDaemonLivenessSweep() *daemonLivenessSweep {
 	return &daemonLivenessSweep{
 		samples:  make(map[string]livenessLogSample),
-		stat:     os.Stat,
+		stat:     transcript.StatJobLog,
 		probe:    probeRuntimePID,
 		identity: workflow.RuntimeProcessIdentity,
 		signal:   syscall.Kill,
@@ -159,8 +159,10 @@ func (s *daemonLivenessSweep) evaluate(ctx context.Context, store *db.Store, std
 	if err != nil {
 		return nil // malformed evidence degrades to unknown, never to reaped
 	}
+	// Progress is the whole log: once its head is full only the tail
+	// segments grow, and the head alone would read as a silent run.
 	info, err := s.stat(transcript.JobLogPath(paths.Logs, job.ID))
-	if err != nil || info.IsDir() {
+	if err != nil {
 		s.forget(job.ID)
 		return nil
 	}
@@ -209,7 +211,7 @@ func (s *daemonLivenessSweep) evaluate(ctx context.Context, store *db.Store, std
 	}
 
 	_, stable := s.previousStable(job.ID, info, now, stableFor)
-	if now.Sub(info.ModTime()) < requiredQuiet || !stable {
+	if now.Sub(info.ModTime) < requiredQuiet || !stable {
 		return nil
 	}
 
@@ -280,11 +282,11 @@ func (s *daemonLivenessSweep) killRecordedRuntimeGroup(ctx context.Context, stor
 	}
 }
 
-func (s *daemonLivenessSweep) previousStable(jobID string, info os.FileInfo, now time.Time, stableFor time.Duration) (livenessLogSample, bool) {
+func (s *daemonLivenessSweep) previousStable(jobID string, info transcript.JobLogInfo, now time.Time, stableFor time.Duration) (livenessLogSample, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	previous, ok := s.samples[jobID]
-	current := livenessLogSample{size: info.Size(), modified: info.ModTime(), observed: now, identityReported: previous.identityReported}
+	current := livenessLogSample{size: info.Size, modified: info.ModTime, observed: now, identityReported: previous.identityReported}
 	unchanged := ok && previous.size == current.size && previous.modified.Equal(current.modified)
 	if unchanged {
 		current.observed = previous.observed

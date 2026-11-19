@@ -19,7 +19,8 @@ type FollowOptions struct {
 
 // Follow reads path from offset zero with tail -F-style create retry, emits only
 // complete logical lines while the job is live, and flushes the final partial
-// line after the job settles and the file has been drained to EOF.
+// line after the job settles and the log has been drained to EOF. Once the
+// head is full it follows the log's tail segments (followJobLogTail).
 func Follow(ctx context.Context, path string, opts FollowOptions, onLine func(string) error) error {
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = 100 * time.Millisecond
@@ -53,55 +54,83 @@ func Follow(ctx context.Context, path string, opts FollowOptions, onLine func(st
 
 	buffer := newLineBuffer(MaxLogicalLineBytes, onLine)
 	chunk := make([]byte, 32*1024)
-	for {
-		n, err := file.Read(chunk)
-		if n > 0 {
-			if feedErr := buffer.Write(chunk[:n]); feedErr != nil {
-				return feedErr
+	var tail *jobLogTailCursor
+	readHead := func() (bool, error) {
+		fed := false
+		for {
+			n, err := file.Read(chunk)
+			if n > 0 {
+				fed = true
+				if feedErr := buffer.Write(chunk[:n]); feedErr != nil {
+					return fed, feedErr
+				}
+			}
+			if err != nil && !errors.Is(err, io.EOF) {
+				return fed, fmt.Errorf("read log: %w", err)
+			}
+			if n == 0 {
+				return fed, nil
 			}
 		}
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("read log: %w", err)
+	}
+	// drain feeds everything readable now and reports whether it fed anything.
+	drain := func() (bool, error) {
+		if tail != nil {
+			return followJobLogTail(path, tail, buffer)
 		}
-		if n > 0 {
-			continue
+		if fed, err := readHead(); fed || err != nil {
+			return fed, err
 		}
 		changed, changeErr := followFileChanged(file, path)
 		if changeErr != nil {
-			return changeErr
+			return false, changeErr
 		}
 		if changed {
 			reopened, openErr := os.Open(path)
 			if openErr != nil {
 				if !errors.Is(openErr, os.ErrNotExist) {
-					return fmt.Errorf("reopen log: %w", openErr)
+					return false, fmt.Errorf("reopen log: %w", openErr)
 				}
 			} else {
 				_ = file.Close()
 				file = reopened
 				buffer.Reset()
-				continue
+				return true, nil
 			}
 		}
-
+		if jobLogTailStarted(path) {
+			// The head got its last line, the marker, before the tail was
+			// started; read up to it, which may have landed since the read
+			// above, before moving on.
+			if fed, err := readHead(); fed || err != nil {
+				return fed, err
+			}
+			tail = &jobLogTailCursor{}
+			return followJobLogTail(path, tail, buffer)
+		}
+		return false, nil
+	}
+	for {
+		fed, err := drain()
+		if err != nil {
+			return err
+		}
+		if fed {
+			continue
+		}
 		settled, settleErr := opts.Settled(ctx)
 		if settleErr != nil {
 			return fmt.Errorf("poll job state: %w", settleErr)
 		}
 		if settled {
 			// The state transition is the stop signal. Drain once more to the
-			// current EOF before flushing a final unterminated logical line.
+			// current end before flushing a final unterminated logical line.
 			for {
-				n, drainErr := file.Read(chunk)
-				if n > 0 {
-					if feedErr := buffer.Write(chunk[:n]); feedErr != nil {
-						return feedErr
-					}
+				fed, err := drain()
+				if err != nil {
+					return err
 				}
-				if drainErr != nil && !errors.Is(drainErr, io.EOF) {
-					return fmt.Errorf("read log: %w", drainErr)
-				}
-				if n == 0 {
+				if !fed {
 					return buffer.Flush()
 				}
 			}

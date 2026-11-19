@@ -176,8 +176,10 @@ artifact_blobs = %q
 
 # [transcripts] is ON by default. Raw unredacted runtime output
 # is retained in 0600 per-job append logs for deterministic trajectory export.
-# Each log is capped at 32 MiB and each line at 256 KiB; omp's streaming
-# message_update and tool_execution_update events are not retained.
+# Each log is bounded to 32 MiB: its first 24 MiB, then the latest output in
+# two rotating 4 MiB tail files (<log>.tail.0/.tail.1). A line is cut to
+# 256 KiB (a JSON event keeps its structure with long strings shortened), and
+# omp's streaming message_update and tool_execution_update events are not retained.
 # retain and max_total_bytes bound home-scoped garbage collection.
 # [transcripts]
 # enabled = true

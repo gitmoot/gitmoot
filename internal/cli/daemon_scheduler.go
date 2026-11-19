@@ -989,22 +989,20 @@ func recoveredJobElapsed(now time.Time, job db.Job) string {
 
 func recoveredJobLogTail(store *db.Store, jobID string) string {
 	logsDir := filepath.Join(filepath.Dir(store.DatabasePath()), config.LogsDir)
-	f, err := os.Open(transcript.ResolveJobLogPath(logsDir, jobID))
+	// The tail is the END of the run, which a full head no longer holds; the
+	// job log reader returns head and tail segments as one stream.
+	log, err := transcript.OpenJobLog(transcript.ResolveJobLogPath(logsDir, jobID))
 	if err != nil {
 		return ""
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return ""
-	}
+	defer log.Close()
 	const scanBytes = 64 * 1024
-	start := info.Size() - scanBytes
+	start := log.Size() - scanBytes
 	if start < 0 {
 		start = 0
 	}
-	buf := make([]byte, info.Size()-start)
-	n, err := f.ReadAt(buf, start)
+	buf := make([]byte, log.Size()-start)
+	n, err := log.ReadAt(buf, start)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return ""
 	}
