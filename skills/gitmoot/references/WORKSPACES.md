@@ -54,9 +54,18 @@ require = ["go version", "make --version"]  # optional, at most 16
   `requirements_unmet` (exit 125) and closes the workspace with reason
   `requirements_unmet: <command>` through the normal close, so its spend
   settles; it is never left open. When all pass, `open` lists them.
+- The workspace stays `opening` while the checks run and is marked `ready`
+  only once all pass. Open moves `last_active_at` before each check, so the
+  daemon's abandoned-open sweep (below) keeps a live open whose checks run
+  long and reaps one whose process died mid-check. The sandbox needs no
+  renewal meanwhile: its create funds one hour, and an open reaches its first
+  check within the 15-minute bound, after which 16 checks take about 20
+  minutes at most.
 - The repository key matches case-insensitively. Unknown keys are ignored,
   as in the other `[repos."owner/repo".*]` tables. An invalid table refuses
-  `open` for that repository only.
+  `open` for that repository only. A `.workspace` header whose repository
+  name does not read (a broken quote, no name) refuses `open` for every
+  repository, since which one it meant is unknown.
 
 `open` records what it used in `<home>/workspaces/<id>/open.json`; `show`
 reports it as `template` and `checks`.
@@ -132,7 +141,9 @@ line.
 
 `requirements_unmet` adds `failed_check` (the command), `exit_code` (its
 status, 124 on timeout) and `output_tail` (the last 2 KiB of its combined
-stdout and stderr, with tokens, keys and passwords redacted):
+stdout and stderr, with tokens, keys and passwords redacted as the output
+streams, before anything is cut, so a secret longer than the kept window is
+still redacted):
 
 ```json
 {"error":{"code":"requirements_unmet","message":"require check \"go version\" exited 127",
@@ -357,9 +368,11 @@ The daemon (every 30 s, once per process however many repos it watches):
   from `last_active_at`;
 - settles and renews (above), closing on `cost_cap`, `expired` (past
   `paid_until`) or `provider_gone` (`local` only);
-- fails an `open` that never finished within 15 minutes (`open_abandoned`) and
-  retries any close whose teardown the provider did not confirm, settling it
-  as `expired` once the provider deadline guarantee covers it.
+- fails an `open` whose `last_active_at` is 15 minutes old (`open_abandoned`):
+  its process died before the workspace was ready. `last_active_at` is the
+  open's start until a `require` check moves it. It also retries any close
+  whose teardown the provider did not confirm, settling it as `expired` once
+  the provider deadline guarantee covers it.
 
 It keeps nothing in memory: every pass re-reads the `workspaces` table and
 re-attaches to each sandbox by its recorded id, so a restarted daemon carries

@@ -148,3 +148,27 @@ func TestLoadRepoWorkspacesRefusesMalformedHeader(t *testing.T) {
 		t.Fatalf("an unrelated malformed header refused: %v", err)
 	}
 }
+
+// A closed workspace header whose repository will not read is refused for the
+// whole file, never skipped: which repository's checks it meant is unknown.
+func TestLoadRepoWorkspacesRefusesUnreadableRepositoryHeader(t *testing.T) {
+	for _, header := range []string{
+		`[repos."acme/widget.workspace]`, // the review's probe
+		`[repos.acme/widget".workspace]`,
+		`[repos."acme/widget\q".workspace]`,
+		`[repos."".workspace]`,
+		`[repos. .workspace]`,
+	} {
+		cfg, err := LoadRepoWorkspaces(writeGateConfig(t, header+"\nrequire = [\"go version\"]\n\n[repos.\"acme/other\".workspace]\nrequire = [\"make -v\"]\n"))
+		if err == nil {
+			got, forErr := cfg.For("acme/widget")
+			t.Fatalf("%s loaded: acme/widget = %+v, %v", header, got, forErr)
+		}
+	}
+	// Not workspace tables: left to their own loaders.
+	for _, header := range []string{`[repos.workspace]`, `[repos."acme/widget".workspaces]`, `[repos."acme/widget.review]`} {
+		if _, err := LoadRepoWorkspaces(writeGateConfig(t, header+"\nrequire = [\"go version\"]\n")); err != nil {
+			t.Fatalf("%s refused: %v", header, err)
+		}
+	}
+}

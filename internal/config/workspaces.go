@@ -218,9 +218,10 @@ func (c RepoWorkspaces) For(repo string) (RepoWorkspace, error) {
 }
 
 // LoadRepoWorkspaces reads every [repos."owner/repo".workspace] table. A
-// missing file is no tables. A malformed header naming a workspace table is
-// refused for the whole file, so a typo cannot silently drop a repository's
-// checks. Unknown keys are ignored, as in the other per-repository tables.
+// missing file is no tables. A malformed header naming a workspace table, or
+// a workspace header whose repository name cannot be read, is refused for
+// the whole file, so a typo cannot silently drop a repository's checks.
+// Unknown keys are ignored, as in the other per-repository tables.
 func LoadRepoWorkspaces(paths Paths) (RepoWorkspaces, error) {
 	cfg := RepoWorkspaces{repos: map[string]repoWorkspaceEntry{}}
 	content, err := os.ReadFile(paths.ConfigFile)
@@ -240,7 +241,10 @@ func LoadRepoWorkspaces(paths Paths) (RepoWorkspaces, error) {
 			if section == "" && malformedHeaderTargets(line, "workspace") {
 				return RepoWorkspaces{}, fmt.Errorf("malformed section header %q", line)
 			}
-			repo, key = parseRepoWorkspaceSection(section)
+			repo, key, err = parseRepoWorkspaceSection(section)
+			if err != nil {
+				return RepoWorkspaces{}, err
+			}
 			if key != "" {
 				if _, ok := cfg.repos[key]; !ok {
 					cfg.repos[key] = repoWorkspaceEntry{}
@@ -267,23 +271,28 @@ func LoadRepoWorkspaces(paths Paths) (RepoWorkspaces, error) {
 
 // parseRepoWorkspaceSection returns the repository a [repos."owner/repo".workspace]
 // header names and its lower-cased key, or two empty strings for any other
-// section.
-func parseRepoWorkspaceSection(section string) (string, string) {
-	if !strings.HasPrefix(section, "repos.") || !strings.HasSuffix(section, ".workspace") {
-		return "", ""
+// section. A workspace header whose repository cannot be read (a broken
+// quote, an empty name) is an error for the whole file: which repository's
+// checks it meant is unknown, so no repository may open without them.
+func parseRepoWorkspaceSection(section string) (string, string, error) {
+	body, ok := strings.CutPrefix(section, "repos.")
+	if !ok || !strings.HasSuffix(body, ".workspace") {
+		return "", "", nil
 	}
-	rest := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(section, "repos."), ".workspace"))
+	rest := strings.TrimSpace(strings.TrimSuffix(body, ".workspace"))
 	if strings.HasPrefix(rest, "\"") {
 		unquoted, err := strconv.Unquote(rest)
 		if err != nil {
-			return "", ""
+			return "", "", fmt.Errorf("section [%s]: the repository name does not unquote: %v; write [repos.\"owner/repo\".workspace]", section, err)
 		}
 		rest = strings.TrimSpace(unquoted)
+	} else if strings.ContainsAny(rest, "\"'") {
+		return "", "", fmt.Errorf("section [%s]: the repository name has a stray quote; write [repos.\"owner/repo\".workspace]", section)
 	}
 	if rest == "" {
-		return "", ""
+		return "", "", fmt.Errorf("section [%s] names no repository; write [repos.\"owner/repo\".workspace]", section)
 	}
-	return rest, strings.ToLower(rest)
+	return rest, strings.ToLower(rest), nil
 }
 
 func applyRepoWorkspaceField(workspace *RepoWorkspace, key, value string) error {

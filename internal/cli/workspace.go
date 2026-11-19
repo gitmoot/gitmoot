@@ -16,7 +16,6 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -536,17 +535,25 @@ func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, req
 	if err != nil {
 		return fail(err)
 	}
-	if err := store.MarkWorkspaceReady(ctx, workspace.ID, plan.Branch, plan.Head, plan.BaseRef, int64(rootDev), int64(rootIno), workspaceNow()); err != nil {
-		return fail(err)
-	}
-	ready, err := store.GetWorkspace(ctx, workspace.ID)
-	if err != nil {
-		return fail(err)
-	}
-	// The checks run in the ready workspace, so the daemon renews and settles
-	// it like any other while they run; open returns it only once all pass.
+	// The checks run while the workspace is still opening, and it is marked
+	// ready only once all pass: a ready workspace is renewed until it idles,
+	// so an opener killed mid-check would leave one paying. Opening, it is
+	// reaped by the daemon's abandoned-open sweep, which measures from
+	// last_active_at; each check moves it first, so a live opener whose
+	// checks outlast that bound is not reaped. The sandbox needs no renewal
+	// meanwhile: create funded it to paid_until (one reserved hour), and the
+	// sweep bounds an open before its first check to
+	// workspaceOpenAbandonedAfter, after which the checks take at most
+	// MaxWorkspaceRequire x (workspaceRequireTimeout + the exec kill grace and
+	// drain), about 20 minutes.
+	checking := workspace
+	checking.ProviderInstanceID, checking.Root = instanceID, sandbox.Root()
+	checking.RootDev, checking.RootIno = int64(rootDev), int64(rootIno)
 	for _, check := range opened.Checks {
-		unmet, failure := runWorkspaceRequire(ctx, store, ready, sandbox, check)
+		if err := store.TouchWorkspace(ctx, workspace.ID, workspaceNow()); err != nil {
+			return fail(err)
+		}
+		unmet, failure := runWorkspaceRequire(ctx, store, checking, sandbox, check)
 		if failure != nil {
 			return fail(failure)
 		}
@@ -554,6 +561,13 @@ func openWorkspace(ctx context.Context, store *db.Store, paths config.Paths, req
 			closeErr := closeWorkspace(context.WithoutCancel(ctx), store, paths, workspace.ID, workspaceReasonRequirementsUnmet+": "+check, io.Discard)
 			return db.Workspace{}, workspaceOpenRecord{}, errors.Join(unmet, closeErr)
 		}
+	}
+	if err := store.MarkWorkspaceReady(ctx, workspace.ID, plan.Branch, plan.Head, plan.BaseRef, int64(rootDev), int64(rootIno), workspaceNow()); err != nil {
+		return fail(err)
+	}
+	ready, err := store.GetWorkspace(ctx, workspace.ID)
+	if err != nil {
+		return fail(err)
 	}
 	return ready, opened, nil
 }
@@ -595,21 +609,18 @@ func readWorkspaceOpenRecord(paths config.Paths, id string) (workspaceOpenRecord
 
 // Require checks (#2704). Each command gets workspaceRequireTimeout (a
 // variable only so the offline tests can shorten it); a failure reports the
-// redacted last workspaceRequireTailBytes of the command's combined output,
-// cut from at most workspaceRequireCaptureBytes kept while it runs.
+// last workspaceRequireTailBytes of the command's combined output, redacted
+// as it streams (workflow.RedactedTail) so no cut can split a secret.
 var workspaceRequireTimeout = 60 * time.Second
 
-const (
-	workspaceRequireTailBytes    = 2 << 10
-	workspaceRequireCaptureBytes = 16 << 10
-)
+const workspaceRequireTailBytes = 2 << 10
 
 // runWorkspaceRequire runs one require command as `bash -lc '<command>'` in
 // the workspace root through runWorkspaceCommand, the exec path. It returns
 // the requirements_unmet error for a command that exited non-zero or timed
 // out (exit 124), or the session's own failure.
 func runWorkspaceRequire(ctx context.Context, store *db.Store, workspace db.Workspace, sandbox workspaceSandbox, command string) (unmet, failure *workspaceError) {
-	output := &workspaceTail{max: workspaceRequireCaptureBytes}
+	output := workflow.NewRedactedTail(workspaceRequireTailBytes)
 	status, failure := runWorkspaceCommand(ctx, store, workspace, sandbox, workspaceExecRequest{
 		ID: workspace.ID, Cwd: ".", Timeout: workspaceRequireTimeout, Argv: []string{"bash", "-lc", command},
 	}, nil, output, output)
@@ -625,23 +636,8 @@ func runWorkspaceRequire(ctx context.Context, store *db.Store, workspace db.Work
 		exitCode = 124
 		message = fmt.Sprintf("require check %q timed out after %s", command, workspaceRequireTimeout)
 	}
-	tail := workspaceRequireTail(output.String())
+	tail := output.String()
 	return &workspaceError{Code: wsErrRequirementsUnmet, Message: message, FailedCheck: command, ExitCode: &exitCode, OutputTail: &tail}, nil
-}
-
-// workspaceRequireTail redacts output with the job-output redactor before it
-// cuts the tail, so a secret split by the cut cannot leak, and advances the
-// cut to a rune boundary.
-func workspaceRequireTail(output string) string {
-	tail := workflow.RedactCommentText(output)
-	if len(tail) <= workspaceRequireTailBytes {
-		return tail
-	}
-	tail = tail[len(tail)-workspaceRequireTailBytes:]
-	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
-		tail = tail[1:]
-	}
-	return tail
 }
 
 func newWorkspaceID() (string, error) {

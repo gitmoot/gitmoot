@@ -35,7 +35,9 @@ const (
 	// accrued cost and reserves the next period.
 	workspaceRenewLead = 10 * time.Minute
 	// workspaceOpenAbandonedAfter fails an `open` that never finished: its
-	// process died between the reservation and ready.
+	// process died between the reservation and ready. It is measured from
+	// last_active_at, which is created_at until open moves it before each
+	// require check (#2704), so a live open whose checks run long is kept.
 	workspaceOpenAbandonedAfter = 15 * time.Minute
 	// workspaceLogCopyLimit bounds what close copies to the host.
 	workspaceLogCopyLimit = 1 << 30
@@ -420,7 +422,7 @@ func sweepWorkspaces(ctx context.Context, store *db.Store, paths config.Paths, s
 		case db.WorkspaceStateClosing:
 			closeFor(w, w.CloseReason)
 		case db.WorkspaceStateOpening:
-			if now.Sub(w.CreatedAt) >= workspaceOpenAbandonedAfter {
+			if now.Sub(w.LastActiveAt) >= workspaceOpenAbandonedAfter {
 				closeFor(w, workspaceReasonOpenAbandoned)
 			}
 		case db.WorkspaceStateReady:

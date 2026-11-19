@@ -222,11 +222,12 @@ func (s *Store) MarkWorkspaceReady(ctx context.Context, id, branch, base, baseRe
 		WHERE id = ? AND state = 'opening'`, branch, base, baseRef, rootDev, rootIno, formatWorkspaceTime(now), id)
 }
 
-// TouchWorkspace moves last_active_at forward (never back) on a ready
-// workspace; the idle timeout is measured from it.
+// TouchWorkspace moves last_active_at forward (never back) on an opening or
+// ready workspace. A ready workspace's idle timeout is measured from it, and
+// an opening one's abandonment: open moves it before each require check.
 func (s *Store) TouchWorkspace(ctx context.Context, id string, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE workspaces SET last_active_at = ?
-		WHERE id = ? AND state = 'ready' AND last_active_at < ?`, formatWorkspaceTime(now), id, formatWorkspaceTime(now))
+		WHERE id = ? AND state IN ('opening', 'ready') AND last_active_at < ?`, formatWorkspaceTime(now), id, formatWorkspaceTime(now))
 	return err
 }
 

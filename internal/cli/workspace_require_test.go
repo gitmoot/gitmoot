@@ -2,10 +2,14 @@ package cli
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -185,4 +189,131 @@ func (e *workspaceTestEnv) onlyWorkspace() db.Workspace {
 		e.t.Fatalf("ls --all = %s (%v), want one workspace", out, err)
 	}
 	return e.record(listed[0].ID)
+}
+
+// #2707 review P1: the checks run while the workspace is still opening, so an
+// opener killed mid-check leaves a workspace the abandoned-open sweep reaps,
+// never a ready one the daemon renews until it idles.
+func TestWorkspaceOpenKilledMidCheckIsReaped(t *testing.T) {
+	env := newWorkspaceTestEnv(t, workspaceTestConfig{})
+	flags := t.TempDir()
+	block, started := filepath.Join(flags, "block"), filepath.Join(flags, "started")
+	if err := os.WriteFile(block, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check := fmt.Sprintf("if [ -f %s ]; then touch %s; exec sleep 300; fi", block, started)
+	appendWorkspaceConfig(t, env.paths, "\n[repos.\"acme/widget\".workspace]\nrequire = ["+strconv.Quote(check)+"]\n")
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	opener := exec.Command(executable, "workspace", "open", "--home", env.home, "--repo", "acme/widget", "--issue", "12", "--json")
+	opener.Env = append(os.Environ(),
+		workspaceCLIChildEnv+"=1",
+		workspaceChildGuestHomeEnv+"="+env.cloud.guestHome,
+		workspaceChildEnvdURLEnv+"="+env.cloud.envd.URL,
+	)
+	if err := opener.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opener.Process.Kill(); _ = opener.Wait() })
+	waitFor(t, "the require check to start", 30*time.Second, func() bool { _, err := os.Stat(started); return err == nil })
+	if err := opener.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	_ = opener.Wait()
+	dead := env.onlyWorkspace()
+	if dead.State != db.WorkspaceStateOpening {
+		t.Fatalf("an opener killed mid-check left the workspace %s, want opening", dead.State)
+	}
+	// The child ran on the real clock; the sweep runs on the test clock.
+	env.nowMu.Lock()
+	env.now = dead.LastActiveAt.Add(workspaceOpenAbandonedAfter - time.Minute)
+	env.nowMu.Unlock()
+	env.sweep()
+	if got := env.record(dead.ID); got.State != db.WorkspaceStateOpening {
+		t.Fatalf("reaped %s after %s, before the abandoned-open bound", got.State, workspaceOpenAbandonedAfter-time.Minute)
+	}
+	env.advance(time.Minute)
+	env.sweep()
+	reaped := env.record(dead.ID)
+	if reaped.State != db.WorkspaceStateFailed || reaped.CloseReason != workspaceReasonOpenAbandoned || reaped.ClosedAt.IsZero() || !env.cloud.sandbox(reaped.ProviderInstanceID).deleted {
+		t.Fatalf("after the bound = state %s reason %q closed_at %v sandbox %+v", reaped.State, reaped.CloseReason, reaped.ClosedAt, env.cloud.sandbox(reaped.ProviderInstanceID))
+	}
+	var closed workspaceCloseRecord
+	data, err := os.ReadFile(filepath.Join(env.paths.Workspaces, reaped.ID, "close.json"))
+	if err != nil || json.Unmarshal(data, &closed) != nil || closed.State != db.WorkspaceStateFailed || closed.CostAccruedUSD <= 0 {
+		t.Fatalf("close.json = %s, %v; want the ledger settled", data, err)
+	}
+	// A retry is not refused as already_open.
+	if err := os.Remove(block); err != nil {
+		t.Fatal(err)
+	}
+	if retried := env.open("--issue", "12"); retried.ID == reaped.ID || retried.State != db.WorkspaceStateReady {
+		t.Fatalf("retry = %+v", retried)
+	}
+}
+
+// A live opener whose checks run past created_at + the abandoned-open bound
+// is kept: each check moves last_active_at, which the sweep measures from.
+func TestWorkspaceOpenWithLongChecksIsNotReaped(t *testing.T) {
+	env := newWorkspaceTestEnv(t, workspaceTestConfig{})
+	flags := t.TempDir()
+	flag := func(name string) string { return filepath.Join(flags, name) }
+	release := func(name string) {
+		if err := os.WriteFile(flag(name), nil, 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { release("go1"); release("go2") })
+	var checks []string
+	for _, n := range []string{"1", "2"} {
+		checks = append(checks, strconv.Quote(fmt.Sprintf("touch %s; while [ ! -f %s ]; do sleep 0.05; done", flag("started"+n), flag("go"+n))))
+	}
+	appendWorkspaceConfig(t, env.paths, "\n[repos.\"acme/widget\".workspace]\nrequire = ["+strings.Join(checks, ", ")+"]\n")
+	done := make(chan workspaceCLIResult, 1)
+	go func() { done <- env.run("workspace", "open", "--repo", "acme/widget", "--issue", "12", "--json") }()
+	exists := func(name string) func() bool {
+		return func() bool { _, err := os.Stat(flag(name)); return err == nil }
+	}
+	waitFor(t, "the first check to start", 30*time.Second, exists("started1"))
+	opening := env.onlyWorkspace()
+	if opening.State != db.WorkspaceStateOpening {
+		t.Fatalf("the workspace is %s while its checks run, want opening", opening.State)
+	}
+	env.advance(workspaceOpenAbandonedAfter - time.Minute)
+	release("go1")
+	waitFor(t, "the second check to start", 30*time.Second, exists("started2"))
+	// Past created_at + the bound, but not past the second check's start.
+	env.advance(5 * time.Minute)
+	env.sweep()
+	if got := env.record(opening.ID); got.State != db.WorkspaceStateOpening || env.cloud.sandbox(got.ProviderInstanceID).deleted {
+		t.Fatalf("a live opener's workspace was reaped: state %s reason %q", got.State, got.CloseReason)
+	}
+	release("go2")
+	select {
+	case result := <-done:
+		if result.code != 0 {
+			t.Fatalf("open exited %d: %s", result.code, result.stderr)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("open did not finish")
+	}
+	if got := env.record(opening.ID); got.State != db.WorkspaceStateReady {
+		t.Fatalf("after the checks passed the workspace is %s", got.State)
+	}
+}
+
+// #2707 review P2: a workspace header that will not unquote refuses open
+// instead of opening the repository without its checks.
+func TestWorkspaceOpenRefusesUnreadableWorkspaceHeader(t *testing.T) {
+	env := newWorkspaceTestEnv(t, workspaceTestConfig{local: true})
+	appendWorkspaceConfig(t, env.paths, "\n[repos.\"acme/widget.workspace]\nrequire = [\"go version\"]\n")
+	result := env.run("workspace", "open", "--repo", "acme/widget", "--issue", "12")
+	if refused := workspaceErrorShape(t, result); refused.Code != wsErrInvalidArgs || !strings.Contains(refused.Message, `repos."acme/widget.workspace`) {
+		t.Fatalf("open = %+v, want invalid_args naming the header", refused)
+	}
+	if list := env.mustRun(nil, "workspace", "ls", "--all", "--json"); strings.TrimSpace(list) != "[]" {
+		t.Fatalf("a refused open created %s", list)
+	}
 }
