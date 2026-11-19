@@ -136,6 +136,14 @@ disagrees, trust its live `--help`.
 - [gitmoot status](#gitmoot-status)
 - [gitmoot update](#gitmoot-update)
 - [gitmoot version](#gitmoot-version)
+- [gitmoot workspace](#gitmoot-workspace)
+- [gitmoot workspace close](#gitmoot-workspace-close)
+- [gitmoot workspace exec](#gitmoot-workspace-exec)
+- [gitmoot workspace ls](#gitmoot-workspace-ls)
+- [gitmoot workspace open](#gitmoot-workspace-open)
+- [gitmoot workspace show](#gitmoot-workspace-show)
+- [gitmoot ws](#gitmoot-ws)
+- [gitmoot ws sh](#gitmoot-ws-sh)
 
 ## gitmoot
 
@@ -170,6 +178,8 @@ Commands:
   campaign   inspect campaigns: sets of runs and notes that belong together
   note       add and read campaign notes
   dashboard  show a snapshot of local Gitmoot state
+  workspace  open, run commands in and close remote workspaces for coding seats
+  ws         short forms for the workspace named by $GITMOOT_WORKSPACE
 ```
 
 ## gitmoot ask
@@ -1895,4 +1905,115 @@ Usage of version:
     	home directory to use instead of the current user's home
   -json
     	print version information as JSON
+```
+
+## gitmoot workspace
+
+```text
+Remote workspaces: a VM bound to one seat and one issue or pull request (#2678).
+
+Usage:
+  gitmoot workspace open --repo owner/repo (--issue N | --pr N) [--json]
+  gitmoot workspace show <id> [--json]
+  gitmoot workspace ls [--all] [--json]
+  gitmoot workspace exec <id> [--cwd REL] [--env K=V]... [--timeout S] [--stdin] [--status-file HOSTPATH] -- <argv...>
+  gitmoot workspace close <id> [--reason TEXT] [--json]
+  gitmoot ws sh [--cwd REL] '<command>'
+
+The seat is the acting org role (GITMOOT_ORG_ROLE or the calling pane's seat).
+Requires [workspaces] enabled = true. A failure prints
+{"error":{"code","message"}} on stderr (and stdout with --json) and exits 125.
+See skills/gitmoot/references/WORKSPACES.md.
+```
+
+## gitmoot workspace close
+
+```text
+Usage of workspace close:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the closed workspace as JSON
+  -reason string
+    	why the workspace is closed (recorded as close_reason) (default "manual")
+```
+
+## gitmoot workspace exec
+
+```text
+Usage of workspace exec:
+  -cwd string
+    	working directory relative to the workspace root; must stay under it (default ".")
+  -env value
+    	K=V added to the command's environment (repeatable); the host environment is never passed
+  -home string
+    	home directory to use instead of the current user's home
+  -status-file string
+    	host path written last with {"exit_code","signal","timed_out","error"}
+  -stdin
+    	connect this process's stdin to the command (default: /dev/null)
+  -timeout float
+    	seconds (fractions allowed) before the command's process group is killed (exit 124); 0 means none
+```
+
+## gitmoot workspace ls
+
+```text
+Usage of workspace ls:
+  -all
+    	include closed and failed workspaces
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the workspaces as a JSON array
+```
+
+## gitmoot workspace open
+
+```text
+Usage of workspace open:
+  -home string
+    	home directory to use instead of the current user's home
+  -issue int
+    	issue number: opens a new branch ws/<seat>/<issue> from the default branch
+  -json
+    	print the workspace as JSON
+  -pr int
+    	pull request number: checks out the PR's head branch
+  -repo string
+    	repository as owner/repo (registered with gitmoot)
+```
+
+## gitmoot workspace show
+
+```text
+Usage of workspace show:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the workspace as JSON
+```
+
+## gitmoot ws
+
+```text
+Short forms for the workspace named by $GITMOOT_WORKSPACE (#2678).
+
+Usage:
+  gitmoot ws sh [--cwd REL] [--status-file HOSTPATH] '<command>'
+
+Runs exactly one command string as `bash -lc '<command>'` in the workspace, like
+`gitmoot workspace exec $GITMOOT_WORKSPACE --cwd REL -- bash -lc '<command>'`.
+```
+
+## gitmoot ws sh
+
+```text
+Usage of ws sh:
+  -cwd string
+    	working directory relative to the workspace root; must stay under it (default ".")
+  -home string
+    	home directory to use instead of the current user's home
+  -status-file string
+    	host path written last with {"exit_code","signal","timed_out","error"}
 ```

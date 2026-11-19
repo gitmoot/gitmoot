@@ -269,12 +269,18 @@ func (b *ledgeredExecutionBackend) actualCostUSD(ctx context.Context, key db.Exe
 	if !ok {
 		return nil
 	}
-	lifetime := b.now().UTC().Sub(created)
-	if lifetime < 0 {
-		lifetime = 0
-	}
-	cost := lifetime.Hours() * b.perHourUSD
+	cost := sandboxHoursCostUSD(b.now().UTC().Sub(created), b.perHourUSD)
 	return &cost
+}
+
+// sandboxHoursCostUSD prices a sandbox lifetime at a provider's configured
+// cost_per_hour_usd. The provider APIs report no per-sandbox cost, so job
+// attempts (#2316) and remote workspaces (#2678) both bill by this measure.
+func sandboxHoursCostUSD(lifetime time.Duration, perHourUSD float64) float64 {
+	if lifetime < 0 || perHourUSD <= 0 {
+		return 0
+	}
+	return lifetime.Hours() * perHourUSD
 }
 
 func (b *ledgeredExecutionBackend) Reap(ctx context.Context) ([]string, error) {
@@ -323,6 +329,11 @@ func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, repor
 			continue
 		}
 		observed[id] = struct{}{}
+		// A remote workspace is ledgered in the workspaces table and renewed and
+		// destroyed by the workspace sweep, never by an attempt row (#2678).
+		if strings.HasPrefix(instance.JobID, execbackend.WorkspaceJobIDPrefix) {
+			continue
+		}
 		key := db.ExecBackendAttemptKey{JobID: instance.JobID, Attempt: instance.Attempt, LifecycleGeneration: instance.LifecycleGeneration}
 		attempt := byKey[key]
 		// Provider inventory is account-wide. Even a matching sandbox ID is

@@ -653,6 +653,11 @@ func (b *LocalBackend) Reap(ctx context.Context) ([]string, error) {
 		if localOwnerAlive(meta.OwnerPID, meta.OwnerBootID, meta.OwnerStartTime) {
 			continue
 		}
+		// A remote workspace (#2678) outlives the CLI process that opened it;
+		// the workspaces table owns its teardown.
+		if strings.HasPrefix(meta.JobID, WorkspaceJobIDPrefix) {
+			continue
+		}
 		id := entry.Name()
 		if err := b.Destroy(ctx, &Instance{ID: id}); err != nil {
 			reapErrs = append(reapErrs, fmt.Errorf("reap local execution instance %q: %w", id, err))

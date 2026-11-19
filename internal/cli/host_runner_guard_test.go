@@ -119,6 +119,10 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		rawCommands: 1,
 		reason:      "operator update lifecycle restarts the local daemon executable",
 	},
+	"internal/cli/workspace.go:workspaceGit": {
+		rawCommands: 1,
+		reason:      "workspace open (#2678) fetches and resolves the workspace's commits in the registered host clone with the host's own credentials before any sandbox exists; it is host-side source preparation for a workspace, not a job, so there is no resolved backend runner, and only the credential-free object store derived from it reaches the sandbox",
+	},
 }
 
 func TestJobPathsDoNotHardcodeHostRunners(t *testing.T) {

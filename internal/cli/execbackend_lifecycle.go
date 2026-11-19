@@ -147,23 +147,11 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 		if err != nil {
 			return nil, err
 		}
-		// GITMOOT-IMPL: production resolves provider envd endpoints; the injected
-		// resolver exists only so the lifecycle E2E remains offline and spend-free.
-		resolver := w.RemoteEnvdEndpointResolver
-		if resolver == nil {
-			if cfg.E2BEnvdBaseURL != "" {
-				origin := cfg.E2BEnvdBaseURL
-				resolver = func(string, int) string { return origin }
-			} else if cfg.E2BDomain != "" {
-				domain := cfg.E2BDomain
-				resolver = func(sandboxID string, port int) string {
-					return fmt.Sprintf("https://%d-%s.%s", port, sandboxID, domain)
-				}
-			}
-		}
 		remoteBackend, err := remoteexec.NewBackend(client, remoteexec.Options{
-			TemplateID:     cfg.E2BTemplate,
-			Envd:           e2b.EnvdOptions{EndpointResolver: resolver, FixedHostRouting: cfg.E2BEnvdBaseURL != ""},
+			TemplateID: cfg.E2BTemplate,
+			// GITMOOT-IMPL: production resolves provider envd endpoints; the injected
+			// resolver exists only so the lifecycle E2E remains offline and spend-free.
+			Envd:           remoteEnvdOptions(cfg, w.RemoteEnvdEndpointResolver),
 			ShouldRenewTTL: w.shouldRenewSandboxTTL,
 		})
 		if err != nil {
@@ -210,6 +198,24 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 		}
 		return revokingBackend, nil
 	})
+}
+
+// remoteEnvdOptions resolves a provider's envd endpoints: an injected
+// resolver (offline tests), the fixed [remote_exec.sandboxd] envd_base_url, a
+// custom E2B domain, or else the E2B default.
+func remoteEnvdOptions(cfg config.RemoteExecConfig, resolver func(string, int) string) e2b.EnvdOptions {
+	if resolver == nil {
+		if cfg.E2BEnvdBaseURL != "" {
+			origin := cfg.E2BEnvdBaseURL
+			resolver = func(string, int) string { return origin }
+		} else if cfg.E2BDomain != "" {
+			domain := cfg.E2BDomain
+			resolver = func(sandboxID string, port int) string {
+				return fmt.Sprintf("https://%d-%s.%s", port, sandboxID, domain)
+			}
+		}
+	}
+	return e2b.EnvdOptions{EndpointResolver: resolver, FixedHostRouting: cfg.E2BEnvdBaseURL != ""}
 }
 
 func (w jobWorker) executionBackendConfig() (config.RemoteExecConfig, error) {

@@ -524,6 +524,9 @@ type registeredRepoPoller struct {
 	// WorkflowFactory closure below captures the same pointer; the pass resets it
 	// so the reads stay per-tick. nil (legacy/test callers) resolves directly.
 	ConfigCache *tickConfigCache
+	// WorkspaceReconciler builds the per-repo remote workspace reconciler
+	// (#2678) a full poll hands its open pull requests to. Nil skips it.
+	WorkspaceReconciler func(gh github.Client, repo github.Repository) func(context.Context, []github.PullRequest) error
 }
 
 // defaultRegisteredRepoPoller wires the registered-repo supervisor's per-tick
@@ -543,12 +546,15 @@ type registeredRepoPoller struct {
 func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer, rawHome, resolvedRoot string) registeredRepoPoller {
 	configCache := &tickConfigCache{}
 	return registeredRepoPoller{
-		ConfigCache:       configCache,
-		Store:             store,
-		Workers:           workers,
-		DryRun:            dryRun,
-		Stdout:            stdout,
-		AutoMergeEnabled:  autoMergeEnabledResolver(rawHome),
+		ConfigCache:      configCache,
+		Store:            store,
+		Workers:          workers,
+		DryRun:           dryRun,
+		Stdout:           stdout,
+		AutoMergeEnabled: autoMergeEnabledResolver(rawHome),
+		WorkspaceReconciler: func(gh github.Client, repo github.Repository) func(context.Context, []github.PullRequest) error {
+			return workspacePullRequestReconciler(store, rawHome, gh, repo, stdout)
+		},
 		IdleGraceTicks:    config.DefaultDaemonIdleGraceTicks,
 		IdleMaxMultiplier: config.DefaultDaemonIdleMaxMultiplier,
 		GitHubClient:      func(checkout string) github.Client { return github.NewClient(checkout) },
@@ -886,6 +892,9 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		},
 		WatchIssues:      p.WatchIssues,
 		AutoMergeEnabled: p.AutoMergeEnabled,
+	}
+	if p.WorkspaceReconciler != nil {
+		d.ReconcileOpenPullRequests = p.WorkspaceReconciler(gh, repo)
 	}
 	// Bound the poll the same way the single-repo supervisor does (#555 / #536):
 	// this call runs while HOLDING the per-repo checkout lock (deferred Unlock

@@ -43,6 +43,12 @@ const (
 	Remote Backend = "remote"
 )
 
+// WorkspaceJobIDPrefix starts the job_id a remote workspace sandbox (#2678)
+// carries in provider metadata. Workspaces are ledgered in the workspaces
+// table, never in execbackend_attempts, so the attempt reconciler skips them
+// instead of reporting each one as an unmatched sandbox.
+const WorkspaceJobIDPrefix = "workspace:"
+
 // AllowedNames is the canonical allowed set of backend names, in the order
 // error messages render them. Parse accepts names exclusively from this list,
 // so a backend cannot be accepted without also being advertised.

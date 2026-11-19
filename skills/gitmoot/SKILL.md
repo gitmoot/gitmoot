@@ -401,6 +401,8 @@ once every note is triaged.
   result a reviewer returns.
 - [references/SAFETY.md](references/SAFETY.md): locks, isolation and the gate's
   guarantees.
+- [references/WORKSPACES.md](references/WORKSPACES.md): remote workspaces, a
+  VM per seat and issue or PR, and the `workspace` / `ws sh` CLI contract.
 - [references/CLI.md](references/CLI.md): every command's `--help`.
 - The dashboard: `gitmoot dashboard` prints a snapshot,
   `gitmoot dashboard --web --addr 127.0.0.1:8080` serves the read-only web view.

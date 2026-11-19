@@ -88,6 +88,11 @@ type Daemon struct {
 	// hook invoked only after durable completion is recorded and before
 	// secondary identities settle.
 	AfterCanonicalTerminalEffects func(context.Context, db.PullRequestTerminalReconciliation) error
+	// ReconcileOpenPullRequests receives each full poll's open pull request
+	// listing, so state bound to a pull request elsewhere (remote workspaces,
+	// #2678) follows it closing or merging without another listing. Nil skips
+	// it; its error is reported like any other reconciler's.
+	ReconcileOpenPullRequests func(context.Context, []github.PullRequest) error
 	// parseCommentCommand is an injectable test seam for proving that the
 	// system-verified author gate runs before untrusted comment text reaches the
 	// command parser. Nil uses ParseCommand.
@@ -213,6 +218,11 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	}
 	if err := d.reconcilePROpenTasks(ctx, pulls); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	if d.ReconcileOpenPullRequests != nil {
+		if err := d.ReconcileOpenPullRequests(ctx, pulls); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	if err := d.reconcileExternallyMergedTasks(ctx, openPullNumbers); err != nil && firstErr == nil {
 		firstErr = err
