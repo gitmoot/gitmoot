@@ -2,14 +2,16 @@ package transcript
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sort"
+	"syscall"
 	"time"
 )
 
-// jobLogSegment is one tail segment of a job log that has a header, so its
-// place in the run is known.
+// jobLogSegment is one tail segment of a job log that had a header when it
+// was listed, so its place in the run is known.
 type jobLogSegment struct {
 	seq  int64
 	file *os.File
@@ -17,7 +19,9 @@ type jobLogSegment struct {
 
 // openJobLogSegments opens the tail segments of the log at path that have a
 // header, oldest first. A segment that does not exist, or has no header yet,
-// is not part of the log.
+// is not part of the log. The numbers are read without a lock, so they are a
+// listing only: copyJobLogSegment re-checks a segment's number before trusting
+// its bytes.
 func openJobLogSegments(path string) ([]jobLogSegment, error) {
 	var segments []jobLogSegment
 	for _, tailPath := range JobLogTailPaths(path) {
@@ -50,18 +54,67 @@ func closeJobLogSegments(segments []jobLogSegment) {
 	}
 }
 
+// copyJobLogSegment copies a segment's bytes from offset to its current end,
+// under flock(LOCK_SH) on it, which rotation cannot take over (rotateTail
+// reuses a segment only under LOCK_EX). It reports false, and copies nothing,
+// when the segment is no longer generation seq: it was reused since it was
+// listed. The lock is held for the copy alone, never while the caller uses
+// the bytes, so a slow consumer cannot hold up a writer; the copy is at most
+// one segment, JobLogTailSegmentBytes.
+func copyJobLogSegment(file *os.File, seq, offset int64) (data []byte, same bool, err error) {
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH); err != nil {
+		return nil, false, err
+	}
+	defer func() {
+		if unlockErr := syscall.Flock(int(file.Fd()), syscall.LOCK_UN); err == nil {
+			err = unlockErr
+		}
+	}()
+	current, err := readJobLogSegmentSeq(file)
+	if err != nil || current != seq {
+		return nil, false, err
+	}
+	if jobLogSegmentLocked != nil {
+		jobLogSegmentLocked()
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if info.Size() <= offset {
+		return nil, true, nil
+	}
+	data = make([]byte, info.Size()-offset)
+	n, err := file.ReadAt(data, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	return data[:n], true, nil
+}
+
+// jobLogSegmentLocked, when set by a test, runs while copyJobLogSegment holds
+// a segment's shared lock, so a test can race a rotation against the copy.
+var jobLogSegmentLocked func()
+
+// jobLogSnapshotAttempts bounds how often OpenJobLog relists the segments
+// when a rotation reused one between listing and copying. A rotation needs
+// 4 MiB of new output, so a second attempt practically always succeeds.
+const jobLogSnapshotAttempts = 8
+
 // JobLogReader reads a retained job log as the one stream it records: the
 // head, then the older and the newer tail segment. It is the only reader of
 // the on-disk layout; every consumer of a job log opens it through OpenJobLog.
 //
-// The part sizes are taken at open. A log still being written can rotate a
-// segment while it is read; the read then ends early at that segment rather
-// than mixing two segments' bytes.
+// It is a SNAPSHOT taken at open. The tail segments are copied then, each
+// under a shared lock and checked to be one generation (copyJobLogSegment),
+// because a writer reuses their files; after that the reader holds no lock,
+// so it can never block a writer. The head needs no copy: a writer only ever
+// appends to it, so its first Size bytes never change.
 type JobLogReader struct {
-	files  []*os.File
-	sizes  []int64
-	size   int64
-	offset int64
+	head     *os.File
+	headSize int64
+	tail     []byte
+	offset   int64
 }
 
 // OpenJobLog opens the log at path with its tail segments. A missing head is
@@ -71,57 +124,86 @@ func OpenJobLog(path string) (*JobLogReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	segments, err := openJobLogSegments(path)
+	tail, err := snapshotJobLogTail(path)
 	if err != nil {
 		_ = head.Close()
 		return nil, err
 	}
-	r := &JobLogReader{files: []*os.File{head}}
-	for _, segment := range segments {
-		r.files = append(r.files, segment.file)
+	// The head's size is taken AFTER the tail: the head gets its last line,
+	// the marker, before the first segment exists, so a tail that was copied
+	// always follows a head that is complete.
+	info, err := head.Stat()
+	if err != nil {
+		_ = head.Close()
+		return nil, err
 	}
-	for _, file := range r.files {
-		info, err := file.Stat()
+	return &JobLogReader{head: head, headSize: info.Size(), tail: tail}, nil
+}
+
+// snapshotJobLogTail copies the tail segments oldest first. Each is checked
+// to still be the generation it was listed as; if one was reused in between,
+// the listing is stale and is taken again. Copying the segments one at a time
+// is consistent: a rotation can only reuse the OLDER one, which leaves the
+// already-copied older segment and the still-listed newer one a contiguous
+// stretch of the run.
+func snapshotJobLogTail(path string) ([]byte, error) {
+	for range jobLogSnapshotAttempts {
+		segments, err := openJobLogSegments(path)
 		if err != nil {
-			_ = r.Close()
 			return nil, err
 		}
-		r.sizes = append(r.sizes, info.Size())
-		r.size += info.Size()
+		var tail []byte
+		consistent := true
+		for _, segment := range segments {
+			data, same, err := copyJobLogSegment(segment.file, segment.seq, 0)
+			if err != nil {
+				closeJobLogSegments(segments)
+				return nil, err
+			}
+			if !same {
+				consistent = false
+				break
+			}
+			tail = append(tail, data...)
+		}
+		closeJobLogSegments(segments)
+		if consistent {
+			return tail, nil
+		}
 	}
-	return r, nil
+	return nil, fmt.Errorf("job log %s: its tail segments kept rotating while being read", path)
 }
 
 // Size is the length of the whole stream, as of OpenJobLog.
-func (r *JobLogReader) Size() int64 { return r.size }
+func (r *JobLogReader) Size() int64 { return r.headSize + int64(len(r.tail)) }
 
 func (r *JobLogReader) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, errors.New("job log: negative offset")
 	}
 	n := 0
-	for i, file := range r.files {
-		if len(p) == 0 {
-			return n, nil
-		}
-		if off >= r.sizes[i] {
-			off -= r.sizes[i]
-			continue
-		}
-		want := min(int64(len(p)), r.sizes[i]-off)
-		got, err := file.ReadAt(p[:want], off)
+	if off < r.headSize {
+		want := min(int64(len(p)), r.headSize-off)
+		got, err := r.head.ReadAt(p[:want], off)
 		n += got
 		if int64(got) < want {
-			// The part shrank under us: a rotation of a live log.
-			if err == nil || errors.Is(err, io.EOF) {
-				err = io.EOF
+			if err == nil {
+				err = io.ErrUnexpectedEOF
 			}
 			return n, err
 		}
-		p = p[got:]
-		off = 0
+		p, off = p[got:], r.headSize
 	}
-	if len(p) > 0 {
+	if len(p) == 0 {
+		return n, nil
+	}
+	tailOff := off - r.headSize
+	if tailOff >= int64(len(r.tail)) {
+		return n, io.EOF
+	}
+	copied := copy(p, r.tail[tailOff:])
+	n += copied
+	if copied < len(p) {
 		return n, io.EOF
 	}
 	return n, nil
@@ -137,13 +219,7 @@ func (r *JobLogReader) Read(p []byte) (int, error) {
 }
 
 func (r *JobLogReader) Close() error {
-	var err error
-	for _, file := range r.files {
-		if closeErr := file.Close(); err == nil {
-			err = closeErr
-		}
-	}
-	return err
+	return r.head.Close()
 }
 
 // JobLogInfo is a job log's progress evidence: its total size and its latest
@@ -214,6 +290,11 @@ type jobLogTailCursor struct {
 // order, and reports whether it fed anything. A segment the cursor was in that
 // has been rotated away is skipped to the oldest newer one: its unread lines
 // are gone from disk.
+//
+// Each step copies one segment under its shared lock (copyJobLogSegment),
+// checked to be the generation the cursor names, and feeds the bytes only
+// after the lock is released: a follower whose consumer stalls holds no lock,
+// and bytes of two generations of one file are never joined.
 func followJobLogTail(path string, cursor *jobLogTailCursor, buffer *lineBuffer) (bool, error) {
 	segments, err := openJobLogSegments(path)
 	if err != nil {
@@ -225,18 +306,21 @@ func followJobLogTail(path string, cursor *jobLogTailCursor, buffer *lineBuffer)
 		if segment.seq < cursor.seq {
 			continue
 		}
+		offset := cursor.offset
 		if segment.seq > cursor.seq {
-			cursor.seq, cursor.offset = segment.seq, 0
-			buffer.Reset()
+			offset = 0
 		}
-		data, err := io.ReadAll(io.NewSectionReader(segment.file, cursor.offset, 1<<62))
+		data, same, err := copyJobLogSegment(segment.file, segment.seq, offset)
 		if err != nil {
 			return fed, err
 		}
-		// A segment rotated while it was read holds a newer segment's bytes
-		// past the offset; leave it to the next pass, which lists it afresh.
-		if seq, err := readJobLogSegmentSeq(segment.file); err != nil || seq != segment.seq {
-			return fed, err
+		if !same {
+			// Reused since it was listed; the next pass lists it afresh.
+			return fed, nil
+		}
+		if segment.seq > cursor.seq {
+			cursor.seq, cursor.offset = segment.seq, 0
+			buffer.Reset()
 		}
 		if len(data) == 0 {
 			continue

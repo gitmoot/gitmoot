@@ -281,8 +281,9 @@ func (w *JobLogWriter) resetLine() {
 
 // render bounds the current line. A JSON object is shortened into a valid,
 // smaller event, because a cut one no longer decodes and every reader would
-// lose its type, ids and status. The raw cut is the fallback, for a line that
-// is not a JSON object, does not decode, or stays too big after shortening.
+// lose its type, ids and status; shortenJSONLine always fits one that decodes.
+// The raw cut is only for a line that is not a JSON object, does not decode,
+// or ran past jobLogMaxStructuredLineBytes before it ended.
 func (w *JobLogWriter) render(terminated bool) []byte {
 	if total := int64(len(w.line)) + w.overflow; total > JobLogMaxLineBytes {
 		short, ok := []byte(nil), false
@@ -394,6 +395,15 @@ func endsWithMarker(file *os.File, size int64) (bool, error) {
 // highest header number, first rotating to the other segment when the line
 // would overflow it. Rotation empties the other segment IN PLACE (no rename),
 // so every handle on the log keeps addressing the same two files.
+//
+// Readers never take the head lock; they take flock(LOCK_SH) on a segment
+// while they copy it, and rotation reuses a segment only under
+// flock(LOCK_EX) on THAT segment (rotateTail). So a reader never sees two
+// generations of one segment, and writers wait for readers only at a
+// rotation, never on an ordinary line. There is no deadlock: a writer takes
+// the head and then one segment; whoever holds a segment exclusively waits
+// for nothing while holding it; and a reader only ever takes shared locks
+// and never upgrades one.
 func (w *JobLogWriter) appendTail(line []byte) error {
 	current, seq := -1, int64(0)
 	var currentSize int64
@@ -419,16 +429,30 @@ func (w *JobLogWriter) appendTail(line []byte) error {
 		if current >= 0 {
 			next = 1 - current
 		}
-		file := w.tails[next]
-		if err := file.Truncate(0); err != nil {
-			return err
-		}
-		if _, err := file.Write(jobLogSegmentHeader(seq + 1)); err != nil {
+		if err := rotateTail(w.tails[next], seq+1); err != nil {
 			return err
 		}
 		current = next
 	}
 	_, err := w.tails[current].Write(line)
+	return err
+}
+
+// rotateTail empties a segment and opens it as segment seq, under an
+// exclusive lock on it, so no reader is mid-copy of the generation it ends.
+func rotateTail(file *os.File, seq int64) (err error) {
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() {
+		if unlockErr := syscall.Flock(int(file.Fd()), syscall.LOCK_UN); err == nil {
+			err = unlockErr
+		}
+	}()
+	if err := file.Truncate(0); err != nil {
+		return err
+	}
+	_, err = file.Write(jobLogSegmentHeader(seq))
 	return err
 }
 

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -429,22 +430,216 @@ func deref(p *int) int {
 	return *p
 }
 
-// A JSON line that no shortening can bring under the cap, or that does not
-// decode, gets the raw cut: a bounded head and the truncated count.
-func TestJobLogWriterRawCutsJSONThatCannotBeShortened(t *testing.T) {
-	numbers := `{"type":"x","values":[` + strings.TrimSuffix(strings.Repeat("12345,", 60<<10), ",") + `]}`
+// Only a line that does not decode gets the raw cut: a bounded head and the
+// truncated count.
+func TestJobLogWriterRawCutsOnlyUndecodableJSON(t *testing.T) {
 	broken := `{"type":"x","text":"` + strings.Repeat("z", JobLogMaxLineBytes+10)
-	for name, line := range map[string]string{"structure too big": numbers, "undecodable": broken} {
-		path := filepath.Join(t.TempDir(), "job.log")
-		w := openTestJobLog(t, path, false)
-		writeChunks(t, w, line+"\n", 1<<20)
-		if err := w.Close(); err != nil {
+	path := filepath.Join(t.TempDir(), "job.log")
+	w := openTestJobLog(t, path, false)
+	writeChunks(t, w, broken+"\n", 1<<20)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := broken[:JobLogMaxLineBytes] + fmt.Sprintf("…[%d bytes truncated]\n", len(broken)-JobLogMaxLineBytes)
+	if got := readJobLog(t, path); got != want {
+		t.Fatalf("log ends %q, want %q", got[max(0, len(got)-60):], want[len(want)-60:])
+	}
+}
+
+// keptJSONLine writes one line through a job log and returns the one line it
+// kept, which must be valid JSON within the line cap.
+func keptJSONLine(t *testing.T, line string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "job.log")
+	w := openTestJobLog(t, path, true)
+	writeChunks(t, w, line+"\n", 7919)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	kept, ok := strings.CutSuffix(readJobLog(t, path), "\n")
+	if !ok || strings.Contains(kept, "\n") {
+		t.Fatalf("log is not one line: %d bytes", len(kept))
+	}
+	if len(kept) > JobLogMaxLineBytes || !json.Valid([]byte(kept)) {
+		t.Fatalf("kept %d bytes, valid JSON %v; want a valid event within %d (tail %q)", len(kept), json.Valid([]byte(kept)), JobLogMaxLineBytes, kept[max(0, len(kept)-80):])
+	}
+	return kept
+}
+
+// Review F2 on #2708, round 3: a valid event whose size comes from MANY SHORT
+// values - 2,500 text parts of 100 characters - has no long string to cut.
+// Its arrays are shortened instead, and it still reads as the same failed
+// tool result, with its status and exit code. An array of numbers is cut the
+// same way.
+func TestJobLogWriterKeepsAValidEventOfManySmallValues(t *testing.T) {
+	parts := make([]string, 2500)
+	for i := range parts {
+		parts[i] = fmt.Sprintf(`{"type":"text","text":%q}`, fmt.Sprintf("%04d ", i)+strings.Repeat("p", 95))
+	}
+	event := `{"type":"tool_execution_end","toolCallId":"call-many","toolName":"bash","isError":true,"result":{"content":[` +
+		strings.Join(parts, ",") + `],"details":{"exitCode":3}}}`
+	if len(event) < 300<<10 {
+		t.Fatalf("fixture is %d bytes, want the reviewer's ~315 KB", len(event))
+	}
+	kept := keptJSONLine(t, event)
+	if !strings.HasPrefix(kept, `{"type":"tool_execution_end",`) || !strings.Contains(kept, "elements truncated]") {
+		t.Fatalf("kept line does not open with its type or does not mark the cut: %q", kept[:min(len(kept), 120)])
+	}
+	translator, err := NewSnapshotTranslator("omp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := translator.Translate(kept)
+	if len(events) != 1 || events[0].Kind != KindToolResult || events[0].ToolID != "call-many" || events[0].Status != "error" || deref(events[0].ExitCode) != 3 {
+		t.Fatalf("kept event translates to %+v, want the failed tool result with exit code 3", events)
+	}
+	if !strings.Contains(events[0].OutputDigest, "0000 ppp") {
+		t.Fatalf("kept result lost the head of its output: %q", events[0].OutputDigest[:min(len(events[0].OutputDigest), 80)])
+	}
+
+	numbers := `{"type":"x","values":[` + strings.TrimSuffix(strings.Repeat("12345,", 60<<10), ",") + `]}`
+	if kept := keptJSONLine(t, numbers); !strings.Contains(kept, `"…[`) {
+		t.Fatalf("number array kept without a marker: %q", kept[:min(len(kept), 120)])
+	}
+}
+
+// When neither strings nor arrays can be cut enough - here one object of
+// 40,000 short keys - the line becomes the envelope: its top-level scalars,
+// type first, and "gitmoot_truncated":true. It is never raw-cut.
+func TestJobLogWriterEnvelopesAnEventNothingElseShortens(t *testing.T) {
+	var fields []string
+	for i := range 40000 {
+		fields = append(fields, fmt.Sprintf(`"k%05d":%d`, i, i))
+	}
+	event := `{"type":"tool_execution_end","toolCallId":"call-env","toolName":"bash","isError":true,"result":{"details":{` +
+		strings.Join(fields, ",") + `}}}`
+	kept := keptJSONLine(t, event)
+	want := `{"type":"tool_execution_end","toolCallId":"call-env","toolName":"bash","isError":true,"gitmoot_truncated":true}`
+	if kept != want {
+		t.Fatalf("kept %q, want the envelope %q", kept[:min(len(kept), 200)], want)
+	}
+}
+
+// Review F4 on #2708: a snapshot must not mix generations of a reused tail
+// segment. The reader is opened over segments 1 and 2 and has read into
+// segment 1; the writer then reuses segment 1's file for segment 3 and fills
+// it to the same size. What the reader returns must still be exactly the log
+// as it was at open: in order, one generation per segment.
+func TestJobLogReaderIsASnapshotAcrossRotation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "job.log")
+	w := openSmallJobLog(t, path, 10<<10, 2560)
+	writeChunks(t, w, numberedLines(1, 13), 1<<20) // head 1-9, segment 1: 10-11, segment 2: 12-13
+	atOpen := readWholeJobLog(t, path)
+	log, err := OpenJobLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	firstPart := len(numberedLines(1, 9)+JobLogTruncatedMarker+string(jobLogSegmentHeader(1))) + len(numberedLine(10))
+	got := make([]byte, firstPart)
+	if _, err := io.ReadFull(log, got); err != nil {
+		t.Fatal(err)
+	}
+	writeChunks(t, w, numberedLines(14, 15), 1<<20) // segment 3 reuses segment 1's file
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rest, err := io.ReadAll(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if whole := string(got) + string(rest); whole != atOpen {
+		t.Fatalf("snapshot mixed generations:\n%s\nwant\n%s", whole, atOpen)
+	}
+}
+
+// The snapshot copies each segment under a shared lock, so a rotation that
+// wants to reuse that segment waits for the copy to finish rather than
+// replacing it mid-copy.
+func TestOpenJobLogHoldsOffRotationWhileCopying(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "job.log")
+	w := openSmallJobLog(t, path, 10<<10, 2560)
+	writeChunks(t, w, numberedLines(1, 13), 1<<20)
+	atOpen := readWholeJobLog(t, path)
+	rotated := make(chan error, 1)
+	var once sync.Once
+	jobLogSegmentLocked = func() {
+		once.Do(func() {
+			go func() {
+				_, err := w.Write([]byte(numberedLines(14, 15))) // reuses segment 1, being copied now
+				rotated <- err
+			}()
+			select {
+			case err := <-rotated:
+				t.Errorf("the writer reused a segment while it was being copied (err %v)", err)
+				rotated <- err
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
+	}
+	t.Cleanup(func() { jobLogSegmentLocked = nil })
+	log, err := OpenJobLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	jobLogSegmentLocked = nil
+	if err := <-rotated; err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	whole, err := io.ReadAll(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(whole) != atOpen {
+		t.Fatalf("snapshot =\n%s\nwant\n%s", whole, atOpen)
+	}
+}
+
+// A follower whose consumer stalls must not hold up the writer: it holds a
+// segment's lock only while copying it, so the writer can rotate through the
+// very segment the stalled follower is in.
+func TestStalledFollowerDoesNotBlockTheWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "job.log")
+	w := openSmallJobLog(t, path, 10<<10, 2560)
+	writeChunks(t, w, numberedLines(1, 11), 1<<20) // segment 1 (tail.0): 10-11
+	stalled, release := make(chan struct{}), make(chan struct{})
+	var settled atomic.Bool
+	followed := make(chan error, 1)
+	go func() {
+		followed <- Follow(context.Background(), path, FollowOptions{PollInterval: time.Millisecond, Settled: func(context.Context) (bool, error) { return settled.Load(), nil }}, func(line string) error {
+			if strings.HasPrefix(line, "line-10 ") {
+				close(stalled)
+				<-release
+			}
+			return nil
+		})
+	}()
+	<-stalled
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := w.Write([]byte(numberedLines(12, 17))) // segments 2, 3 (reusing tail.0) and 4
+		wrote <- err
+	}()
+	select {
+	case err := <-wrote:
+		if err != nil {
 			t.Fatal(err)
 		}
-		want := line[:JobLogMaxLineBytes] + fmt.Sprintf("…[%d bytes truncated]\n", len(line)-JobLogMaxLineBytes)
-		if got := readJobLog(t, path); got != want {
-			t.Fatalf("%s: log ends %q, want %q", name, got[max(0, len(got)-60):], want[len(want)-60:])
-		}
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("the writer is blocked by a stalled follower")
+	}
+	settled.Store(true)
+	close(release)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-followed; err != nil {
+		t.Fatal(err)
 	}
 }
 

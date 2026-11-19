@@ -13,95 +13,210 @@ import (
 // 110 bytes, and a cut id would no longer pair a tool call with its result.
 var jobLogStringKeeps = [...]int{64 << 10, 16 << 10, 4 << 10, 1 << 10, 256}
 
+// jobLogArrayKeeps are how many elements shortenJSONLine keeps at EACH end of
+// a long array, after first trying no array cut at all (-1). 0 replaces a
+// whole array with its one marker element, which still keeps every scalar and
+// key outside arrays at every depth - a tool result's isError and
+// details.exitCode among them.
+var jobLogArrayKeeps = [...]int{-1, 64, 16, 4, 1, 0}
+
+// jsonNode is one decoded JSON value. Objects keep their key order, so omp's
+// "type" stays first: readers classify a line by its first key without
+// decoding it. A number, boolean or null is kept as its literal text.
+type jsonNode struct {
+	kind byte // '{', '[', '"' or 0 for a literal
+	text string
+	keys []string
+	vals []*jsonNode
+}
+
 // shortenJSONLine turns an over-long JSON object line into a valid one of at
-// most limit bytes by shortening its long string VALUES, keeping each one's
-// head and a "…[N bytes truncated]" suffix inside the string. Everything else
-// is kept: the key order (omp's "type" stays first, which is how readers
-// classify a line without decoding it), every key, number, boolean and null.
-// So a tool event keeps its type, ids, tool name, argument keys and status.
-// It reports false when the line is not exactly one JSON object, or when even
-// the shortest keep leaves it over the limit.
+// most limit bytes. It shortens, in order of preference, long string values
+// (keeping each one's head and a "…[N bytes truncated]" suffix inside the
+// string), then long arrays (keeping their first and last elements around one
+// marker element), and keeps every key and every scalar outside a cut array.
+// When nothing else fits, the line becomes an envelope: the top-level scalars
+// plus "gitmoot_truncated":true. So a line that decodes is never cut into
+// invalid JSON. It reports false only when the line is not exactly one JSON
+// object.
 func shortenJSONLine(line []byte, limit int) ([]byte, bool) {
-	for _, keep := range jobLogStringKeeps {
-		out, err := shortenJSONStrings(line, keep)
-		if err != nil {
-			return nil, false
-		}
-		if len(out) <= limit {
-			return out, true
+	root, err := decodeJSONTree(line)
+	if err != nil || root.kind != '{' {
+		return nil, false
+	}
+	s := jsonShortener{limit: limit}
+	for _, arrayKeep := range jobLogArrayKeeps {
+		for _, keep := range jobLogStringKeeps {
+			s.keep, s.arrayKeep = keep, arrayKeep
+			if out, ok := s.encode(root); ok {
+				return out, true
+			}
 		}
 	}
-	return nil, false
+	return s.envelope(root), true
 }
 
-type jsonFrame struct {
-	object bool
-	items  int // tokens written in this container: keys and values alike
-}
-
-// shortenJSONStrings re-encodes one JSON object token by token, so key order
-// and layout survive, with every string value longer than keep shortened.
-func shortenJSONStrings(line []byte, keep int) ([]byte, error) {
+func decodeJSONTree(line []byte) (*jsonNode, error) {
 	dec := json.NewDecoder(bytes.NewReader(line))
 	dec.UseNumber()
-	out := bytes.NewBuffer(make([]byte, 0, JobLogMaxLineBytes))
-	enc := json.NewEncoder(out)
-	enc.SetEscapeHTML(false)
-	var stack []jsonFrame
-	started := false
-	for {
-		tok, err := dec.Token()
-		if errors.Is(err, io.EOF) {
-			if !started || len(stack) != 0 {
-				return nil, io.ErrUnexpectedEOF
+	root, err := decodeJSONValue(dec)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("job log line is not one JSON value")
+	}
+	return root, nil
+}
+
+func decodeJSONValue(dec *json.Decoder) (*jsonNode, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	switch v := tok.(type) {
+	case json.Delim:
+		node := &jsonNode{kind: byte(v)}
+		for dec.More() {
+			if node.kind == '{' {
+				key, err := dec.Token()
+				if err != nil {
+					return nil, err
+				}
+				node.keys = append(node.keys, key.(string))
 			}
-			return out.Bytes(), nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		if len(stack) == 0 {
-			if started || tok != json.Delim('{') {
-				return nil, errors.New("job log line is not one JSON object")
-			}
-			started = true
-		}
-		isKey := false
-		if closing := tok == json.Delim('}') || tok == json.Delim(']'); !closing && len(stack) > 0 {
-			top := &stack[len(stack)-1]
-			switch {
-			case top.object && top.items%2 == 1:
-				out.WriteByte(':')
-			case top.items > 0:
-				out.WriteByte(',')
-			}
-			isKey = top.object && top.items%2 == 0
-			top.items++
-		}
-		switch v := tok.(type) {
-		case json.Delim:
-			out.WriteByte(byte(v))
-			switch v {
-			case '{', '[':
-				stack = append(stack, jsonFrame{object: v == '{'})
-			default:
-				stack = stack[:len(stack)-1]
-			}
-		case string:
-			if !isKey && len(v) > keep {
-				head := v[:utf8HeadLen([]byte(v[:keep]))]
-				v = head + "…[" + strconv.Itoa(len(v)-len(head)) + " bytes truncated]"
-			}
-			if err := enc.Encode(v); err != nil {
+			val, err := decodeJSONValue(dec)
+			if err != nil {
 				return nil, err
 			}
-			out.Truncate(out.Len() - 1) // Encode ends every value with a newline
-		case json.Number:
-			out.WriteString(v.String())
-		case bool:
-			out.WriteString(strconv.FormatBool(v))
-		case nil:
-			out.WriteString("null")
+			node.vals = append(node.vals, val)
+		}
+		if _, err := dec.Token(); err != nil { // the closing delimiter
+			return nil, err
+		}
+		return node, nil
+	case string:
+		return &jsonNode{kind: '"', text: v}, nil
+	case json.Number:
+		return &jsonNode{text: v.String()}, nil
+	case bool:
+		return &jsonNode{text: strconv.FormatBool(v)}, nil
+	case nil:
+		return &jsonNode{text: "null"}, nil
+	default:
+		return nil, errors.New("unexpected JSON token")
+	}
+}
+
+// jsonShortener encodes a tree under one setting. It gives up as soon as the
+// output passes limit, so trying a setting that does not fit costs at most
+// limit bytes of encoding however large the tree is.
+type jsonShortener struct {
+	limit     int
+	keep      int
+	arrayKeep int
+	out       []byte
+	scratch   bytes.Buffer
+	enc       *json.Encoder
+}
+
+func (s *jsonShortener) encode(root *jsonNode) ([]byte, bool) {
+	s.out = s.out[:0]
+	if !s.value(root) {
+		return nil, false
+	}
+	return s.out, true
+}
+
+func (s *jsonShortener) value(n *jsonNode) bool {
+	switch n.kind {
+	case '{':
+		s.out = append(s.out, '{')
+		for i, key := range n.keys {
+			if i > 0 {
+				s.out = append(s.out, ',')
+			}
+			s.out = s.appendString(s.out, key)
+			s.out = append(s.out, ':')
+			if !s.value(n.vals[i]) {
+				return false
+			}
+		}
+		s.out = append(s.out, '}')
+	case '[':
+		s.out = append(s.out, '[')
+		vals := n.vals
+		if s.arrayKeep >= 0 && len(vals) > 2*s.arrayKeep {
+			head, tail := vals[:s.arrayKeep], vals[len(vals)-s.arrayKeep:]
+			vals = append(append(append([]*jsonNode{}, head...), arrayMarker(vals[s.arrayKeep:len(vals)-s.arrayKeep])), tail...)
+		}
+		for i, val := range vals {
+			if i > 0 {
+				s.out = append(s.out, ',')
+			}
+			if !s.value(val) {
+				return false
+			}
+		}
+		s.out = append(s.out, ']')
+	case '"':
+		s.out = s.appendString(s.out, shortenJSONString(n.text, s.keep))
+	default:
+		s.out = append(s.out, n.text...)
+	}
+	return len(s.out) <= s.limit
+}
+
+// arrayMarker stands in for the elements an array cut drops. It has the SAME
+// kind as them when they are all objects: a consumer decoding the array into a
+// slice of structs (omp's result.content is one) fails on a string element,
+// and the whole event with it, while an object with an unknown key decodes as
+// an empty element.
+func arrayMarker(dropped []*jsonNode) *jsonNode {
+	text := "…[" + strconv.Itoa(len(dropped)) + " elements truncated]"
+	for _, n := range dropped {
+		if n.kind != '{' {
+			return &jsonNode{kind: '"', text: text}
 		}
 	}
+	return &jsonNode{kind: '{', keys: []string{"gitmoot_truncated"}, vals: []*jsonNode{{kind: '"', text: text}}}
+}
+
+func shortenJSONString(v string, keep int) string {
+	if len(v) <= keep {
+		return v
+	}
+	head := v[:utf8HeadLen([]byte(v[:keep]))]
+	return head + "…[" + strconv.Itoa(len(v)-len(head)) + " bytes truncated]"
+}
+
+// envelope is the last resort: the top-level scalars, in order, with strings
+// at the shortest keep, and "gitmoot_truncated":true. Scalars are dropped from
+// the end until it fits, so even an object of a million keys yields a valid
+// line that still opens with its type.
+func (s *jsonShortener) envelope(root *jsonNode) []byte {
+	var keys []string
+	var vals []*jsonNode
+	for i, val := range root.vals {
+		if val.kind != '{' && val.kind != '[' {
+			keys, vals = append(keys, root.keys[i]), append(vals, val)
+		}
+	}
+	s.keep, s.arrayKeep = jobLogStringKeeps[len(jobLogStringKeeps)-1], 0
+	for n := len(keys); ; n-- {
+		node := &jsonNode{kind: '{', keys: append(keys[:n:n], "gitmoot_truncated"), vals: append(vals[:n:n], &jsonNode{text: "true"})}
+		if out, ok := s.encode(node); ok || n == 0 {
+			return out
+		}
+	}
+}
+
+func (s *jsonShortener) appendString(dst []byte, v string) []byte {
+	if s.enc == nil {
+		s.enc = json.NewEncoder(&s.scratch)
+		s.enc.SetEscapeHTML(false)
+	}
+	s.scratch.Reset()
+	_ = s.enc.Encode(v) // a Go string always encodes
+	return append(dst, bytes.TrimSuffix(s.scratch.Bytes(), []byte("\n"))...)
 }
