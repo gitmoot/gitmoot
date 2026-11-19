@@ -659,13 +659,20 @@ func (c Client) RemoteDefaultBranch(ctx context.Context) (string, error) {
 
 // OriginRemoteConfigured returns the literal configured origin URL without Git's
 // url.*.insteadOf rewrite. A disposable clone must preserve the forge-facing URL
-// in its own config even when the source checkout rewrites transport locally.
+// in its own config even when the source checkout rewrites transport locally,
+// and a checkout's identity is that forge-facing URL.
+//
+// A remote may carry several url entries (directly or through includeIf), and
+// Git fetches from the FIRST in configuration order. `git config --get` returns
+// the LAST, so it would name a different repository than the one origin fetches.
+// `--get-all` lists them in order, with includes expanded in place.
 func (c Client) OriginRemoteConfigured(ctx context.Context) (string, error) {
-	result, err := c.run(ctx, "config", "--get", "remote.origin.url")
+	result, err := c.run(ctx, "config", "--get-all", "remote.origin.url")
 	if err != nil {
 		return "", err
 	}
-	remote := strings.TrimSpace(result.Stdout)
+	first, _, _ := strings.Cut(strings.TrimLeft(result.Stdout, "\r\n"), "\n")
+	remote := strings.TrimSpace(first)
 	if remote == "" {
 		return "", errors.New("origin remote is empty")
 	}
