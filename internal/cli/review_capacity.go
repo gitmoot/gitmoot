@@ -351,9 +351,13 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 const reviewCapacityCancelLockWait = 2 * time.Minute
 
 func cancelMonitoredReview(store *db.Store, jobID string, generation int64, reason string, stopRuntime func()) error {
-	// Only after the whole wait failed is the runtime stopped without a
-	// committed cancel: capacity evidence is fail-closed, and the error is
-	// recorded beside the cancel request.
+	// The runtime is stopped only after the cancel is committed (or failed):
+	// a stopped runtime makes the worker record the run failed at once, and
+	// the shared lifecycle lock held here does not hold that write back, so
+	// stopping first let "failed" win the race and CancelJob then refused the
+	// finished job (#2676). Only after the whole wait failed is the runtime
+	// stopped without a committed cancel: capacity evidence is fail-closed,
+	// and the error is recorded beside the cancel request.
 	defer stopRuntime()
 	ctx, cancel := context.WithTimeout(context.Background(), reviewCapacityCancelLockWait)
 	defer cancel()
@@ -371,9 +375,8 @@ func cancelMonitoredReview(store *db.Store, jobID string, generation int64, reas
 	}
 	switch job.State {
 	case string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked):
-		// Prevent the stopped worker from recording failure before cancellation
-		// is committed. The lifecycle lock also fences any successor attempt.
-		stopRuntime()
+		// The runtime is still running; the deferred stopRuntime stops it
+		// once the cancel is committed.
 		// Name the cause on the job itself: a bare "cancel requested" reads as a
 		// person cancelling it.
 		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: reviewCapacityCancelledEventKind, Message: "review capacity monitor cancelled this run: " + reason})

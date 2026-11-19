@@ -89,6 +89,28 @@ func (g *Gateway) EnableRemote(options RemoteListenerOptions) error {
 	if err != nil {
 		return fmt.Errorf("listen for remote credential gateway: %w", err)
 	}
+	return g.serveRemote(listener, configuredOptions)
+}
+
+// ServeRemote is EnableRemote on a listener the caller already bound, so an
+// ephemeral port is never released between choosing it and serving on it.
+// options.ListenAddress must be the address that later RemoteGateway calls
+// request (the listener's own address), so they reuse this listener. The
+// gateway owns the listener from here on, including when this returns an error.
+func (g *Gateway) ServeRemote(listener net.Listener, options RemoteListenerOptions) error {
+	if g == nil {
+		_ = listener.Close()
+		return errors.New("credential gateway is not running")
+	}
+	configuredOptions := normalizedRemoteListenerOptions(options)
+	if configuredOptions.ListenAddress == "" {
+		_ = listener.Close()
+		return errors.New("remote credential gateway listen address is required")
+	}
+	return g.serveRemote(listener, configuredOptions)
+}
+
+func (g *Gateway) serveRemote(listener net.Listener, configuredOptions RemoteListenerOptions) error {
 	origins, err := remoteAdvertiseOrigins(configuredOptions.AdvertiseURLs, listener.Addr())
 	if err != nil {
 		_ = listener.Close()
