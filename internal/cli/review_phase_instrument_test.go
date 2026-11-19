@@ -915,13 +915,16 @@ func TestPhaseInstrumentCapsAnUnterminatedLine(t *testing.T) {
 	if profile.DroppedBytes <= 0 {
 		t.Fatalf("dropped_bytes = %d, want the discarded fragment recorded (%+v)", profile.DroppedBytes, profile)
 	}
-	// The transcript itself must still hold every byte.
+	// The parser's cap must not decide what the transcript keeps: the log
+	// holds what its OWN line cap keeps (#2686), the line's head and the
+	// count of bytes cut, not what the parser discarded.
 	onDisk, err := os.ReadFile(filepath.Join(paths.Logs, "jobs", "flood.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(onDisk) != 24*64*1024 {
-		t.Fatalf("transcript holds %d bytes, want %d - capping the PARSER must never drop a retained byte", len(onDisk), 24*64*1024)
+	want := strings.Repeat("x", transcript.JobLogMaxLineBytes) + fmt.Sprintf("…[%d bytes truncated]", 24*64*1024-transcript.JobLogMaxLineBytes)
+	if string(onDisk) != want {
+		t.Fatalf("transcript holds %d bytes, want the %d-byte line-capped head - the parser's cap must not change what the log keeps", len(onDisk), len(want))
 	}
 }
 

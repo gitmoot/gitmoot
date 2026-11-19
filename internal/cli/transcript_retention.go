@@ -59,16 +59,13 @@ func openRetainedTranscriptLog(home, jobID, jobType, runtimeName string, attempt
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return nil, err
 	}
-	path := transcript.JobLogPath(paths.Logs, jobID)
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// Every runtime's log is bounded (#2686); only omp's `--mode=json` stream
+	// has streaming update events to drop.
+	log, err := transcript.OpenJobLogWriter(transcript.JobLogPath(paths.Logs, jobID), strings.TrimSpace(runtimeName) == runtime.OmpRuntime)
 	if err != nil {
 		return nil, err
 	}
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	return newRetainedTranscript(file, jobID, jobType, runtimeName, attempt, store), nil
+	return newRetainedTranscript(log, jobID, jobType, runtimeName, attempt, store), nil
 }
 
 // appendDeliveryAdapterOutput adds a writer at the existing runner base instead
@@ -265,20 +262,34 @@ func sweepTranscriptRetention(ctx context.Context, paths config.Paths, store *db
 	files := make([]transcriptRetentionFile, 0, len(entries))
 	var total int64
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
+		if entry.IsDir() {
 			continue
 		}
-		info, err := entry.Info()
+		if head, ok := jobLogTailHead(entry.Name()); ok {
+			// A tail segment goes with its log. One whose log is gone (a
+			// removal that failed half way) is unreadable, so it goes now.
+			if _, err := os.Lstat(filepath.Join(dir, head)); errors.Is(err, os.ErrNotExist) {
+				if err := remove(filepath.Join(dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+					stats.Errors++
+				}
+			}
+			continue
+		}
+		if !strings.HasSuffix(entry.Name(), ".log") {
+			continue
+		}
+		// The log's size and last write include its tail segments.
+		info, err := transcript.StatJobLog(filepath.Join(dir, entry.Name()))
 		if err != nil {
 			stats.Errors++
 			continue
 		}
 		stats.Scanned++
-		total += info.Size()
-		file := transcriptRetentionFile{path: filepath.Join(dir, entry.Name()), size: info.Size(), oldest: info.ModTime()}
+		total += info.Size
+		file := transcriptRetentionFile{path: filepath.Join(dir, entry.Name()), size: info.Size, oldest: info.ModTime}
 		refs := byName[entry.Name()]
 		if len(refs) == 0 {
-			file.expired = !info.ModTime().After(now.Add(-cfg.Retain))
+			file.expired = !info.ModTime.After(now.Add(-cfg.Retain))
 			file.eligible = file.expired
 			files = append(files, file)
 			continue
@@ -333,13 +344,24 @@ func sweepTranscriptRetention(ctx context.Context, paths config.Paths, store *db
 		if !selected[file.path] {
 			continue
 		}
-		if err := remove(file.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := transcript.RemoveJobLog(file.path, remove); err != nil && !errors.Is(err, os.ErrNotExist) {
 			stats.Errors++
 			continue
 		}
 		stats.Removed++
 	}
 	return stats, nil
+}
+
+// jobLogTailHead returns the name of the log a tail segment file belongs to.
+func jobLogTailHead(name string) (string, bool) {
+	for i := range 2 {
+		suffix := transcript.JobLogTailPaths("")[i]
+		if head, ok := strings.CutSuffix(name, suffix); ok && strings.HasSuffix(head, ".log") {
+			return head, true
+		}
+	}
+	return "", false
 }
 
 func parseTranscriptStoreTime(value string) time.Time {

@@ -1013,12 +1013,12 @@ func transcriptExportMetadata(job db.Job, payload workflow.JobPayload, runtimeNa
 }
 
 func readTranscriptEvents(path string, translator transcript.Translator) ([]transcript.Event, error) {
-	file, err := os.Open(path)
+	log, err := transcript.OpenJobLog(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
-	return transcript.ReadSnapshotEvents(file, translator)
+	defer log.Close()
+	return transcript.ReadSnapshotEvents(log, translator)
 }
 
 func writeTranscriptExport(path string, render func(io.Writer) error) error {

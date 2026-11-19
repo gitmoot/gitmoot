@@ -130,6 +130,52 @@ func TestTranscriptRetentionCapOldestSettledAndENOENT(t *testing.T) {
 	}
 }
 
+// A job log's tail segments are part of it (#2708): they count toward the
+// total the sweep bounds, they go when their log goes, and one whose log is
+// already gone goes too.
+func TestTranscriptRetentionCountsAndRemovesTailSegments(t *testing.T) {
+	_, paths, store := transcriptRetentionTestStore(t, 10)
+	createTranscriptRetentionJob(t, store, "old", string(workflow.JobSucceeded))
+	createTranscriptRetentionJob(t, store, "new", string(workflow.JobFailed))
+	oldPath := writeRetentionLog(t, paths, "old", "1")
+	newPath := writeRetentionLog(t, paths, "new", "2")
+	oldTails := transcript.JobLogTailPaths(oldPath)
+	for _, tail := range oldTails {
+		if err := os.WriteFile(tail, []byte(strings.Repeat("t", 20)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orphan := transcript.JobLogTailPaths(filepath.Join(filepath.Dir(oldPath), "gone.log"))[1]
+	if err := os.WriteFile(orphan, []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Exec(`UPDATE jobs SET updated_at = '2020-01-01 00:00:00' WHERE id = 'old'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(`UPDATE jobs SET updated_at = '2020-01-02 00:00:00' WHERE id = 'new'`); err != nil {
+		t.Fatal(err)
+	}
+	// The heads alone are 2 bytes, under the 10-byte bound; with old's tail
+	// segments the logs are 42.
+	stats, err := sweepTranscriptRetention(context.Background(), paths, store, time.Date(2020, 1, 2, 1, 0, 0, 0, time.UTC), os.Remove)
+	if err != nil || stats.Removed != 1 || stats.Errors != 0 {
+		t.Fatalf("sweep = %+v, err=%v; want old's log evicted", stats, err)
+	}
+	for _, gone := range []string{oldPath, oldTails[0], oldTails[1], orphan} {
+		if _, err := os.Stat(gone); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s survived the sweep: %v", gone, err)
+		}
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("newer log evicted: %v", err)
+	}
+}
+
 func TestTranscriptRetentionOrphansAndSweepLimit(t *testing.T) {
 	_, paths, store := transcriptRetentionTestStore(t, 1<<30)
 	dir := filepath.Join(paths.Logs, "jobs")
