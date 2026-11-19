@@ -117,14 +117,89 @@ func procEntryIsKernelThread(procEntry string) (bool, error) {
 	return flags&linuxPFKThread != 0, nil
 }
 
-func scanWorktreeLiveness(path string, procRoot string, requireEveryCWD bool) (live bool, known bool) {
+// worktreeLivenessTarget normalizes a probe path. ok=false means the empty path,
+// which is trivially (live=false, known=true).
+func worktreeLivenessTarget(path string) (abs string, ok bool) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return false, true
+		return "", false
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		abs = path
+	}
+	return abs, true
+}
+
+// normalizeProcCWD trims a /proc/<pid>/cwd link target, including the
+// " (deleted)" suffix the kernel appends for a removed directory.
+func normalizeProcCWD(cwd string) string {
+	return strings.TrimSuffix(strings.TrimSpace(cwd), " (deleted)")
+}
+
+// cwdWithin reports whether a normalized cwd is abs itself or a path under it.
+// A sibling sharing the prefix (/x/wt2 for /x/wt) does not match.
+func cwdWithin(cwd, abs string) bool {
+	return cwd == abs || strings.HasPrefix(cwd, abs+string(os.PathSeparator))
+}
+
+// procPIDEntry reports whether a /proc entry is a process other than our own.
+// Our own process is skipped: its cwd is never the worktree (the daemon runs from
+// the home/checkout), but guard regardless so a test driving cleanup from a
+// worktree cwd cannot self-trip.
+func procPIDEntry(name string, self int) bool {
+	if len(name) == 0 || name[0] < '0' || name[0] > '9' {
+		return false
+	}
+	pid, err := strconv.Atoi(name)
+	return err != nil || pid != self
+}
+
+// SnapshotWorktreeLiveness reads every process cwd under /proc once and returns
+// a probe with WorktreeLiveness's best-effort (live, known) contract, so a
+// caller probing many worktrees (run list) pays one /proc scan instead of one
+// per path. The snapshot is a point-in-time view.
+func SnapshotWorktreeLiveness() func(path string) (live bool, known bool) {
+	return snapshotWorktreeLiveness("/proc")
+}
+
+func snapshotWorktreeLiveness(procRoot string) func(path string) (live bool, known bool) {
+	entries, err := os.ReadDir(procRoot)
+	known := err == nil
+	self := os.Getpid()
+	cwds := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if !procPIDEntry(name, self) {
+			continue
+		}
+		cwd, err := os.Readlink(filepath.Join(procRoot, name, "cwd"))
+		if err != nil {
+			continue
+		}
+		cwds = append(cwds, normalizeProcCWD(cwd))
+	}
+	return func(path string) (bool, bool) {
+		abs, ok := worktreeLivenessTarget(path)
+		if !ok {
+			return false, true
+		}
+		if !known {
+			return false, false
+		}
+		for _, cwd := range cwds {
+			if cwdWithin(cwd, abs) {
+				return true, true
+			}
+		}
+		return false, true
+	}
+}
+
+func scanWorktreeLiveness(path string, procRoot string, requireEveryCWD bool) (live bool, known bool) {
+	abs, ok := worktreeLivenessTarget(path)
+	if !ok {
+		return false, true
 	}
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
@@ -134,13 +209,7 @@ func scanWorktreeLiveness(path string, procRoot string, requireEveryCWD bool) (l
 	conclusive := true
 	for _, entry := range entries {
 		name := entry.Name()
-		if len(name) == 0 || name[0] < '0' || name[0] > '9' {
-			continue
-		}
-		// Skip our own process: its cwd is never the worktree (the daemon runs from
-		// the home/checkout), but guard regardless so a test driving cleanup from a
-		// worktree cwd cannot self-trip.
-		if pid, perr := strconv.Atoi(name); perr == nil && pid == self {
+		if !procPIDEntry(name, self) {
 			continue
 		}
 		cwd, err := os.Readlink(filepath.Join(procRoot, name, "cwd"))
@@ -162,8 +231,7 @@ func scanWorktreeLiveness(path string, procRoot string, requireEveryCWD bool) (l
 			}
 			continue
 		}
-		cwd = strings.TrimSuffix(strings.TrimSpace(cwd), " (deleted)")
-		if cwd == abs || strings.HasPrefix(cwd, abs+string(os.PathSeparator)) {
+		if cwdWithin(normalizeProcCWD(cwd), abs) {
 			return true, true
 		}
 	}
