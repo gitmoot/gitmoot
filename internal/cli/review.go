@@ -325,17 +325,9 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	}
 	opts.purpose = strings.ToLower(strings.TrimSpace(opts.purpose))
 	opts.role = strings.ToLower(strings.TrimSpace(opts.role))
-	// On a hub client the hub resolves the role ([client] role, or the
-	// machine's only hub role); the local pane and org lookups do not apply.
-	if !hubClientHome(opts.home) {
-		if !resolveAgentOrgRole(&opts.role, opts.home, "review request", stderr) {
-			return 2
-		}
-		if opts.role == "" {
-			fmt.Fprintln(stderr, "review request: set --role or GITMOOT_ORG_ROLE, or run from a registered seat's pane; the verdict is delivered to that organization role")
-			return 2
-		}
-	}
+	// A hub client is routed first: the hub resolves the role ([client] role,
+	// or the machine's only hub role), so the local pane and org lookups below
+	// apply only to a local request.
 	var output reviewRequestOutput
 	handled, code := withHubClient(opts.home, opts.role, "review request", stderr, func(ctx context.Context, client *hubclient.Client, role string) error {
 		// Refuse what the hub does not take rather than drop it silently.
@@ -375,6 +367,13 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 		return code
 	}
 	if !handled {
+		if !resolveAgentOrgRole(&opts.role, opts.home, "review request", stderr) {
+			return 2
+		}
+		if opts.role == "" {
+			fmt.Fprintln(stderr, "review request: set --role or GITMOOT_ORG_ROLE, or run from a registered seat's pane; the verdict is delivered to that organization role")
+			return 2
+		}
 		err := withStore(opts.home, func(store *db.Store) error {
 			var err error
 			output, err = requestReview(context.Background(), store, opts, stderr)
