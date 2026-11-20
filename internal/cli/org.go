@@ -1272,7 +1272,9 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
-	if fs.NArg() != 0 || strings.TrimSpace(*roleName) == "" {
+	// On a hub client the role may come from [client] role or the machine's
+	// only hub role, so --role is required only locally.
+	if fs.NArg() != 0 || (strings.TrimSpace(*roleName) == "" && !hubClientHome(*home)) {
 		fmt.Fprintln(stderr, "org brief requires --role NAME")
 		return 2
 	}

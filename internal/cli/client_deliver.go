@@ -112,17 +112,22 @@ func clientDeliverOnce(ctx context.Context, client *hubclient.Client, notifier c
 	if len(claim.Claimed) == 0 {
 		return nil
 	}
-	finish := func(ids []int64, outcome, reason string) error {
+	// Every finish names the attempt its claim returned, so a late or
+	// replayed outcome cannot change a newer attempt of the same message.
+	finish := func(item hubOMPClaimed, outcome, reason string) error {
 		return client.Do(ctx, http.MethodPost, "/v1/notifications/omp/finish", role,
-			map[string]any{"ids": ids, "outcome": outcome, "reason": reason}, nil)
+			map[string]any{"id": item.ID, "attempt": item.Attempt, "outcome": outcome, "reason": reason}, nil)
 	}
 	target, found := notifier.ResolveNotificationTarget(ctx, "agent:"+cfg.Agent)
 	if !found {
-		ids := make([]int64, len(claim.Claimed))
-		for index, item := range claim.Claimed {
-			ids[index] = item.ID
+		// Nothing reached omp: every claimed row goes back to pending.
+		var firstErr error
+		for _, item := range claim.Claimed {
+			if err := finish(item, "deferred", fmt.Sprintf("local omp agent %q not found on this machine", cfg.Agent)); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-		return finish(ids, "deferred", fmt.Sprintf("local omp agent %q not found on this machine", cfg.Agent))
+		return firstErr
 	}
 	var firstErr error
 	for _, item := range claim.Claimed {
@@ -132,12 +137,12 @@ func clientDeliverOnce(ctx context.Context, client *hubclient.Client, notifier c
 		var deferred *cockpit.NotificationDeferred
 		switch {
 		case delivered:
-			err = finish([]int64{item.ID}, "delivered", "")
+			err = finish(item, "delivered", "")
 			if err == nil {
 				fmt.Fprintf(stdout, "delivered message %d\n", item.MessageID)
 			}
 		case errors.As(err, &deferred):
-			err = finish([]int64{item.ID}, "deferred", deferred.Reason)
+			err = finish(item, "deferred", deferred.Reason)
 		default:
 			// Unknown receipt (uncertain, or any other error): the row stays
 			// attempted on the hub and is never resent automatically.

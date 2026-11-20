@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -165,5 +166,32 @@ func TestClientDeliverOnceReportsTheAddOnsOutcome(t *testing.T) {
 	}
 	if err := clientDeliverOnce(context.Background(), client, admitting, cfg, &out); err != nil || len(admitting.prompts) != 1 {
 		t.Fatalf("an unknown-outcome message was resent: %d prompts, %v", len(admitting.prompts), err)
+	}
+}
+
+// A client takes its role from the hub (the machine's only role) when no
+// local role signal exists: the turn hook, org brief and review request all
+// reach the hub instead of refusing locally (#2717 review).
+func TestClientRoleDefaultsReachTheHub(t *testing.T) {
+	t.Setenv("GITMOOT_ORG_ROLE", "")
+	t.Setenv("HERDR_PANE_ID", "")
+	hubHome := messageTestHome(t)
+	sendTestMessage(t, hubHome, "gm-omp-nag", "deimos", "Mail for the remote seat.")
+	clientHome, _ := clientTestHome(t, hubHome, "mac", "deimos", "")
+
+	code, out, diag := runCLI(t, "org", "brief", "--home", clientHome, "--json")
+	if code != 0 || !strings.Contains(out, `"deimos"`) {
+		t.Fatalf("org brief without --role: exit=%d out=%s diag=%s", code, out, diag)
+	}
+	output, err := claimTurnHookNotifications(turnHookRequest{runtime: "claude", event: "UserPromptSubmit", home: clientHome}, turnHookStdin{}, nil, io.Discard)
+	if err != nil || output == nil || output.HookSpecificOutput == nil || !strings.Contains(output.HookSpecificOutput.AdditionalContext, "Mail for the remote seat.") {
+		t.Fatalf("hook without a local role: %+v %v", output, err)
+	}
+	// No --role and no --head: the request reaches the hub (which then needs
+	// GitHub to resolve the head) instead of a local refusal or a 400 on the
+	// missing head.
+	code, _, diag = runCLI(t, "review", "request", "--repo", "gitmoot/implementation", "--pr", "7", "--home", clientHome)
+	if code == 0 || strings.Contains(diag, "set --role") || strings.Contains(diag, "40-character") || !strings.Contains(diag, "hub:") {
+		t.Fatalf("review request without --role/--head: exit=%d %s", code, diag)
 	}
 }

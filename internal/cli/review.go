@@ -325,12 +325,16 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	}
 	opts.purpose = strings.ToLower(strings.TrimSpace(opts.purpose))
 	opts.role = strings.ToLower(strings.TrimSpace(opts.role))
-	if !resolveAgentOrgRole(&opts.role, opts.home, "review request", stderr) {
-		return 2
-	}
-	if opts.role == "" {
-		fmt.Fprintln(stderr, "review request: set --role or GITMOOT_ORG_ROLE, or run from a registered seat's pane; the verdict is delivered to that organization role")
-		return 2
+	// On a hub client the hub resolves the role ([client] role, or the
+	// machine's only hub role); the local pane and org lookups do not apply.
+	if !hubClientHome(opts.home) {
+		if !resolveAgentOrgRole(&opts.role, opts.home, "review request", stderr) {
+			return 2
+		}
+		if opts.role == "" {
+			fmt.Fprintln(stderr, "review request: set --role or GITMOOT_ORG_ROLE, or run from a registered seat's pane; the verdict is delivered to that organization role")
+			return 2
+		}
 	}
 	var output reviewRequestOutput
 	handled, code := withHubClient(opts.home, opts.role, "review request", stderr, func(ctx context.Context, client *hubclient.Client, role string) error {

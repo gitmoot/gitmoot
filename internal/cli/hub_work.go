@@ -112,8 +112,11 @@ func registerHubWorkEndpoints(handle func(string, hubHandler), home string, stor
 			return http.StatusBadRequest, nil, errors.New("repo OWNER/REPO and pr > 0 are required")
 		}
 		head := strings.ToLower(strings.TrimSpace(input.HeadSHA))
-		if !hubFullSHA.MatchString(head) {
-			return http.StatusBadRequest, nil, errors.New("head_sha must be the full 40-character commit SHA")
+		// Empty means the pull request's current head, as with a local
+		// request without --head; requestReview resolves it. A head that is
+		// given must be complete, never a prefix.
+		if head != "" && !hubFullSHA.MatchString(head) {
+			return http.StatusBadRequest, nil, errors.New("head_sha, when given, must be the full 40-character commit SHA")
 		}
 		// requestReview validates the purpose against the review router's
 		// settings, the same check a local request gets; no second list here.

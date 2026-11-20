@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -194,15 +195,17 @@ func claimTurnHookNotifications(request turnHookRequest, input turnHookStdin, in
 		// claimed into a continuation the runtime's cap would override.
 		return nil, nil
 	}
+	// On a hub client the seat's mail lives on the hub (#2710). Checked
+	// before the local-seat test: a client's role can come from [client] role
+	// or the machine's only hub role, with no local role signal at all.
+	if handled, output, err := claimTurnHookViaHub(request); handled {
+		return output, err
+	}
 	if strings.TrimSpace(request.role) == "" &&
 		strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")) == "" &&
 		strings.TrimSpace(os.Getenv("HERDR_PANE_ID")) == "" {
 		// Not a fleet seat: nothing to claim and nothing worth logging.
 		return nil, nil
-	}
-	// On a hub client the seat's mail lives on the hub (#2710).
-	if handled, output, err := claimTurnHookViaHub(request); handled {
-		return output, err
 	}
 	start := turnHookNow()
 	paths, err := pathsFromFlag(request.home)
@@ -259,13 +262,15 @@ func claimTurnHookRows(ctx context.Context, store *db.Store, role string, reques
 	now := turnHookNow()
 	// A tool-return hook is inside a working turn. Prompt-submit and Stop
 	// hooks are idle boundaries, so they release mail without a batching wait.
-	eligible, more, err := eligibleInboxRows(ctx, store, role, request.event == turnHookPostToolUse, now, stderr)
-	if err != nil || len(eligible) == 0 {
+	candidates, more, err := eligibleInboxRows(ctx, store, role, request.event == turnHookPostToolUse, now, stderr)
+	if err != nil || len(candidates) == 0 {
 		return nil, false, err
 	}
-	ids := make([]int64, 0, len(eligible))
-	for _, row := range eligible {
-		ids = append(ids, row.ID)
+	eligible := make([]db.WakeOutboxObligation, 0, len(candidates))
+	ids := make([]int64, 0, len(candidates))
+	for _, candidate := range candidates {
+		eligible = append(eligible, candidate.row)
+		ids = append(ids, candidate.row.ID)
 	}
 	receipt := db.WakeOutboxTurnHookReceiptPrefix + request.runtime + ":" + request.event
 	claimedIDs, err := store.ClaimWakeOutboxForTurnHook(ctx, role, ids, receipt, now)
@@ -285,11 +290,19 @@ func claimTurnHookRows(ctx context.Context, store *db.Store, role string, reques
 	return claimed, more, nil
 }
 
+// inboxCandidate is a pending inbox row the routing policy would deliver,
+// with the event and the rule that matched it, resolved once.
+type inboxCandidate struct {
+	row   db.WakeOutboxObligation
+	event events.Event
+	rule  db.EventRule
+}
+
 // eligibleInboxRows returns role's pending inbox rows that the daemon's
 // routing policy would deliver now, at most turnHookMaxItems, and whether more
 // are waiting. Rows that are not mail, are muted, or have no route stay with
 // the daemon. working holds a group back until its coalescing window passes.
-func eligibleInboxRows(ctx context.Context, store *db.Store, role string, working bool, now time.Time, stderr io.Writer) ([]db.WakeOutboxObligation, bool, error) {
+func eligibleInboxRows(ctx context.Context, store *db.Store, role string, working bool, now time.Time, stderr io.Writer) ([]inboxCandidate, bool, error) {
 	obligations, err := store.ListWakeOutboxObligationsForRole(ctx, role, now)
 	if err != nil || len(obligations.Pending) == 0 {
 		return nil, false, err
@@ -298,7 +311,7 @@ func eligibleInboxRows(ctx context.Context, store *db.Store, role string, workin
 	if err != nil {
 		return nil, false, fmt.Errorf("list event rules: %w", err)
 	}
-	eligible := make([]db.WakeOutboxObligation, 0, len(obligations.Pending))
+	eligible := make([]inboxCandidate, 0, len(obligations.Pending))
 	more := false
 	dueGroups := make(map[string]bool)
 	for _, row := range obligations.Pending {
@@ -312,7 +325,8 @@ func eligibleInboxRows(ctx context.Context, store *db.Store, role string, workin
 			fmt.Fprintf(stderr, "message pending: leaving notification %d to the daemon: %v\n", row.ID, err)
 			continue
 		}
-		if len(matchingWakeRules(rules, event)) == 0 {
+		matching := matchingWakeRules(rules, event)
+		if len(matching) == 0 {
 			continue
 		}
 		if working {
@@ -337,7 +351,7 @@ func eligibleInboxRows(ctx context.Context, store *db.Store, role string, workin
 			more = true
 			break
 		}
-		eligible = append(eligible, row)
+		eligible = append(eligible, inboxCandidate{row: row, event: event, rule: matching[0]})
 	}
 	return eligible, more, nil
 }
