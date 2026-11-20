@@ -23,9 +23,6 @@ type hubHandler func(ctx context.Context, caller hub.Caller, org config.OrgConfi
 
 var hubFullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// hubReviewPurposes are the purposes `review request --purpose` documents.
-var hubReviewPurposes = map[string]bool{"code": true, "security": true, "ui": true, "architecture": true}
-
 // registerHubWorkEndpoints adds the endpoints beyond messages (#2710):
 //
 //	GET  /v1/org/brief                    org brief for the caller's role
@@ -118,12 +115,11 @@ func registerHubWorkEndpoints(handle func(string, hubHandler), home string, stor
 		if !hubFullSHA.MatchString(head) {
 			return http.StatusBadRequest, nil, errors.New("head_sha must be the full 40-character commit SHA")
 		}
+		// requestReview validates the purpose against the review router's
+		// settings, the same check a local request gets; no second list here.
 		purpose := strings.ToLower(strings.TrimSpace(input.Purpose))
 		if purpose == "" {
 			purpose = "code"
-		}
-		if !hubReviewPurposes[purpose] {
-			return http.StatusBadRequest, nil, errors.New("purpose must be code, security, ui or architecture")
 		}
 		if status, err := hubRequireScope(org, caller.Role, repo.FullName()); err != nil {
 			return status, nil, err
