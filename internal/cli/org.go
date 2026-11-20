@@ -1272,12 +1272,12 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
-	// On a hub client the role may come from [client] role or the machine's
-	// only hub role, so --role is required only locally.
-	if fs.NArg() != 0 || (strings.TrimSpace(*roleName) == "" && !hubClientHome(*home)) {
+	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "org brief requires --role NAME")
 		return 2
 	}
+	// A hub client is routed first: its role may come from [client] role or
+	// the machine's only hub role, so --role is required only locally.
 	if handled, code := withHubClient(*home, *roleName, "org brief", stderr, func(ctx context.Context, client *hubclient.Client, role string) error {
 		var out orgBriefOutput
 		if err := client.Do(ctx, http.MethodGet, "/v1/org/brief", role, nil, &out); err != nil {
@@ -1290,6 +1290,10 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 		return nil
 	}); handled {
 		return code
+	}
+	if strings.TrimSpace(*roleName) == "" {
+		fmt.Fprintln(stderr, "org brief requires --role NAME")
+		return 2
 	}
 	ctx := context.Background()
 	cfg, presence, store, err := loadOrgCommandState(ctx, *home)

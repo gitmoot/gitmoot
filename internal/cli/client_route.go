@@ -178,19 +178,3 @@ func openOrgDatabase(paths config.Paths) (*db.Store, error) {
 	}
 	return db.Open(paths.Database)
 }
-
-// hubClientHome reports whether home is configured as a hub client. An
-// invalid [client] section also counts, so local-only checks are skipped and
-// the hub call reports the configuration error itself.
-func hubClientHome(home string) bool {
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		return false
-	}
-	cfg, err := config.LoadClientConfig(paths)
-	var unreadable *fs.PathError
-	if errors.As(err, &unreadable) {
-		return false
-	}
-	return err != nil || cfg.Enabled()
-}
