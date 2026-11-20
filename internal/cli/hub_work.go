@@ -29,7 +29,7 @@ var hubReviewPurposes = map[string]bool{"code": true, "security": true, "ui": tr
 // registerHubWorkEndpoints adds the endpoints beyond messages (#2710):
 //
 //	GET  /v1/org/brief                    org brief for the caller's role
-//	GET  /v1/tasks/{ref}?repo=OWNER/REPO  task show
+//	GET  /v1/tasks/{ref}?repo=OWNER/REPO  pr show
 //	POST /v1/reviews/level {"repo","pr"}  review level
 //	POST /v1/reviews {"repo","pr","head_sha","message",...} review request
 //	POST /v1/notifications/claim {"runtime","event"}        turn-hook claim

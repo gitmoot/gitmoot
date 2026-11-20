@@ -68,7 +68,7 @@ same fields as the JSON output of the matching `message` command.
 | `POST /v1/messages` `{"to", "body", "campaign"?}` | `message send TO BODY [--campaign ID]` |
 | `POST /v1/messages/{id}/reply` `{"body"}` | `message reply ID BODY` |
 | `GET /v1/org/brief` | `org brief --role <caller's role>` (presence noted as `org brief (hub: MACHINE)`) |
-| `GET /v1/tasks/{ref}?repo=OWNER/REPO` | `task show REF [--repo]` |
+| `GET /v1/tasks/{ref}?repo=OWNER/REPO` | `pr show REF [--repo]` |
 | `POST /v1/reviews/level` `{"repo", "pr"}` | `review level`; returns `{"decision", "warnings"}` |
 | `POST /v1/reviews` `{"repo", "pr", "head_sha", "message", "purpose"?, "reviewer"?, "model"?, "post_merge"?, "no_execution"?}` | `review request --org-role <caller's role>`; returns `{"review", "warnings"}` |
 | `POST /v1/notifications/claim` `{"runtime", "event"}` | `message pending --claim --hook EVENT --runtime claude\|codex` for the caller's role; returns `{"hook_output"}` (null when nothing is pending), the same output a local turn hook prints |
@@ -90,3 +90,51 @@ they stay on the hub machine.
 curl --cacert ca.pem --cert mac-studio.crt --key mac-studio.key \
   https://100.106.218.88:7711/v1/whoami
 ```
+
+## The client side
+
+On the other machine, a gitmoot home with a `[client]` section is a client of
+the hub. It has no org database of its own.
+
+```toml
+[client]
+hub = "https://100.106.218.88:7711"
+certs = "hub-certs"        # ca.pem, NAME.crt, NAME.key; relative to the gitmoot home
+name = "mac-studio"        # NAME the certificate was issued for
+role = "mac-studio"        # optional: the role to act as when the machine holds several
+agent = "mac-studio"       # optional: the local omp agent `client deliver` notifies
+```
+
+On a client home:
+
+- `message send|reply|inbox|show`, `org brief`, `pr show`, `review level` and
+  `review request` call the hub and print what they print locally. The acting
+  role is `--role`, then `GITMOOT_ORG_ROLE`, then `[client] role`; with none,
+  the hub uses the machine's only role.
+- `review request` refuses the flags the hub does not take, naming them.
+- `message pending --claim --hook ...` (the Claude Code and Codex turn hook)
+  claims the seat's mail through the hub, so a remote seat gets the same
+  turn-hook delivery as a local one.
+- Every other command that needs the org database refuses with "this gitmoot
+  home is a hub client". It never answers from an empty local store.
+
+An omp seat gets its mail through its machine's omp inbox add-on, which only a
+local process can reach. Run the delivery loop on that machine:
+
+```sh
+gitmoot client deliver            # every 10s; --once for a single pass
+```
+
+Each pass claims the role's pending mail on the hub, hands it to the add-on of
+`[client] agent`, and reports the outcome:
+
+| Add-on outcome | Result on the hub |
+|---|---|
+| Admitted | Delivered, receipt `omp-client:NAME` |
+| Refused (nothing reached omp) | Back to pending, with the add-on's reason |
+| Unknown | Left attempted for the hub's aged-attempt check; never resent |
+
+The pane is never typed into. On the hub, these are the endpoints
+`POST /v1/notifications/omp/claim` and
+`POST /v1/notifications/omp/finish {"ids", "outcome": "delivered"|"deferred", "reason"}`.
+Finish refuses rows addressed to another role.

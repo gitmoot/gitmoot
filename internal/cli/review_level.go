@@ -18,6 +18,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/hubclient"
 	"github.com/gitmoot/gitmoot/internal/jev"
 	"github.com/gitmoot/gitmoot/internal/keychain"
 	"github.com/gitmoot/gitmoot/internal/reviewlevel"
@@ -71,10 +72,31 @@ func runReviewLevel(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "review level requires --repo OWNER/REPO and --pr NUMBER")
 		return 2
 	}
-	decision, err := decideReviewLevel(context.Background(), *home, repo, *pr, stderr)
-	if err != nil {
-		fmt.Fprintf(stderr, "review level: %v\n", err)
-		return 1
+	var decision reviewlevel.Decision
+	handled, code := withHubClient(*home, "", "review level", stderr, func(ctx context.Context, client *hubclient.Client, role string) error {
+		var answer struct {
+			Decision reviewlevel.Decision `json:"decision"`
+			Warnings []string             `json:"warnings"`
+		}
+		if err := client.Do(ctx, http.MethodPost, "/v1/reviews/level", role, map[string]any{"repo": repo.FullName(), "pr": *pr}, &answer); err != nil {
+			return err
+		}
+		for _, warning := range answer.Warnings {
+			fmt.Fprintln(stderr, warning)
+		}
+		decision = answer.Decision
+		return nil
+	})
+	if handled && code != 0 {
+		return code
+	}
+	if !handled {
+		var err error
+		decision, err = decideReviewLevel(context.Background(), *home, repo, *pr, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "review level: %v\n", err)
+			return 1
+		}
 	}
 
 	if *asJSON {

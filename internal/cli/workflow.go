@@ -9,6 +9,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/hubclient"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -586,13 +589,25 @@ func runPRShow(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var record taskListOutput
-	if err := withStore(*home, func(store *db.Store) error {
-		var err error
-		record, err = resolvePRRecord(context.Background(), store, ref, *repo)
-		return err
-	}); err != nil {
-		fmt.Fprintf(stderr, "pr show: %v\n", err)
-		return 1
+	handled, code := withHubClient(*home, "", "pr show", stderr, func(ctx context.Context, client *hubclient.Client, role string) error {
+		query := url.Values{}
+		if *repo != "" {
+			query.Set("repo", *repo)
+		}
+		return client.Do(ctx, http.MethodGet, "/v1/tasks/"+url.PathEscape(ref)+"?"+query.Encode(), role, nil, &record)
+	})
+	if handled && code != 0 {
+		return code
+	}
+	if !handled {
+		if err := withStore(*home, func(store *db.Store) error {
+			var err error
+			record, err = resolvePRRecord(context.Background(), store, ref, *repo)
+			return err
+		}); err != nil {
+			fmt.Fprintf(stderr, "pr show: %v\n", err)
+			return 1
+		}
 	}
 	if *jsonOutput {
 		if err := writeJSON(stdout, record); err != nil {

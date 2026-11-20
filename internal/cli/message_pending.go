@@ -200,6 +200,10 @@ func claimTurnHookNotifications(request turnHookRequest, input turnHookStdin, in
 		// Not a fleet seat: nothing to claim and nothing worth logging.
 		return nil, nil
 	}
+	// On a hub client the seat's mail lives on the hub (#2710).
+	if handled, output, err := claimTurnHookViaHub(request); handled {
+		return output, err
+	}
 	start := turnHookNow()
 	paths, err := pathsFromFlag(request.home)
 	if err != nil {

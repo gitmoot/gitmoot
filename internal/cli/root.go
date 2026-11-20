@@ -34,6 +34,7 @@ var rootCommands = []command{
 	{name: "org", summary: "org registry, attribution, and brief/chart/status (RFC #1042)", run: runOrg},
 	{name: "message", summary: "send, read and reply to durable fleet messages", run: runMessage},
 	{name: "hub", summary: "manage machines allowed to call the hub API from other machines", run: runHub},
+	{name: "client", summary: "deliver this machine's hub mail to its local omp agent", run: runClient},
 	{name: "key", summary: "manage keycard registry metadata", run: runKey},
 	{name: "update", summary: "check for and apply Gitmoot releases", run: runUpdate},
 	{name: "setup", summary: "register a repo and initial reviewer", run: runSetup},
@@ -116,7 +117,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	store, err := db.Open(paths.Database)
+	store, err := openOrgDatabase(paths)
 	if err != nil {
 		fmt.Fprintf(stderr, "initialize database: %v\n", err)
 		return 1

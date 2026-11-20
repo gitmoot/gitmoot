@@ -7,7 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
+	"github.com/gitmoot/gitmoot/internal/hubclient"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -330,14 +333,53 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var output reviewRequestOutput
-	err := withStore(opts.home, func(store *db.Store) error {
-		var err error
-		output, err = requestReview(context.Background(), store, opts, stderr)
-		return err
+	handled, code := withHubClient(opts.home, opts.role, "review request", stderr, func(ctx context.Context, client *hubclient.Client, role string) error {
+		// Refuse what the hub does not take rather than drop it silently.
+		var unsupported []string
+		for flagName, set := range map[string]bool{
+			"--part": opts.part != "", "--supersede": opts.supersede != "", "--effort": opts.effort != "",
+			"--campaign": opts.workflowID != "", "--session": opts.session != "", "--branch": opts.branch != "",
+			"--ttl": opts.ttl != defaultReviewRequestTTL, "--full": opts.full, "--allow-prompt-head-mismatch": opts.allowPromptHeadMismatch,
+			"--exec-backend": opts.execBackendSet, "--exec-provider": opts.execProvider != "", "--runtime": opts.runtime != "",
+			"--evidence-manifest": opts.evidenceManifest != "", "--related-pr": len(opts.relatedPRs) != 0,
+		} {
+			if set {
+				unsupported = append(unsupported, flagName)
+			}
+		}
+		if len(unsupported) != 0 {
+			slices.Sort(unsupported)
+			return fmt.Errorf("not available through the hub: %s", strings.Join(unsupported, ", "))
+		}
+		var answer struct {
+			Review   reviewRequestOutput `json:"review"`
+			Warnings []string            `json:"warnings"`
+		}
+		if err := client.Do(ctx, http.MethodPost, "/v1/reviews", role, map[string]any{
+			"repo": opts.repo, "pr": opts.pr, "head_sha": opts.head, "message": opts.message, "purpose": opts.purpose,
+			"reviewer": opts.reviewer, "model": opts.model, "post_merge": opts.postMerge, "no_execution": opts.noExecution,
+		}, &answer); err != nil {
+			return err
+		}
+		for _, warning := range answer.Warnings {
+			fmt.Fprintln(stderr, warning)
+		}
+		output = answer.Review
+		return nil
 	})
-	if err != nil {
-		fmt.Fprintf(stderr, "review request: %v\n", err)
-		return 1
+	if handled && code != 0 {
+		return code
+	}
+	if !handled {
+		err := withStore(opts.home, func(store *db.Store) error {
+			var err error
+			output, err = requestReview(context.Background(), store, opts, stderr)
+			return err
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "review request: %v\n", err)
+			return 1
+		}
 	}
 	if opts.json {
 		if err := writeJSON(stdout, output); err != nil {
