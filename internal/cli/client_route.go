@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -161,9 +162,15 @@ func claimTurnHookViaHub(request turnHookRequest) (handled bool, output *turnHoo
 // openOrgDatabase opens the org database, refusing on a hub client home
 // (#2710): a client has no org database of its own, and opening one would
 // answer from an empty store as if the org had no work.
+//
+// A config file that cannot be read is not a client: [client] cannot be in
+// effect without a readable file, and the database must stay reachable then
+// (an unwritable or missing config plane never blocked it before). A
+// [client] section that is present but invalid still refuses.
 func openOrgDatabase(paths config.Paths) (*db.Store, error) {
 	client, err := config.LoadClientConfig(paths)
-	if err != nil {
+	var unreadable *fs.PathError
+	if err != nil && !errors.As(err, &unreadable) {
 		return nil, err
 	}
 	if client.Enabled() {
