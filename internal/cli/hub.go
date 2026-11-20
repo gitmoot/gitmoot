@@ -344,9 +344,12 @@ func runHubMachineRevoke(args []string, stdout, stderr io.Writer) int {
 //	GET  /v1/messages/{id}?thread=1&before&limit show
 //	POST /v1/messages {"to","body","campaign"}   send
 //	POST /v1/messages/{id}/reply {"body"}        reply
-func hubAPI(paths config.Paths, store *db.Store) http.Handler {
+//
+// and the work endpoints in hub_work.go. home is the --home value the CLI
+// commands take; paths is its resolved form.
+func hubAPI(home string, paths config.Paths, store *db.Store) http.Handler {
 	mux := http.NewServeMux()
-	handle := func(pattern string, serve func(ctx context.Context, caller hub.Caller, org config.OrgConfig, r *http.Request) (int, any, error)) {
+	handle := func(pattern string, serve hubHandler) {
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
 			caller, ok := hub.CallerFrom(r.Context())
 			if !ok {
@@ -451,6 +454,7 @@ func hubAPI(paths config.Paths, store *db.Store) http.Handler {
 		}
 		return http.StatusCreated, newMessageJSON(message), nil
 	})
+	registerHubWorkEndpoints(handle, home, store)
 	return mux
 }
 
@@ -508,7 +512,7 @@ func startDaemonHub(home string, stdout io.Writer) func() {
 	if cfg.Listen == "" {
 		return func() {}
 	}
-	server, store, err := startHub(paths, cfg)
+	server, store, err := startHub(home, paths, cfg)
 	if err != nil {
 		writeLine(stdout, "hub: not started: %v", err)
 		return func() {}
@@ -520,7 +524,7 @@ func startDaemonHub(home string, stdout io.Writer) func() {
 	}
 }
 
-func startHub(paths config.Paths, cfg config.HubConfig) (*hub.Server, *db.Store, error) {
+func startHub(home string, paths config.Paths, cfg config.HubConfig) (*hub.Server, *db.Store, error) {
 	address, err := config.ValidateHubListen(cfg.Listen)
 	if err != nil {
 		return nil, nil, err
@@ -539,7 +543,7 @@ func startHub(paths config.Paths, cfg config.HubConfig) (*hub.Server, *db.Store,
 		return nil, nil, err
 	}
 	hosts := append([]string{address.Addr().String()}, cfg.Advertise...)
-	handler := hub.Authenticate(store.ActiveHubMachineByFingerprint, time.Now, config.TailscalePrefixes, hubAPI(paths, store))
+	handler := hub.Authenticate(store.ActiveHubMachineByFingerprint, time.Now, config.TailscalePrefixes, hubAPI(home, paths, store))
 	server, err := hub.Serve(listener, authority, hosts, handler)
 	if err != nil {
 		_ = store.Close()

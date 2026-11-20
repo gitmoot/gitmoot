@@ -214,7 +214,7 @@ func Serve(listener net.Listener, authority *mtlsca.Authority, hosts []string, h
 		ErrorLog:          log.New(io.Discard, "", 0),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      3 * time.Minute, // a review request or level decision calls GitHub and a model
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 	}

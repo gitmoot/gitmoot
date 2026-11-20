@@ -42,7 +42,7 @@ func hubTestServer(t *testing.T, home string) string {
 		t.Fatal(err)
 	}
 	handler := hub.Authenticate(store.ActiveHubMachineByFingerprint, time.Now,
-		[]netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, hubAPI(paths, store))
+		[]netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, hubAPI(home, paths, store))
 	server, err := hub.Serve(listener, authority, []string{"127.0.0.1"}, handler)
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +157,14 @@ func TestHubMachineSendsAndRepliesAsItsRoleOverMutualTLS(t *testing.T) {
 	}
 
 	// Both writes are recorded against the machine and role.
+	if n := hubWriteCount(t, home, "message.send") + hubWriteCount(t, home, "message.reply"); n != 2 {
+		t.Fatalf("hub_writes=%d, want 2", n)
+	}
+}
+
+// hubWriteCount counts hub_writes rows for action, from any machine.
+func hubWriteCount(t *testing.T, home, action string) int {
+	t.Helper()
 	raw, err := sql.Open("sqlite", config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
@@ -164,12 +172,10 @@ func TestHubMachineSendsAndRepliesAsItsRoleOverMutualTLS(t *testing.T) {
 	defer raw.Close()
 	var writes int
 	if err := raw.QueryRowContext(context.Background(),
-		`SELECT count(*) FROM hub_writes w JOIN hub_machines m ON m.id = w.machine_id WHERE m.name = 'mac-studio' AND w.role = 'gm-omp-nag'`).Scan(&writes); err != nil {
+		`SELECT count(*) FROM hub_writes w JOIN hub_machines m ON m.id = w.machine_id WHERE w.action = ? AND w.role IN (SELECT role FROM hub_machine_roles WHERE machine_id = m.id)`, action).Scan(&writes); err != nil {
 		t.Fatal(err)
 	}
-	if writes != 2 {
-		t.Fatalf("hub_writes=%d, want 2", writes)
-	}
+	return writes
 }
 
 func TestHubRefusesOtherRolesUnregisteredAndRevokedMachines(t *testing.T) {

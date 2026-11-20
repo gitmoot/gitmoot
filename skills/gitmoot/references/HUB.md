@@ -67,11 +67,24 @@ same fields as the JSON output of the matching `message` command.
 | `GET /v1/messages/{id}?thread=1&before=ID&limit=N` | `message show ID --thread` |
 | `POST /v1/messages` `{"to", "body", "campaign"?}` | `message send TO BODY [--campaign ID]` |
 | `POST /v1/messages/{id}/reply` `{"body"}` | `message reply ID BODY` |
+| `GET /v1/org/brief` | `org brief --role <caller's role>` (presence noted as `org brief (hub: MACHINE)`) |
+| `GET /v1/tasks/{ref}?repo=OWNER/REPO` | `task show REF [--repo]` |
+| `POST /v1/reviews/level` `{"repo", "pr"}` | `review level`; returns `{"decision", "warnings"}` |
+| `POST /v1/reviews` `{"repo", "pr", "head_sha", "message", "purpose"?, "reviewer"?, "model"?, "post_merge"?, "no_execution"?}` | `review request --org-role <caller's role>`; returns `{"review", "warnings"}` |
+| `POST /v1/notifications/claim` `{"runtime", "event"}` | `message pending --claim --hook EVENT --runtime claude\|codex` for the caller's role; returns `{"hook_output"}` (null when nothing is pending), the same output a local turn hook prints |
 
-Each endpoint calls the same code as its CLI command, so a remote send is
+Each endpoint calls the same code as its CLI command, so a remote request is
 checked exactly like a local one. Every write is recorded in `hub_writes` with
-the machine and role that made it. Org changes, merges, deploys and config are
-not served, and will not be: they stay on the hub machine.
+the machine and role that made it.
+
+The task and review endpoints refuse a repository outside the caller role's
+org `scope`. A review request needs the full 40-character `head_sha` and the
+verdict goes to the caller's role. Host paths and execution overrides
+(`--evidence-manifest`, `--related-pr`, `--session`, `--runtime`,
+`--exec-backend`, `--exec-provider`, `--supersede`,
+`--allow-prompt-head-mismatch`) are not accepted remotely; an unknown field is
+refused, not ignored. Org changes, merges, deploys and config are not served:
+they stay on the hub machine.
 
 ```sh
 curl --cacert ca.pem --cert mac-studio.crt --key mac-studio.key \
