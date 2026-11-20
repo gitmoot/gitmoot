@@ -190,3 +190,50 @@ func (s *Store) RecordHubWrite(ctx context.Context, machineID int64, role, actio
 	}
 	return tx.Commit()
 }
+
+// ErrHubAttemptStale reports a hub finish whose attempt is no longer the
+// row's current one: the row was finished, deferred or claimed again since.
+var ErrHubAttemptStale = errors.New("notification attempt is no longer current")
+
+// HubAttemptToken names one delivery attempt of a wake row: the attempted_at
+// stamp its claim wrote. A deferral clears attempted_at and a new claim writes
+// a new stamp, so a token never matches a later attempt of the same row
+// (attempt_count cannot serve: a deferral decrements it).
+func HubAttemptToken(claimedAt time.Time) string {
+	return claimedAt.UTC().Format(BlockedEpisodeTimeLayout)
+}
+
+// FinishHubWakeAttempt records a remote client's outcome for exactly the
+// attempt named by token, on a row addressed to role (#2710). delivered
+// finishes it with detail as the receipt; deferred returns it to pending with
+// detail as the reason. Anything else, or a stale token, changes nothing.
+func (s *Store) FinishHubWakeAttempt(ctx context.Context, role string, id int64, token string, delivered bool, detail string, now time.Time) error {
+	stamp := HubAttemptToken(now)
+	query := `UPDATE wake_outbox
+SET state = 'delivered', coalesced_into = NULL, last_error = ?, finished_at = ?, updated_at = ?
+WHERE id = ? AND lower(target_role) = ? AND state = 'attempted' AND attempted_at = ?`
+	args := []any{strings.TrimSpace(detail), stamp, stamp, id, strings.ToLower(strings.TrimSpace(role)), token}
+	if !delivered {
+		query = `UPDATE wake_outbox
+SET state = 'pending', coalesced_into = NULL, last_error = ?, attempted_at = NULL, finished_at = NULL,
+	attempt_count = attempt_count - 1, updated_at = ?
+WHERE id = ? AND lower(target_role) = ? AND state = 'attempted' AND attempt_count > 0 AND attempted_at = ?`
+		args = []any{strings.TrimSpace(detail), stamp, id, strings.ToLower(strings.TrimSpace(role)), token}
+	}
+	writeCtx, cancel := s.durableWriteContext(ctx, 1)
+	defer cancel()
+	return retryNotificationWrite(writeCtx, func() error {
+		result, err := s.db.ExecContext(writeCtx, query, args...)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return ErrHubAttemptStale
+		}
+		return nil
+	})
+}

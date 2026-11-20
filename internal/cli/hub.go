@@ -455,6 +455,7 @@ func hubAPI(home string, paths config.Paths, store *db.Store) http.Handler {
 		return http.StatusCreated, newMessageJSON(message), nil
 	})
 	registerHubWorkEndpoints(handle, home, store)
+	registerHubOMPEndpoints(handle, store)
 	return mux
 }
 

@@ -235,6 +235,10 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "inbox requires --before >= 0 and --limit 1–100")
 		return 2
 	}
+	request := messageRequest{action: action, id: id, args: args, workflowID: workflowID, before: before, limit: limit, thread: thread}
+	if handled, code := runMessageViaHub(*home, *roleFlag, request, *jsonOutput, stdout, stderr); handled {
+		return code
+	}
 	err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		cfg, err := config.LoadOrg(paths)
 		if err != nil {
@@ -251,35 +255,14 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 			if err != nil {
 				return err
 			}
-			if *jsonOutput {
-				return writeJSON(stdout, newMessagesJSON(messages))
-			}
-			for _, message := range messages {
-				printInboxMessage(stdout, message)
-			}
-			if len(messages) == limit {
-				fmt.Fprintf(stdout, "Older thread messages: gitmoot message show %d --thread --before %d\n", id, messages[len(messages)-1].ID)
-			}
-			return nil
+			return printMessageList(stdout, request, messages, *jsonOutput)
 		}
 		if action == "inbox" {
 			messages, err := store.ListMessages(ctx, role, before, limit)
 			if err != nil {
 				return err
 			}
-			if *jsonOutput {
-				return writeJSON(stdout, newMessagesJSON(messages))
-			}
-			if len(messages) == 0 {
-				fmt.Fprintln(stdout, "No messages.")
-			}
-			for _, m := range messages {
-				fmt.Fprintf(stdout, "%d  %s  from %s  thread %d  notification=%s  lifecycle=%s\n  %s\n", m.ID, m.Kind, m.Sender, m.ThreadID, m.Status, m.Lifecycle, terminalSafeWorkflowText(m.Body))
-			}
-			if len(messages) == limit {
-				fmt.Fprintf(stdout, "Older messages: gitmoot message inbox --before %d\n", messages[len(messages)-1].ID)
-			}
-			return nil
+			return printMessageList(stdout, request, messages, *jsonOutput)
 		}
 		var message db.Message
 		if action == "show" {
@@ -295,21 +278,64 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		if *jsonOutput {
-			return writeJSON(stdout, newMessageJSON(message))
-		}
-		if action != "show" {
-			fmt.Fprintf(stdout, "saved message %d from %s to %s; notification=%s; no acknowledgment required\n", message.ID, message.Sender, message.Recipient, message.Status)
-			return nil
-		}
-		printInboxMessage(stdout, message)
-		return nil
+		return printMessageResult(stdout, action, message, *jsonOutput)
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "message:", err)
 		return 1
 	}
 	return 0
+}
+
+// messageRequest is a parsed message inbox/show/send/reply command.
+type messageRequest struct {
+	action     string
+	id         int64
+	args       []string
+	workflowID string
+	before     int64
+	limit      int
+	thread     bool
+}
+
+// printMessageList prints an inbox page or a thread, from the local store or
+// the hub alike.
+func printMessageList(stdout io.Writer, request messageRequest, messages []db.Message, jsonOutput bool) error {
+	if jsonOutput {
+		return writeJSON(stdout, newMessagesJSON(messages))
+	}
+	if request.action == "show" {
+		for _, message := range messages {
+			printInboxMessage(stdout, message)
+		}
+		if len(messages) == request.limit {
+			fmt.Fprintf(stdout, "Older thread messages: gitmoot message show %d --thread --before %d\n", request.id, messages[len(messages)-1].ID)
+		}
+		return nil
+	}
+	if len(messages) == 0 {
+		fmt.Fprintln(stdout, "No messages.")
+	}
+	for _, m := range messages {
+		fmt.Fprintf(stdout, "%d  %s  from %s  thread %d  notification=%s  lifecycle=%s\n  %s\n", m.ID, m.Kind, m.Sender, m.ThreadID, m.Status, m.Lifecycle, terminalSafeWorkflowText(m.Body))
+	}
+	if len(messages) == request.limit {
+		fmt.Fprintf(stdout, "Older messages: gitmoot message inbox --before %d\n", messages[len(messages)-1].ID)
+	}
+	return nil
+}
+
+// printMessageResult prints one shown, sent or replied message.
+func printMessageResult(stdout io.Writer, action string, message db.Message, jsonOutput bool) error {
+	if jsonOutput {
+		return writeJSON(stdout, newMessageJSON(message))
+	}
+	if action != "show" {
+		fmt.Fprintf(stdout, "saved message %d from %s to %s; notification=%s; no acknowledgment required\n", message.ID, message.Sender, message.Recipient, message.Status)
+		return nil
+	}
+	printInboxMessage(stdout, message)
+	return nil
 }
 
 // sendMessage saves a message from role to recipient. The CLI and the hub API

@@ -16,6 +16,7 @@ disagrees, trust its live `--help`.
 - [gitmoot campaign list](#gitmoot-campaign-list)
 - [gitmoot campaign register](#gitmoot-campaign-register)
 - [gitmoot campaign show](#gitmoot-campaign-show)
+- [gitmoot client](#gitmoot-client)
 - [gitmoot config](#gitmoot-config)
 - [gitmoot config path](#gitmoot-config-path)
 - [gitmoot config show](#gitmoot-config-show)
@@ -171,6 +172,7 @@ Commands:
   org        org registry, attribution, and brief/chart/status (RFC #1042)
   message    send, read and reply to durable fleet messages
   hub        manage machines allowed to call the hub API from other machines
+  client     deliver this machine's hub mail to its local omp agent
   key        manage keycard registry metadata
   update     check for and apply Gitmoot releases
   setup      register a repo and initial reviewer
@@ -249,6 +251,21 @@ Usage: gitmoot campaign show <label> [--json] [--limit N] [--home DIR]
     	print the campaign timeline as JSON
   -limit int
     	maximum merged timeline entries (0 means all) (default 100)
+```
+
+## gitmoot client
+
+```text
+Deliver this machine's gitmoot mail to its local omp agent (#2710).
+
+Usage:
+  gitmoot client deliver [--once] [--interval 10s] [--home DIR]
+
+Needs [client] hub, certs, name and agent in config.toml. Each pass claims the
+role's pending mail on the hub and hands it to the omp inbox add-on of the
+local agent named by [client] agent. A delivery the add-on refuses goes back
+to pending with its reason; an unknown outcome is left for the hub's checks
+and is never sent twice. The pane is never typed into.
 ```
 
 ## gitmoot config

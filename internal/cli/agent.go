@@ -2396,7 +2396,7 @@ func withStoreAndPaths(home string, fn func(config.Paths, *db.Store) error) erro
 	if err := config.Initialize(paths); err != nil {
 		return err
 	}
-	store, err := db.Open(paths.Database)
+	store, err := openOrgDatabase(paths)
 	if err != nil {
 		return err
 	}

@@ -1,0 +1,157 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gitmoot/gitmoot/internal/cockpit"
+	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/hubclient"
+)
+
+// clientNotifier is the part of the cockpit the omp delivery loop uses.
+type clientNotifier interface {
+	ResolveNotificationTarget(ctx context.Context, binding string) (cockpit.NotificationTarget, bool)
+	AgentNotify(ctx context.Context, target cockpit.NotificationTarget, prompt string) (delivered bool, uncertain bool, err error)
+}
+
+const clientDeliverNotifyTimeout = 15 * time.Second
+
+func runClient(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || helpRequested(args[:1]) {
+		printClientUsage(stdout)
+		return 0
+	}
+	if args[0] != "deliver" {
+		fmt.Fprintf(stderr, "unknown client command %q\n\n", args[0])
+		printClientUsage(stderr)
+		return 2
+	}
+	if helpRequested(args[1:]) {
+		printClientUsage(stdout)
+		return 0
+	}
+	fs := flag.NewFlagSet("client deliver", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory")
+	once := fs.Bool("once", false, "deliver what is pending now, then exit")
+	interval := fs.Duration("interval", 10*time.Second, "how often to ask the hub for new mail")
+	if err := fs.Parse(args[1:]); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 || *interval < time.Second {
+		fmt.Fprintln(stderr, "client deliver: unexpected argument, or --interval below 1s")
+		return 2
+	}
+	client, cfg, ok, err := hubClientFor(*home)
+	if err == nil && !ok {
+		err = errors.New("this home is not a hub client; set [client] hub, certs and name")
+	}
+	if err == nil && cfg.Agent == "" {
+		err = errors.New("[client] agent names the local omp agent to notify")
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "client deliver:", err)
+		return 1
+	}
+	defer client.Close()
+	notifier := cockpit.New(cockpit.Options{HerdrBin: "herdr", OMPRuntimeDir: ompRuntimeDir(*home)})
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	for {
+		passCtx, cancel := context.WithTimeout(ctx, hubClientCallTimeout)
+		err := clientDeliverOnce(passCtx, client, notifier, cfg, stdout)
+		cancel()
+		if err != nil {
+			fmt.Fprintln(stderr, "client deliver:", err)
+			if *once {
+				return 1
+			}
+		}
+		if *once {
+			return 0
+		}
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-time.After(*interval):
+		}
+	}
+}
+
+func printClientUsage(w io.Writer) {
+	fmt.Fprintln(w, "Deliver this machine's gitmoot mail to its local omp agent (#2710).")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot client deliver [--once] [--interval 10s] [--home DIR]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Needs [client] hub, certs, name and agent in config.toml. Each pass claims the")
+	fmt.Fprintln(w, "role's pending mail on the hub and hands it to the omp inbox add-on of the")
+	fmt.Fprintln(w, "local agent named by [client] agent. A delivery the add-on refuses goes back")
+	fmt.Fprintln(w, "to pending with its reason; an unknown outcome is left for the hub's checks")
+	fmt.Fprintln(w, "and is never sent twice. The pane is never typed into.")
+}
+
+// clientDeliverOnce claims the role's pending mail and reports each outcome.
+func clientDeliverOnce(ctx context.Context, client *hubclient.Client, notifier clientNotifier, cfg config.ClientConfig, stdout io.Writer) error {
+	role := hubClientRole(cfg, "")
+	var claim struct {
+		Claimed []hubOMPClaimed `json:"claimed"`
+	}
+	if err := client.Do(ctx, http.MethodPost, "/v1/notifications/omp/claim", role, struct{}{}, &claim); err != nil {
+		return err
+	}
+	if len(claim.Claimed) == 0 {
+		return nil
+	}
+	// Every finish names the attempt its claim returned, so a late or
+	// replayed outcome cannot change a newer attempt of the same message.
+	finish := func(item hubOMPClaimed, outcome, reason string) error {
+		return client.Do(ctx, http.MethodPost, "/v1/notifications/omp/finish", role,
+			map[string]any{"id": item.ID, "attempt": item.Attempt, "outcome": outcome, "reason": reason}, nil)
+	}
+	target, found := notifier.ResolveNotificationTarget(ctx, "agent:"+cfg.Agent)
+	if !found {
+		// Nothing reached omp: every claimed row goes back to pending.
+		var firstErr error
+		for _, item := range claim.Claimed {
+			if err := finish(item, "deferred", fmt.Sprintf("local omp agent %q not found on this machine", cfg.Agent)); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	}
+	var firstErr error
+	for _, item := range claim.Claimed {
+		notifyCtx, cancel := context.WithTimeout(ctx, clientDeliverNotifyTimeout)
+		delivered, uncertain, err := notifier.AgentNotify(notifyCtx, target, item.Prompt)
+		cancel()
+		var deferred *cockpit.NotificationDeferred
+		switch {
+		case delivered:
+			err = finish(item, "delivered", "")
+			if err == nil {
+				fmt.Fprintf(stdout, "delivered message %d\n", item.MessageID)
+			}
+		case errors.As(err, &deferred):
+			err = finish(item, "deferred", deferred.Reason)
+		default:
+			// Unknown receipt (uncertain, or any other error): the row stays
+			// attempted on the hub and is never resent automatically.
+			fmt.Fprintf(stdout, "message %d: delivery outcome unknown (uncertain=%t, %v); left for the hub's checks\n", item.MessageID, uncertain, err)
+			err = nil
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}

@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/doctor"
+	"github.com/gitmoot/gitmoot/internal/hubclient"
 	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -310,7 +312,7 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		}
 		desired.Pane = binding
 	}
-	store, err := db.Open(paths.Database)
+	store, err := openOrgDatabase(paths)
 	if err != nil {
 		fmt.Fprintf(stderr, "org seat add: open store: %v\n", err)
 		return 1
@@ -503,7 +505,7 @@ func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
 			hasLivePane = true
 		}
 	}
-	store, err := db.Open(paths.Database)
+	store, err := openOrgDatabase(paths)
 	if err != nil {
 		fmt.Fprintf(stderr, "org seat rm: open store: %v\n", err)
 		return 1
@@ -1270,9 +1272,24 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
-	if fs.NArg() != 0 || strings.TrimSpace(*roleName) == "" {
+	// On a hub client the role may come from [client] role or the machine's
+	// only hub role, so --role is required only locally.
+	if fs.NArg() != 0 || (strings.TrimSpace(*roleName) == "" && !hubClientHome(*home)) {
 		fmt.Fprintln(stderr, "org brief requires --role NAME")
 		return 2
+	}
+	if handled, code := withHubClient(*home, *roleName, "org brief", stderr, func(ctx context.Context, client *hubclient.Client, role string) error {
+		var out orgBriefOutput
+		if err := client.Do(ctx, http.MethodGet, "/v1/org/brief", role, nil, &out); err != nil {
+			return err
+		}
+		if *jsonOutput {
+			return writeJSON(stdout, out)
+		}
+		printOrgBrief(stdout, out)
+		return nil
+	}); handled {
+		return code
 	}
 	ctx := context.Background()
 	cfg, presence, store, err := loadOrgCommandState(ctx, *home)
@@ -1365,7 +1382,7 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "org %s: %v\n", command, err)
 		return 1
 	}
-	store, err := db.Open(paths.Database)
+	store, err := openOrgDatabase(paths)
 	if err != nil {
 		fmt.Fprintf(stderr, "org %s: %v\n", command, err)
 		return 1
@@ -1604,7 +1621,7 @@ func loadOrgCommandState(ctx context.Context, home string) (config.OrgConfig, ma
 	if !cfg.Enabled() {
 		return config.OrgConfig{}, nil, nil, errors.New("organization registry is disabled; run `gitmoot org init`")
 	}
-	store, err := db.Open(paths.Database)
+	store, err := openOrgDatabase(paths)
 	if err != nil {
 		return config.OrgConfig{}, nil, nil, err
 	}

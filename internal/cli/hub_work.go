@@ -23,13 +23,10 @@ type hubHandler func(ctx context.Context, caller hub.Caller, org config.OrgConfi
 
 var hubFullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// hubReviewPurposes are the purposes `review request --purpose` documents.
-var hubReviewPurposes = map[string]bool{"code": true, "security": true, "ui": true, "architecture": true}
-
 // registerHubWorkEndpoints adds the endpoints beyond messages (#2710):
 //
 //	GET  /v1/org/brief                    org brief for the caller's role
-//	GET  /v1/tasks/{ref}?repo=OWNER/REPO  task show
+//	GET  /v1/tasks/{ref}?repo=OWNER/REPO  pr show
 //	POST /v1/reviews/level {"repo","pr"}  review level
 //	POST /v1/reviews {"repo","pr","head_sha","message",...} review request
 //	POST /v1/notifications/claim {"runtime","event"}        turn-hook claim
@@ -115,15 +112,17 @@ func registerHubWorkEndpoints(handle func(string, hubHandler), home string, stor
 			return http.StatusBadRequest, nil, errors.New("repo OWNER/REPO and pr > 0 are required")
 		}
 		head := strings.ToLower(strings.TrimSpace(input.HeadSHA))
-		if !hubFullSHA.MatchString(head) {
-			return http.StatusBadRequest, nil, errors.New("head_sha must be the full 40-character commit SHA")
+		// Empty means the pull request's current head, as with a local
+		// request without --head; requestReview resolves it. A head that is
+		// given must be complete, never a prefix.
+		if head != "" && !hubFullSHA.MatchString(head) {
+			return http.StatusBadRequest, nil, errors.New("head_sha, when given, must be the full 40-character commit SHA")
 		}
+		// requestReview validates the purpose against the review router's
+		// settings, the same check a local request gets; no second list here.
 		purpose := strings.ToLower(strings.TrimSpace(input.Purpose))
 		if purpose == "" {
 			purpose = "code"
-		}
-		if !hubReviewPurposes[purpose] {
-			return http.StatusBadRequest, nil, errors.New("purpose must be code, security, ui or architecture")
 		}
 		if status, err := hubRequireScope(org, caller.Role, repo.FullName()); err != nil {
 			return status, nil, err
