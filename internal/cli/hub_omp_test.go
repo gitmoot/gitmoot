@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -176,5 +177,74 @@ func TestHubOMPClaimIsAllOrNothing(t *testing.T) {
 	}
 	if claimed := hubOMPClaim(t, client, base); len(claimed) != 2 {
 		t.Fatalf("claim after the failure cleared = %+v", claimed)
+	}
+}
+
+// Binding a role retires the notifications that have waited longer than the
+// threshold: the new agent's client claims nothing stale, the messages stay
+// in the inbox, and mail sent after the bind is delivered as usual (#2721:
+// the mac-studio bind pushed weeks of stale instructions into a fresh agent).
+func TestBindRetiresOlderNotificationsButKeepsTheMessages(t *testing.T) {
+	home := messageTestHome(t)
+	old := sendTestMessage(t, home, "gm-omp-nag", "deimos", "Weeks old: owner authorized disk cleanup.")
+	client, base := hubWorkClient(t, home, "deimos")
+	// A bind two days later, with the default threshold: the message has
+	// waited longer than 24h, so it is retired.
+	retired, kept, err := retireBacklogOnBind(config.PathsForHome(home), "deimos", "agent:mac/deimos", time.Now().UTC().Add(48*time.Hour), defaultBindRetireAge)
+	if err != nil || retired != 1 || kept != 0 {
+		t.Fatalf("retired, kept = %d, %d, %v; want 1, 0", retired, kept, err)
+	}
+	fresh := sendTestMessage(t, home, "gm-omp-nag", "deimos", "Sent after the bind.")
+	claimed := hubOMPClaim(t, client, base)
+	if len(claimed) != 1 || claimed[0].MessageID != fresh {
+		t.Fatalf("claimed = %+v, want only message %d", claimed, fresh)
+	}
+	if got := turnHookWakeReceipts(t, home, "deimos")[fmt.Sprint(old)]; !strings.HasPrefix(got, "superseded|retired when role deimos was bound") {
+		t.Fatalf("old notification = %q", got)
+	}
+	var inbox []messageTestResult
+	if err := json.Unmarshal(messageCLI(t, home, "deimos", "inbox"), &inbox); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, message := range inbox {
+		found = found || (message.ID == old && strings.Contains(message.Body, "Weeks old"))
+	}
+	if !found {
+		t.Fatalf("the retired message is no longer readable: %+v", inbox)
+	}
+	// Another role's waiting mail is not touched by deimos's bind, even one
+	// that retires everything.
+	other := sendTestMessage(t, home, "gm-omp-nag", "jarvis", "For jarvis.")
+	if _, _, err := retireBacklogOnBind(config.PathsForHome(home), "deimos", "agent:mac/deimos", time.Now().UTC().Add(time.Second), 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := turnHookWakeReceipts(t, home, "jarvis")[fmt.Sprint(other)]; !strings.HasPrefix(got, "pending|") {
+		t.Fatalf("jarvis's notification after deimos's bind: %q", got)
+	}
+}
+
+// A routine re-bind (a seat's pane changed) keeps work that arrived minutes
+// earlier pending and delivers it; only --retire-older-than 0 retires it
+// (#2721 review by the gitmoot seat).
+func TestRebindKeepsRecentNotificationsPending(t *testing.T) {
+	home := messageTestHome(t)
+	recent := sendTestMessage(t, home, "gm-omp-nag", "deimos", "Five minutes old: please look.")
+	client, base := hubWorkClient(t, home, "deimos")
+	boundAt := time.Now().UTC().Add(5 * time.Minute)
+	retired, kept, err := retireBacklogOnBind(config.PathsForHome(home), "deimos", "agent:deimos", boundAt, defaultBindRetireAge)
+	if err != nil || retired != 0 || kept != 1 {
+		t.Fatalf("re-bind: retired, kept = %d, %d, %v; want 0, 1", retired, kept, err)
+	}
+	if claimed := hubOMPClaim(t, client, base); len(claimed) != 1 || claimed[0].MessageID != recent {
+		t.Fatalf("the recent message was not delivered after a re-bind: %+v", claimed)
+	}
+	second := sendTestMessage(t, home, "gm-omp-nag", "deimos", "Also recent.")
+	retired, kept, err = retireBacklogOnBind(config.PathsForHome(home), "deimos", "agent:deimos", time.Now().UTC().Add(5*time.Minute), 0)
+	if err != nil || retired != 1 || kept != 0 {
+		t.Fatalf("--retire-older-than 0: retired, kept = %d, %d, %v; want 1, 0", retired, kept, err)
+	}
+	if got := turnHookWakeReceipts(t, home, "deimos")[fmt.Sprint(second)]; !strings.HasPrefix(got, "superseded|") {
+		t.Fatalf("with threshold 0: %q", got)
 	}
 }

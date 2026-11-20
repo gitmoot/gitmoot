@@ -908,6 +908,8 @@ Usage of org seat bind:
     	home directory
   -name string
     	existing organization role
+  -retire-older-than duration
+    	retire the role's waiting notifications older than this (0 retires all waiting from before the bind); newer ones stay pending (default 24h0m0s)
 ```
 
 ## gitmoot org seat rm
