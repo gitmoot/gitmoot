@@ -625,10 +625,11 @@ const (
 // the requirements_unmet error for a command that exited non-zero or timed
 // out (exit 124), or the session's own failure.
 func runWorkspaceRequire(ctx context.Context, store *db.Store, workspace db.Workspace, sandbox workspaceSandbox, command string) (unmet, failure *workspaceError) {
-	output := &workspaceRequireCapture{max: workspaceRequireCaptureBytes}
+	stdout := &workspaceRequireCapture{max: workspaceRequireCaptureBytes}
+	stderr := &workspaceRequireCapture{max: workspaceRequireCaptureBytes}
 	status, failure := runWorkspaceCommand(ctx, store, workspace, sandbox, workspaceExecRequest{
 		ID: workspace.ID, Cwd: ".", Timeout: workspaceRequireTimeout, Argv: []string{"bash", "-lc", command},
-	}, nil, output, output)
+	}, nil, stdout, stderr)
 	if failure != nil {
 		return nil, failure
 	}
@@ -641,12 +642,15 @@ func runWorkspaceRequire(ctx context.Context, store *db.Store, workspace db.Work
 		exitCode = 124
 		message = fmt.Sprintf("require check %q timed out after %s", command, workspaceRequireTimeout)
 	}
-	tail := output.tail()
+	tail := workspaceRequireReport(stdout.redacted(), stderr.redacted())
 	return &workspaceError{Code: wsErrRequirementsUnmet, Message: message, FailedCheck: command, ExitCode: &exitCode, OutputTail: &tail}, nil
 }
 
-// workspaceRequireCapture keeps the last max bytes of a check's combined
-// output, remembering whether anything before them was dropped.
+// workspaceRequireCapture keeps the last max bytes of ONE stream of a
+// check's output, remembering whether anything before them was dropped.
+// stdout and stderr are pumped separately, so they get one capture each: in a
+// shared capture a newline from one stream could land inside the other's cut
+// line and end the partial-line drop early (#2712).
 type workspaceRequireCapture struct {
 	mu   sync.Mutex
 	max  int
@@ -665,14 +669,14 @@ func (c *workspaceRequireCapture) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// tail is one stream's reported text: redacted, then cut to
+// workspaceRequireTailBytes.
 func (c *workspaceRequireCapture) tail() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return workspaceRequireTail(c.data, c.cut)
+	return workspaceRequireCut(c.redacted(), workspaceRequireTailBytes)
 }
 
-// workspaceRequireTail is the reported output_tail: the redactors run over
-// whole lines only, then the last workspaceRequireTailBytes are kept.
+// redacted is the stream's captured text with the redactors applied over
+// whole lines only.
 //
 // When the capture dropped earlier output, its first line is a fragment whose
 // start (a key such as `password =`, a `ghp_` prefix, an opening quote) may
@@ -685,20 +689,42 @@ func (c *workspaceRequireCapture) tail() string {
 // the same command with `workspace exec` and read its raw output. A secret
 // that spans several lines and lost its first line to the capture cut (a PEM
 // body, for one) is not recognized on its later lines.
-func workspaceRequireTail(data []byte, cut bool) string {
-	text := string(data)
-	if cut {
+func (c *workspaceRequireCapture) redacted() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	text := string(c.data)
+	if c.cut {
 		newline := strings.IndexByte(text, '\n')
 		if newline < 0 {
 			return ""
 		}
 		text = text[newline+1:]
 	}
-	text = workflow.RedactCommentText(text)
-	if len(text) <= workspaceRequireTailBytes {
+	return workflow.RedactCommentText(text)
+}
+
+// workspaceRequireReport is the output_tail: stdout's last lines, then
+// stderr's, within workspaceRequireTailBytes. stderr is kept first because it
+// usually says why the check failed ("command not found"); stdout gets what
+// is left. Each part is already redacted, so cutting cannot expose a secret.
+func workspaceRequireReport(stdout, stderr string) string {
+	stderr = workspaceRequireCut(stderr, workspaceRequireTailBytes)
+	stdout = workspaceRequireCut(stdout, workspaceRequireTailBytes-len(stderr))
+	if stdout != "" && stderr != "" && !strings.HasSuffix(stdout, "\n") {
+		stdout = workspaceRequireCut(stdout, workspaceRequireTailBytes-len(stderr)-1) + "\n"
+	}
+	return stdout + stderr
+}
+
+// workspaceRequireCut keeps the last max bytes of text, starting on a rune.
+func workspaceRequireCut(text string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(text) <= max {
 		return text
 	}
-	text = text[len(text)-workspaceRequireTailBytes:]
+	text = text[len(text)-max:]
 	for len(text) > 0 && !utf8.RuneStart(text[0]) {
 		text = text[1:]
 	}
