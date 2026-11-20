@@ -284,28 +284,10 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		var message db.Message
 		if action == "show" {
 			message, err = store.GetMessage(ctx, id, role)
+		} else if action == "reply" {
+			message, err = replyMessage(ctx, store, cfg, role, id, args[2], nil)
 		} else {
-			input := db.Message{Sender: role, Body: args[2], WorkflowID: workflowID}
-			if action == "reply" {
-				parent, lookupErr := store.GetMessage(ctx, id, role)
-				if lookupErr != nil {
-					return errors.New("message not found or not visible to this role")
-				}
-				recipient := parent.Sender
-				if recipient == role {
-					recipient = parent.Recipient
-				}
-				if _, ok := cfg.Role(recipient); !ok && recipient != db.MessageSystemSender {
-					return fmt.Errorf("recipient role %q is retired", recipient)
-				}
-				input.ReplyTo = id
-			} else {
-				input.Recipient = strings.ToLower(strings.TrimSpace(args[1]))
-				if _, ok := cfg.Role(input.Recipient); !ok {
-					return fmt.Errorf("unknown recipient role %q", input.Recipient)
-				}
-			}
-			message, err = store.CreateMessage(ctx, input)
+			message, err = sendMessage(ctx, store, cfg, role, args[1], args[2], workflowID, nil)
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return errors.New("message not found or not visible to this role")
@@ -328,6 +310,42 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// sendMessage saves a message from role to recipient. The CLI and the hub API
+// both send through it, so a remote send is checked exactly like a local one.
+// origin is nil for a local send; a hub send passes its machine, and the
+// attribution commits with the message.
+func sendMessage(ctx context.Context, store *db.Store, cfg config.OrgConfig, role, recipient, body, workflowID string, origin *db.HubWriteOrigin) (db.Message, error) {
+	recipient = strings.ToLower(strings.TrimSpace(recipient))
+	if _, ok := cfg.Role(recipient); !ok {
+		return db.Message{}, fmt.Errorf("unknown recipient role %q", recipient)
+	}
+	return createMessage(ctx, store, db.Message{Sender: role, Recipient: recipient, Body: body, WorkflowID: workflowID}, origin)
+}
+
+// replyMessage answers message id, visible to role, in its thread.
+func replyMessage(ctx context.Context, store *db.Store, cfg config.OrgConfig, role string, id int64, body string, origin *db.HubWriteOrigin) (db.Message, error) {
+	parent, err := store.GetMessage(ctx, id, role)
+	if err != nil {
+		return db.Message{}, errors.New("message not found or not visible to this role")
+	}
+	recipient := parent.Sender
+	if recipient == role {
+		recipient = parent.Recipient
+	}
+	if _, ok := cfg.Role(recipient); !ok && recipient != db.MessageSystemSender {
+		return db.Message{}, fmt.Errorf("recipient role %q is retired", recipient)
+	}
+	// The store derives the recipient and campaign from the parent.
+	return createMessage(ctx, store, db.Message{Sender: role, Body: body, ReplyTo: id}, origin)
+}
+
+func createMessage(ctx context.Context, store *db.Store, input db.Message, origin *db.HubWriteOrigin) (db.Message, error) {
+	if origin != nil {
+		return store.CreateHubMessage(ctx, input, *origin)
+	}
+	return store.CreateMessage(ctx, input)
 }
 
 func printInboxMessage(stdout io.Writer, message db.Message) {

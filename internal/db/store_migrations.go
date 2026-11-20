@@ -3474,4 +3474,34 @@ CREATE INDEX idx_workspaces_state ON workspaces(state);
 ALTER TABLE workspaces ADD COLUMN root_dev INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE workspaces ADD COLUMN root_ino INTEGER NOT NULL DEFAULT 0;
 	`,
+	// #2710: machines that reach the hub API with a client certificate from
+	// the hub's certificate authority. A machine is its certificate's
+	// fingerprint; the roles it may act as are rows in hub_machine_roles. Only
+	// one unrevoked machine per name, so rotating a certificate is revoke then
+	// add. hub_writes records every write made through the hub, with the
+	// machine and role that made it.
+	`
+CREATE TABLE hub_machines (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	name TEXT NOT NULL CHECK(name != ''),
+	fingerprint TEXT NOT NULL UNIQUE CHECK(length(fingerprint) = 64),
+	created_at TEXT NOT NULL,
+	expires_at TEXT NOT NULL,
+	revoked_at TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX idx_hub_machines_one_active ON hub_machines(name) WHERE revoked_at = '';
+CREATE TABLE hub_machine_roles (
+	machine_id INTEGER NOT NULL REFERENCES hub_machines(id),
+	role TEXT NOT NULL CHECK(role != ''),
+	PRIMARY KEY(machine_id, role)
+);
+CREATE TABLE hub_writes (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	created_at TEXT NOT NULL,
+	machine_id INTEGER NOT NULL REFERENCES hub_machines(id),
+	role TEXT NOT NULL,
+	action TEXT NOT NULL,
+	ref TEXT NOT NULL DEFAULT ''
+);
+	`,
 }
