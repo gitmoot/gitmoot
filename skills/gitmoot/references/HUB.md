@@ -30,6 +30,7 @@ recommended, but the mutual TLS check above is the real gate.
 [hub]
 listen = "100.106.218.88:7711"          # this machine's Tailscale address
 advertise = ["dev2306.tailnet.ts.net"]   # optional extra names in the server certificate
+allow = ["messages", "notifications"]    # optional; this is the default
 ```
 
 The daemon reads `[hub]` at start; a change needs a restart, not a SIGHUP. A hub
@@ -59,9 +60,32 @@ certificate, revoke the machine and add it again.
 All responses are JSON; errors are `{"error": "..."}`. Message objects have the
 same fields as the JSON output of the matching `message` command.
 
+### Endpoint groups: `[hub] allow`
+
+Every endpoint belongs to one group, and the hub serves a group only when it
+is in `[hub] allow`. The check runs on every request, after authentication
+and before any handler, so a refused request has no effect. It is refused
+with 403 naming the group.
+
+| Group | Paths |
+|---|---|
+| `messages` | `/v1/messages`, `/v1/messages/...` |
+| `notifications` | `/v1/notifications/...`: claiming the caller role's own mail |
+| `org` | `/v1/org/...` |
+| `tasks` | `/v1/tasks/...` |
+| `reviews` | `/v1/reviews`, `/v1/reviews/...` |
+
+- The default is `["messages", "notifications"]`: messaging, plus the claims a
+  remote seat needs to receive its own mail. `allow = []` leaves only
+  `/v1/whoami`.
+- `/v1/whoami` is always served and reports the allowed groups.
+- A path that belongs to no group gets 404.
+- A path that is not in clean, unescaped form gets 400, so no spelling of a
+  path can be checked as one group and routed as another.
+
 | Method and path | Same as |
 |---|---|
-| `GET /v1/whoami` | the machine, the acting role and the machine's roles |
+| `GET /v1/whoami` | the machine, the acting role, the machine's roles and `allow` |
 | `GET /v1/messages?before=ID&limit=N` | `message inbox` (limit 1-100, default 20) |
 | `GET /v1/messages/{id}` | `message show ID` |
 | `GET /v1/messages/{id}?thread=1&before=ID&limit=N` | `message show ID --thread` |

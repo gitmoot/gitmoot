@@ -54,3 +54,28 @@ func TestLoadHubConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadHubConfigAllow(t *testing.T) {
+	load := func(content string) (HubConfig, error) {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadHubConfig(Paths{ConfigFile: path})
+	}
+	cfg, err := load("[hub]\nlisten = \"100.106.218.88:7711\"\n")
+	if err != nil || strings.Join(cfg.Allow, ",") != "messages,notifications" {
+		t.Fatalf("absent allow: %v %v", cfg.Allow, err)
+	}
+	cfg, err = load("[hub]\nlisten = \"100.106.218.88:7711\"\nallow = []\n")
+	if err != nil || cfg.Allow == nil || len(cfg.Allow) != 0 {
+		t.Fatalf("empty allow must stay empty, not fall back to the default: %#v %v", cfg.Allow, err)
+	}
+	cfg, err = load("[hub]\nlisten = \"100.106.218.88:7711\"\nallow = [\"Reviews\", \"messages\", \"reviews\"]\n")
+	if err != nil || strings.Join(cfg.Allow, ",") != "reviews,messages" {
+		t.Fatalf("listed allow: %v %v", cfg.Allow, err)
+	}
+	if _, err := load("[hub]\nlisten = \"100.106.218.88:7711\"\nallow = [\"admin\"]\n"); err == nil || !strings.Contains(err.Error(), `unknown group "admin"`) {
+		t.Fatalf("unknown group: %v", err)
+	}
+}
