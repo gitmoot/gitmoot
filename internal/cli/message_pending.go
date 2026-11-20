@@ -226,17 +226,26 @@ func claimTurnHookNotifications(request turnHookRequest, input turnHookStdin, in
 		if err != nil {
 			return err
 		}
-		claimed, more, err := claimTurnHookRows(claimCtx, store, role, request, stderr)
-		if err != nil || len(claimed) == 0 {
-			return err
-		}
-		receiptCtx, cancelReceipts := context.WithDeadline(context.Background(), start.Add(turnHookReceiptBudget))
-		defer cancelReceipts()
-		recordTurnHookDirectiveReceipts(receiptCtx, store, role, claimed, stderr)
-		output = turnHookOutputFor(request, renderTurnHookContext(request.event, role, claimed, more))
-		return nil
+		output, err = claimTurnHookForRole(claimCtx, start, store, role, request, stderr)
+		return err
 	})
 	return output, err
+}
+
+// claimTurnHookForRole claims role's deliverable pending mail, records the
+// directive receipts and renders the hook output, or returns nil when there
+// is nothing to deliver. The local hook and the hub's claim endpoint (#2710)
+// both call it, so a remote seat sees exactly what a local one would. The
+// receipt budget runs from start, like the claim budget in claimCtx.
+func claimTurnHookForRole(claimCtx context.Context, start time.Time, store *db.Store, role string, request turnHookRequest, stderr io.Writer) (*turnHookOutput, error) {
+	claimed, more, err := claimTurnHookRows(claimCtx, store, role, request, stderr)
+	if err != nil || len(claimed) == 0 {
+		return nil, err
+	}
+	receiptCtx, cancelReceipts := context.WithDeadline(context.Background(), start.Add(turnHookReceiptBudget))
+	defer cancelReceipts()
+	recordTurnHookDirectiveReceipts(receiptCtx, store, role, claimed, stderr)
+	return turnHookOutputFor(request, renderTurnHookContext(request.event, role, claimed, more)), nil
 }
 
 // claimTurnHookRows applies the daemon's routing policy to each pending row and

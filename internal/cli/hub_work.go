@@ -32,6 +32,7 @@ var hubReviewPurposes = map[string]bool{"code": true, "security": true, "ui": tr
 //	GET  /v1/tasks/{ref}?repo=OWNER/REPO  task show
 //	POST /v1/reviews/level {"repo","pr"}  review level
 //	POST /v1/reviews {"repo","pr","head_sha","message",...} review request
+//	POST /v1/notifications/claim {"runtime","event"}        turn-hook claim
 //
 // Every repository must be inside the caller role's org scope. Review
 // requests take no host paths and no runtime or execution overrides: those
@@ -139,6 +140,32 @@ func registerHubWorkEndpoints(handle func(string, hubHandler), home string, stor
 			return http.StatusInternalServerError, nil, fmt.Errorf("review %s requested, but recording the hub write failed", output.JobID)
 		}
 		return http.StatusCreated, map[string]any{"review": output, "warnings": hubWarnings(warnings)}, nil
+	})
+	handle("POST /v1/notifications/claim", func(ctx context.Context, caller hub.Caller, _ config.OrgConfig, r *http.Request) (int, any, error) {
+		var input struct {
+			Runtime string `json:"runtime"`
+			Event   string `json:"event"`
+		}
+		if err := decodeHubBody(r, &input); err != nil {
+			return http.StatusBadRequest, nil, err
+		}
+		request := turnHookRequest{runtime: strings.ToLower(strings.TrimSpace(input.Runtime)), event: strings.TrimSpace(input.Event)}
+		if err := request.validate(); err != nil {
+			return http.StatusBadRequest, nil, err
+		}
+		start := turnHookNow()
+		claimCtx, cancel := context.WithDeadline(ctx, start.Add(turnHookClaimBudget))
+		defer cancel()
+		var warnings bytes.Buffer
+		output, err := claimTurnHookForRole(claimCtx, start, store, caller.Role, request, &warnings)
+		if err != nil {
+			return http.StatusInternalServerError, nil, fmt.Errorf("claim notifications: %w", err)
+		}
+		if output != nil {
+			// The rows are already delivered; a failed record does not undo that.
+			_ = store.RecordHubWrite(ctx, caller.Machine.ID, caller.Role, "notifications.claim", request.runtime+":"+request.event, time.Now().UTC())
+		}
+		return http.StatusOK, map[string]any{"hook_output": output, "warnings": hubWarnings(warnings)}, nil
 	})
 }
 

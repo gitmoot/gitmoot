@@ -71,6 +71,7 @@ same fields as the JSON output of the matching `message` command.
 | `GET /v1/tasks/{ref}?repo=OWNER/REPO` | `task show REF [--repo]` |
 | `POST /v1/reviews/level` `{"repo", "pr"}` | `review level`; returns `{"decision", "warnings"}` |
 | `POST /v1/reviews` `{"repo", "pr", "head_sha", "message", "purpose"?, "reviewer"?, "model"?, "post_merge"?, "no_execution"?}` | `review request --org-role <caller's role>`; returns `{"review", "warnings"}` |
+| `POST /v1/notifications/claim` `{"runtime", "event"}` | `message pending --claim --hook EVENT --runtime claude\|codex` for the caller's role; returns `{"hook_output"}` (null when nothing is pending), the same output a local turn hook prints |
 
 Each endpoint calls the same code as its CLI command, so a remote request is
 checked exactly like a local one. Every write is recorded in `hub_writes` with
