@@ -631,13 +631,14 @@ const ompNoExecutionTools = "read,grep,glob,todo"
 
 // ompNoExecutionVerifiedVersions are the omp builds whose no-execution
 // behaviour was measured: 18.10.4 in #2364, 18.18.6 in #2561, 18.18.8 in
-// #2571 and 18.20.0 in #2663 (tool allowlist, provider and MCP gating, --cwd,
-// settings overlay precedence; probe and record in
-// /root/fleet-tools/state/gitmoot-2561 on the fleet host; 18.20.0 with
-// tools.xdev off: probe-omp-noexec-xdev.sh, runs-xdev-20261115/,
-// record-18.20.0.md). Another version may move a discovery path or a flag, so
+// #2571, 18.20.0 in #2663 and 19.0.1 for the gpt-6.2-sol review model (tool
+// allowlist, provider and MCP gating, --cwd, settings overlay precedence;
+// probe and record in /root/fleet-tools/state/gitmoot-2561 on the fleet host;
+// 18.20.0 and 19.0.1 with tools.xdev off: probe-omp-noexec-xdev.sh,
+// runs-xdev-20261115/, runs-xdev-20261120/, record-18.20.0.md,
+// record-19.0.1.md). Another version may move a discovery path or a flag, so
 // a no-execution seat refuses it until it is measured and added here.
-var ompNoExecutionVerifiedVersions = map[string]bool{"omp/18.10.4": true, "omp/18.18.6": true, "omp/18.18.8": true, "omp/18.20.0": true}
+var ompNoExecutionVerifiedVersions = map[string]bool{"omp/18.10.4": true, "omp/18.18.6": true, "omp/18.18.8": true, "omp/18.20.0": true, "omp/19.0.1": true}
 
 // OmpNoExecutionVersionError refuses a no-execution seat on an omp build
 // whose behaviour has not been verified. version is the runtime contract
@@ -660,9 +661,9 @@ func OmpNoExecutionVersionError(version string) error {
 
 // ompDiscoveryProviders is every config-discovery provider omp ships (the ids
 // registered with its capability registry: the same set in 18.10.4, 18.18.6
-// and 18.18.8; 18.20.0 adds ssh-config, OpenSSH config hosts, and an id a
-// build does not register is ignored). A no-execution seat disables ALL of
-// them, because each one can
+// and 18.18.8; 18.20.0 adds ssh-config, OpenSSH config hosts, and 19.0.1
+// registers the same set as 18.20.0; an id a build does not register is
+// ignored). A no-execution seat disables ALL of them, because each one can
 // contribute MCP servers, custom tools, hooks, extensions or rules from user or
 // project files. Measured on both versions (#2364, #2561): with --no-extensions
 // alone, project and user `tools/*.js` still load in-process and project and
