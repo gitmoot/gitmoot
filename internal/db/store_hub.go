@@ -173,3 +173,20 @@ func (s *Store) hubMachineRoles(ctx context.Context, machineID int64) ([]string,
 	}
 	return roles, rows.Err()
 }
+
+// RecordHubWrite records a hub write that cannot share a transaction with
+// its action (a review request, a level decision, a notification outcome).
+// Callers record it BEFORE acting and refuse the request if it fails, so a
+// remote write never exists without attribution; at worst a row names an
+// attempt that then failed.
+func (s *Store) RecordHubWrite(ctx context.Context, machineID int64, role, action, ref string, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := insertHubWrite(ctx, tx, machineID, role, action, ref, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}

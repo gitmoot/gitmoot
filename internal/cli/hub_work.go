@@ -82,14 +82,16 @@ func registerHubWorkEndpoints(handle func(string, hubHandler), home string, stor
 		if status, err := hubRequireScope(org, caller.Role, repo.FullName()); err != nil {
 			return status, nil, err
 		}
+		// Attribution first: the decision posts a commit status and writes the
+		// level log, which cannot share a transaction with hub_writes.
+		ref := fmt.Sprintf("level:%s#%d", repo.FullName(), input.PR)
+		if err := store.RecordHubWrite(ctx, caller.Machine.ID, caller.Role, "review.level", ref, time.Now().UTC()); err != nil {
+			return http.StatusInternalServerError, nil, errors.New("could not record the hub write; nothing was decided")
+		}
 		var warnings bytes.Buffer
 		decision, err := decideReviewLevel(ctx, home, repo, input.PR, &warnings)
 		if err != nil {
 			return http.StatusBadGateway, nil, fmt.Errorf("review level: %w", err)
-		}
-		ref := fmt.Sprintf("level:%s#%d@%s", repo.FullName(), input.PR, decision.HeadSHA)
-		if err := store.RecordHubWrite(ctx, caller.Machine.ID, caller.Role, "review.level", ref, time.Now().UTC()); err != nil {
-			return http.StatusInternalServerError, nil, errors.New("level decided and posted, but recording the hub write failed")
 		}
 		return http.StatusOK, map[string]any{"decision": decision, "warnings": hubWarnings(warnings)}, nil
 	})
@@ -126,6 +128,11 @@ func registerHubWorkEndpoints(handle func(string, hubHandler), home string, stor
 		if status, err := hubRequireScope(org, caller.Role, repo.FullName()); err != nil {
 			return status, nil, err
 		}
+		// Attribution first, for the same reason as review level.
+		ref := fmt.Sprintf("review:%s#%d@%s", repo.FullName(), input.PR, head)
+		if err := store.RecordHubWrite(ctx, caller.Machine.ID, caller.Role, "review.request", ref, time.Now().UTC()); err != nil {
+			return http.StatusInternalServerError, nil, errors.New("could not record the hub write; no review was requested")
+		}
 		var warnings bytes.Buffer
 		output, err := requestReview(ctx, store, reviewRequestOptions{
 			home: home, repo: repo.FullName(), pr: input.PR, head: head, purpose: purpose,
@@ -135,9 +142,6 @@ func registerHubWorkEndpoints(handle func(string, hubHandler), home string, stor
 		}, &warnings)
 		if err != nil {
 			return http.StatusBadRequest, nil, fmt.Errorf("review request: %w", err)
-		}
-		if err := store.RecordHubWrite(ctx, caller.Machine.ID, caller.Role, "review.request", "run:"+output.JobID, time.Now().UTC()); err != nil {
-			return http.StatusInternalServerError, nil, fmt.Errorf("review %s requested, but recording the hub write failed", output.JobID)
 		}
 		return http.StatusCreated, map[string]any{"review": output, "warnings": hubWarnings(warnings)}, nil
 	})
@@ -153,6 +157,10 @@ func registerHubWorkEndpoints(handle func(string, hubHandler), home string, stor
 		if err := request.validate(); err != nil {
 			return http.StatusBadRequest, nil, err
 		}
+		// Attribution first: a claim delivers rows, which cannot be undone.
+		if err := store.RecordHubWrite(ctx, caller.Machine.ID, caller.Role, "notifications.claim", request.runtime+":"+request.event, time.Now().UTC()); err != nil {
+			return http.StatusInternalServerError, nil, errors.New("could not record the hub write; nothing was claimed")
+		}
 		start := turnHookNow()
 		claimCtx, cancel := context.WithDeadline(ctx, start.Add(turnHookClaimBudget))
 		defer cancel()
@@ -160,10 +168,6 @@ func registerHubWorkEndpoints(handle func(string, hubHandler), home string, stor
 		output, err := claimTurnHookForRole(claimCtx, start, store, caller.Role, request, &warnings)
 		if err != nil {
 			return http.StatusInternalServerError, nil, fmt.Errorf("claim notifications: %w", err)
-		}
-		if output != nil {
-			// The rows are already delivered; a failed record does not undo that.
-			_ = store.RecordHubWrite(ctx, caller.Machine.ID, caller.Role, "notifications.claim", request.runtime+":"+request.event, time.Now().UTC())
 		}
 		return http.StatusOK, map[string]any{"hook_output": output, "warnings": hubWarnings(warnings)}, nil
 	})
