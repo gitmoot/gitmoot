@@ -30,6 +30,7 @@ recommended, but the mutual TLS check above is the real gate.
 [hub]
 listen = "100.106.218.88:7711"          # this machine's Tailscale address
 advertise = ["dev2306.tailnet.ts.net"]   # optional extra names in the server certificate
+allow = ["messages", "notifications"]    # optional; this is the default
 ```
 
 The daemon reads `[hub]` at start; a change needs a restart, not a SIGHUP. A hub
@@ -59,16 +60,40 @@ certificate, revoke the machine and add it again.
 All responses are JSON; errors are `{"error": "..."}`. Message objects have the
 same fields as the JSON output of the matching `message` command.
 
+### Endpoint groups: `[hub] allow`
+
+Every endpoint belongs to one group, and the hub serves a group only when it
+is in `[hub] allow`. The check runs on every request, after authentication
+and before any handler, so a refused request has no effect. It is refused
+with 403 naming the group.
+
+| Group | Paths |
+|---|---|
+| `messages` | `/v1/messages`, `/v1/messages/...` |
+| `notifications` | `/v1/notifications/...`: claiming the caller role's own mail |
+| `org` | `/v1/org/...` |
+| `tasks` | `/v1/tasks`, `/v1/tasks/...` |
+| `reviews` | `/v1/reviews`, `/v1/reviews/...` |
+
+- The default is `["messages", "notifications"]`: messaging, plus the claims a
+  remote seat needs to receive its own mail. `allow = []` leaves only
+  `/v1/whoami`.
+- `/v1/whoami` is always served and reports the allowed groups.
+- A path that belongs to no group gets 404.
+- A path that is not clean, or contains any percent-escape, gets 400, so no
+  spelling of a path can be checked as one group and routed as another. No
+  endpoint needs an escape: the `pr show` ref travels in the query.
+
 | Method and path | Same as |
 |---|---|
-| `GET /v1/whoami` | the machine, the acting role and the machine's roles |
+| `GET /v1/whoami` | the machine, the acting role, the machine's roles and `allow` |
 | `GET /v1/messages?before=ID&limit=N` | `message inbox` (limit 1-100, default 20) |
 | `GET /v1/messages/{id}` | `message show ID` |
 | `GET /v1/messages/{id}?thread=1&before=ID&limit=N` | `message show ID --thread` |
 | `POST /v1/messages` `{"to", "body", "campaign"?}` | `message send TO BODY [--campaign ID]` |
 | `POST /v1/messages/{id}/reply` `{"body"}` | `message reply ID BODY` |
 | `GET /v1/org/brief` | `org brief --role <caller's role>` (presence noted as `org brief (hub: MACHINE)`) |
-| `GET /v1/tasks/{ref}?repo=OWNER/REPO` | `pr show REF [--repo]` |
+| `GET /v1/tasks?ref=REF&repo=OWNER/REPO` | `pr show REF [--repo]` |
 | `POST /v1/reviews/level` `{"repo", "pr"}` | `review level`; returns `{"decision", "warnings"}` |
 | `POST /v1/reviews` `{"repo", "pr", "head_sha"?, "message", "purpose"?, "reviewer"?, "model"?, "post_merge"?, "no_execution"?}` | `review request --org-role <caller's role>`; returns `{"review", "warnings"}` |
 | `POST /v1/notifications/claim` `{"runtime", "event"}` | `message pending --claim --hook EVENT --runtime claude\|codex` for the caller's role; returns `{"hook_output"}` (null when nothing is pending), the same output a local turn hook prints |

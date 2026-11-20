@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -25,7 +26,13 @@ import (
 
 // hubTestServer serves hubAPI exactly as startHub does, but on loopback with
 // loopback admitted as a peer, since a test host has no Tailscale address.
+// Every endpoint group is allowed; hubTestServerAllow takes a [hub] allow.
 func hubTestServer(t *testing.T, home string) string {
+	t.Helper()
+	return hubTestServerAllow(t, home, config.HubGroups)
+}
+
+func hubTestServerAllow(t *testing.T, home string, allow []string) string {
 	t.Helper()
 	paths := config.PathsForHome(home)
 	authority, err := hub.LoadOrCreateAuthority(hub.Dir(paths.Home))
@@ -42,7 +49,7 @@ func hubTestServer(t *testing.T, home string) string {
 		t.Fatal(err)
 	}
 	handler := hub.Authenticate(store.ActiveHubMachineByFingerprint, time.Now,
-		[]netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, hubAPI(home, paths, store))
+		[]netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, hubAllow(allow, hubAPI(home, paths, store)))
 	server, err := hub.Serve(listener, authority, []string{"127.0.0.1"}, handler)
 	if err != nil {
 		t.Fatal(err)
@@ -278,5 +285,95 @@ func TestHubMachineNamedCAEnrolls(t *testing.T) {
 	base := hubTestServer(t, home)
 	if status, body := hubCall(t, hubTestClient(t, certs, "ca"), http.MethodGet, base+"/v1/whoami", "", ""); status != http.StatusOK || !strings.Contains(body, `"machine": "ca"`) {
 		t.Fatalf("whoami as ca: %d %s", status, body)
+	}
+}
+
+// With the default [hub] allow a machine can message and claim its own mail,
+// and nothing else: org, tasks and reviews are refused before any handler
+// runs, whoami reports the groups, and no path spelling routes around the
+// check (#2710, owner decision: remote machines are messages only).
+func TestHubDefaultAllowServesMessagingOnly(t *testing.T) {
+	home := messageTestHome(t)
+	certs := filepath.Join(t.TempDir(), "mac")
+	if code, _, diag := hubCLI(t, home, "machine", "add", "mac", "--role", "gm-omp-impl", "--out", certs); code != 0 {
+		t.Fatalf("machine add exit=%d: %s", code, diag)
+	}
+	base := hubTestServerAllow(t, home, config.DefaultHubAllow)
+	client := hubTestClient(t, certs, "mac")
+
+	status, body := hubCall(t, client, http.MethodGet, base+"/v1/whoami", "", "")
+	if status != http.StatusOK || !strings.Contains(body, `"allow": [`) || !strings.Contains(body, `"messages"`) || !strings.Contains(body, `"notifications"`) || strings.Contains(body, `"reviews"`) {
+		t.Fatalf("whoami %d %s", status, body)
+	}
+	if status, body := hubCall(t, client, http.MethodPost, base+"/v1/messages", "", `{"to":"deimos","body":"allowed"}`); status != http.StatusCreated {
+		t.Fatalf("messages refused: %d %s", status, body)
+	}
+	if status, body := hubCall(t, client, http.MethodGet, base+"/v1/messages", "", ""); status != http.StatusOK {
+		t.Fatalf("inbox refused: %d %s", status, body)
+	}
+	for _, call := range []struct{ method, path, body, group string }{
+		{http.MethodGet, "/v1/org/brief", "", "org"},
+		{http.MethodGet, "/v1/tasks?ref=7&repo=gitmoot/implementation", "", "tasks"},
+		{http.MethodPost, "/v1/reviews/level", `{"repo":"gitmoot/implementation","pr":7}`, "reviews"},
+		{http.MethodPost, "/v1/reviews", `{"repo":"gitmoot/implementation","pr":7,"message":"m"}`, "reviews"},
+	} {
+		status, body := hubCall(t, client, call.method, base+call.path, "", call.body)
+		if status != http.StatusForbidden || !strings.Contains(body, "does not serve "+call.group) {
+			t.Errorf("%s %s: %d %s", call.method, call.path, status, body)
+		}
+	}
+	for _, sneaky := range []string{"/v1/messages/../reviews/level", "/v1/messages/%2e%2e/reviews/level", "/v1//reviews/level", "/v1/messages%2F..%2Freviews%2Flevel"} {
+		status, body := hubCall(t, client, http.MethodPost, base+sneaky, "", `{"repo":"gitmoot/implementation","pr":7}`)
+		if status == http.StatusOK || status == http.StatusCreated || strings.Contains(body, `"decision"`) {
+			t.Errorf("%s reached a handler: %d %s", sneaky, status, body)
+		}
+	}
+	if status, _ := hubCall(t, client, http.MethodGet, base+"/v1/unknown", "", ""); status != http.StatusNotFound {
+		t.Errorf("a path in no group: %d", status)
+	}
+	if n := hubWriteCount(t, home, "review.level") + hubWriteCount(t, home, "review.request"); n != 0 {
+		t.Fatalf("a refused review endpoint recorded %d writes", n)
+	}
+}
+
+// A route added to the hub later without a [hub] allow group is refused, even
+// with every group allowed and a handler registered for it: the check fails
+// closed instead of passing paths it does not know.
+func TestHubAllowRefusesARouteInNoGroup(t *testing.T) {
+	reached := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/admin/config", func(http.ResponseWriter, *http.Request) { reached = true })
+	mux.HandleFunc("GET /v1/whoami", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(hubAllowedFrom(r.Context()))
+	})
+	handler := hubAllow(config.HubGroups, mux)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/admin/config", nil))
+	if reached || recorder.Code != http.StatusNotFound {
+		t.Fatalf("a route in no group: reached=%t status=%d", reached, recorder.Code)
+	}
+	// whoami needs no group, even with nothing allowed.
+	recorder = httptest.NewRecorder()
+	hubAllow([]string{}, mux).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/whoami", nil))
+	if recorder.Code != http.StatusOK || strings.TrimSpace(recorder.Body.String()) != "[]" {
+		t.Fatalf("whoami with allow = []: %d %q", recorder.Code, recorder.Body.String())
+	}
+}
+
+// An unclean or escaped path is refused before routing, so a router that
+// does not normalise paths itself can never be handed one group's path that
+// the check classified as another (#2710 [hub] allow).
+func TestHubAllowRefusesUncleanPathsBeforeRouting(t *testing.T) {
+	// %20, %25, %3F and %2F are the default escapes Go records with an empty
+	// URL.RawPath, the review's probes; they must be refused like the rest.
+	for _, target := range []string{"/v1/messages/../reviews/level", "/v1/messages/./x", "/v1/messages%2F..%2Freviews",
+		"/v1/messages/a%20b", "/v1/messages/%25", "/v1/messages/%3F", "/v1/tasks/%207"} {
+		reached := false
+		next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true })
+		recorder := httptest.NewRecorder()
+		hubAllow(config.DefaultHubAllow, next).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, target, nil))
+		if reached || recorder.Code != http.StatusBadRequest {
+			t.Errorf("%s: reached=%t status=%d", target, reached, recorder.Code)
+		}
 	}
 }

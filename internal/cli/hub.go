@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -376,8 +378,8 @@ func hubAPI(home string, paths config.Paths, store *db.Store) http.Handler {
 			_ = writeJSON(w, value)
 		})
 	}
-	handle("GET /v1/whoami", func(_ context.Context, caller hub.Caller, _ config.OrgConfig, _ *http.Request) (int, any, error) {
-		return http.StatusOK, map[string]any{"machine": caller.Machine.Name, "role": caller.Role, "roles": caller.Machine.Roles}, nil
+	handle("GET /v1/whoami", func(_ context.Context, caller hub.Caller, _ config.OrgConfig, r *http.Request) (int, any, error) {
+		return http.StatusOK, map[string]any{"machine": caller.Machine.Name, "role": caller.Role, "roles": caller.Machine.Roles, "allow": hubAllowedFrom(r.Context())}, nil
 	})
 	handle("GET /v1/messages", func(ctx context.Context, caller hub.Caller, _ config.OrgConfig, r *http.Request) (int, any, error) {
 		before, limit, err := hubPage(r)
@@ -544,11 +546,71 @@ func startHub(home string, paths config.Paths, cfg config.HubConfig) (*hub.Serve
 		return nil, nil, err
 	}
 	hosts := append([]string{address.Addr().String()}, cfg.Advertise...)
-	handler := hub.Authenticate(store.ActiveHubMachineByFingerprint, time.Now, config.TailscalePrefixes, hubAPI(home, paths, store))
+	handler := hub.Authenticate(store.ActiveHubMachineByFingerprint, time.Now, config.TailscalePrefixes, hubAllow(cfg.Allow, hubAPI(home, paths, store)))
 	server, err := hub.Serve(listener, authority, hosts, handler)
 	if err != nil {
 		_ = store.Close()
 		return nil, nil, err
 	}
 	return server, store, nil
+}
+
+type hubAllowKey struct{}
+
+// hubGroupForPath names the [hub] allow group a request path belongs to.
+// /v1/whoami belongs to none and is always served, so a machine can see what
+// it may use. ok is false for a path in no group, which is never served.
+func hubGroupForPath(requestPath string) (group string, ok bool) {
+	switch {
+	case requestPath == "/v1/whoami":
+		return "", true
+	case requestPath == "/v1/messages" || strings.HasPrefix(requestPath, "/v1/messages/"):
+		return "messages", true
+	case strings.HasPrefix(requestPath, "/v1/notifications/"):
+		return "notifications", true
+	case strings.HasPrefix(requestPath, "/v1/org/"):
+		return "org", true
+	case requestPath == "/v1/tasks" || strings.HasPrefix(requestPath, "/v1/tasks/"):
+		return "tasks", true
+	case requestPath == "/v1/reviews" || strings.HasPrefix(requestPath, "/v1/reviews/"):
+		return "reviews", true
+	}
+	return "", false
+}
+
+// hubAllow serves a request only when its endpoint group is in allow ([hub]
+// allow, #2710). It runs after authentication and before routing, on every
+// request. A path that is not in clean form is refused rather than resolved,
+// so no spelling of a path can be checked as one group and routed as another.
+func hubAllow(allow []string, next http.Handler) http.Handler {
+	allowed := slices.Clone(allow)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// r.URL.RawPath is set only for non-default escapes, so the escaped
+		// form itself is checked: no hub path needs an escape (a task ref
+		// travels in the query), and any percent sign is refused.
+		requestPath := r.URL.Path
+		if path.Clean(requestPath) != requestPath || strings.Contains(r.URL.EscapedPath(), "%") {
+			hub.WriteError(w, http.StatusBadRequest, "request path must be in clean, unescaped form")
+			return
+		}
+		group, known := hubGroupForPath(requestPath)
+		if !known {
+			hub.WriteError(w, http.StatusNotFound, "not served by the hub")
+			return
+		}
+		if group != "" && !slices.Contains(allowed, group) {
+			hub.WriteError(w, http.StatusForbidden, fmt.Sprintf("the hub does not serve %s to remote machines ([hub] allow = [%s])", group, strings.Join(allowed, ", ")))
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), hubAllowKey{}, allowed)))
+	})
+}
+
+// hubAllowedFrom returns the groups hubAllow admitted the request under.
+func hubAllowedFrom(ctx context.Context) []string {
+	allowed, _ := ctx.Value(hubAllowKey{}).([]string)
+	if allowed == nil {
+		return []string{}
+	}
+	return allowed
 }

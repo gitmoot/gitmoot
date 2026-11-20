@@ -40,7 +40,7 @@ func TestHubWorkEndpointsRefuseReposOutsideTheRolesScope(t *testing.T) {
 	client, base := hubWorkClient(t, home, "gm-omp-impl")
 	head := strings.Repeat("a", 40)
 	for _, call := range []struct{ method, path, body string }{
-		{http.MethodGet, "/v1/tasks/7?repo=other/repo", ""},
+		{http.MethodGet, "/v1/tasks?ref=7&repo=other/repo", ""},
 		{http.MethodPost, "/v1/reviews/level", `{"repo":"other/repo","pr":7}`},
 		{http.MethodPost, "/v1/reviews", `{"repo":"other/repo","pr":7,"head_sha":"` + head + `","message":"m"}`},
 	} {

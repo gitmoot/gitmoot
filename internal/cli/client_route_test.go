@@ -195,3 +195,14 @@ func TestClientRoleDefaultsReachTheHub(t *testing.T) {
 		t.Fatalf("review request without --role/--head: exit=%d %s", code, diag)
 	}
 }
+
+// pr show with an owner/repo#N ref reaches the hub's task handler: the ref
+// travels in the query, because the hub refuses any escaped path (#2718).
+func TestClientPRShowRefWithSlashAndHashReachesTheHub(t *testing.T) {
+	hubHome := messageTestHome(t)
+	clientHome, _ := clientTestHome(t, hubHome, "mac", "gm-omp-impl", "")
+	code, _, diag := runCLI(t, "pr", "show", "gitmoot/implementation#7", "--home", clientHome)
+	if code == 0 || !strings.Contains(diag, "not found") || strings.Contains(diag, "escape") || strings.Contains(diag, "HTTP 400") {
+		t.Fatalf("pr show owner/repo#N through the hub: exit=%d %s", code, diag)
+	}
+}

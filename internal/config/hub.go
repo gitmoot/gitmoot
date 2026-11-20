@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -18,7 +19,23 @@ type HubConfig struct {
 	// Advertise are extra host names or addresses for the server certificate,
 	// such as the machine's MagicDNS name. The Listen address is always in it.
 	Advertise []string
+	// Allow are the endpoint groups (HubGroups) remote machines may use.
+	// Absent, it is DefaultHubAllow; `allow = []` leaves only /v1/whoami.
+	Allow []string
 }
+
+// HubGroups are the hub's endpoint groups, in display order:
+//
+//	messages       /v1/messages...
+//	notifications  /v1/notifications/... (claiming the caller's own mail)
+//	org            /v1/org/...
+//	tasks          /v1/tasks, /v1/tasks/...
+//	reviews        /v1/reviews...
+var HubGroups = []string{"messages", "notifications", "org", "tasks", "reviews"}
+
+// DefaultHubAllow is messaging: sending and reading messages, and the
+// notification claims a remote seat needs to receive its own mail.
+var DefaultHubAllow = []string{"messages", "notifications"}
 
 // Tailscale assigns node addresses from these prefixes only.
 var TailscalePrefixes = []netip.Prefix{
@@ -97,9 +114,27 @@ func LoadHubConfig(paths Paths) (HubConfig, error) {
 					return HubConfig{}, fmt.Errorf("parse [hub].advertise: %q is not a host name or address", host)
 				}
 			}
+		case "allow":
+			allow, err := parseConfigStringArray(value)
+			if err != nil {
+				return HubConfig{}, fmt.Errorf("parse [hub].allow: %w", err)
+			}
+			cfg.Allow = make([]string, 0, len(allow))
+			for _, group := range allow {
+				group = strings.ToLower(strings.TrimSpace(group))
+				if !slices.Contains(HubGroups, group) {
+					return HubConfig{}, fmt.Errorf("parse [hub].allow: unknown group %q (want any of %s)", group, strings.Join(HubGroups, ", "))
+				}
+				if !slices.Contains(cfg.Allow, group) {
+					cfg.Allow = append(cfg.Allow, group)
+				}
+			}
 		default:
 			return HubConfig{}, fmt.Errorf("parse [hub]: unknown key %q", key)
 		}
+	}
+	if cfg.Allow == nil {
+		cfg.Allow = slices.Clone(DefaultHubAllow)
 	}
 	if cfg.Listen != "" {
 		if _, err := ValidateHubListen(cfg.Listen); err != nil {

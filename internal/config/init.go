@@ -243,6 +243,10 @@ max_consecutive_missed_wakes = 0
 # [hub]
 # listen = "100.64.0.1:7711"
 # advertise = ["host.tailnet.ts.net"]
+# allow lists the endpoint groups remote machines may use: messages,
+# notifications, org, tasks, reviews. The default is messages and
+# notifications.
+# allow = ["messages", "notifications"]
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool
