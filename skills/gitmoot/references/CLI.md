@@ -460,7 +460,7 @@ Usage:
   gitmoot hub machine revoke NAME [--home DIR]
 
 add issues a client certificate from the hub's authority and writes ca.pem,
-NAME.pem and NAME.key (mode 600) into DIR, a new or empty directory. Copy them
+NAME.crt and NAME.key (mode 600) into DIR, a new or empty directory. Copy them
 to the machine; the private key exists nowhere else. The machine may act as
 the listed org roles only. revoke stops the certificate on its next request.
 The daemon serves the hub when [hub] listen is set.

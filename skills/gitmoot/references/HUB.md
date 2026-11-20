@@ -49,7 +49,7 @@ gitmoot hub machine revoke mac-studio
 ```
 
 `add` checks the roles exist, issues a certificate, and writes `ca.pem`,
-`NAME.pem` and `NAME.key` (mode 600) into `--out`, which must be new or empty.
+`NAME.crt` and `NAME.key` (mode 600) into `--out`, which must be new or empty.
 The private key exists only in that directory: copy the three files to the
 machine, then delete them here. One unrevoked machine per name; to replace a
 certificate, revoke the machine and add it again.
@@ -74,6 +74,6 @@ the machine and role that made it. Org changes, merges, deploys and config are
 not served, and will not be: they stay on the hub machine.
 
 ```sh
-curl --cacert ca.pem --cert mac-studio.pem --key mac-studio.key \
+curl --cacert ca.pem --cert mac-studio.crt --key mac-studio.key \
   https://100.106.218.88:7711/v1/whoami
 ```

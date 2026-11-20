@@ -106,9 +106,16 @@ func (s *Store) RevokeHubMachine(ctx context.Context, name string, now time.Time
 	return machines[0], nil
 }
 
-// RecordHubWrite records a write made through the hub API.
-func (s *Store) RecordHubWrite(ctx context.Context, machineID int64, role, action, ref string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO hub_writes(created_at, machine_id, role, action, ref) VALUES (?, ?, ?, ?, ?)`,
+// HubWriteOrigin names the machine and the action of a write made through the
+// hub API; the role is the write's own acting role.
+type HubWriteOrigin struct {
+	MachineID int64
+	Action    string
+}
+
+// insertHubWrite records a hub write inside the transaction that makes it.
+func insertHubWrite(ctx context.Context, tx *sql.Tx, machineID int64, role, action, ref string, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO hub_writes(created_at, machine_id, role, action, ref) VALUES (?, ?, ?, ?, ?)`,
 		formatWorkspaceTime(now), machineID, role, action, ref)
 	return err
 }

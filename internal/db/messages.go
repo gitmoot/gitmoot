@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Message is immutable conversation data. Status describes the notification,
@@ -96,6 +98,21 @@ func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 // existing notification obligation together. Role authorization is the CLI's
 // responsibility; participant routing is derived here rather than caller text.
 func (s *Store) CreateMessage(ctx context.Context, input Message) (Message, error) {
+	return s.createMessage(ctx, input, nil)
+}
+
+// CreateHubMessage is CreateMessage for a write that arrived through the hub
+// API (#2710). The hub_writes row naming the machine and role is committed in
+// the same transaction, so a remote message never exists without its
+// attribution, and a failed attribution leaves no message behind.
+func (s *Store) CreateHubMessage(ctx context.Context, input Message, origin HubWriteOrigin) (Message, error) {
+	if origin.MachineID <= 0 || strings.TrimSpace(origin.Action) == "" {
+		return Message{}, errors.New("hub message requires its machine and action")
+	}
+	return s.createMessage(ctx, input, &origin)
+}
+
+func (s *Store) createMessage(ctx context.Context, input Message, origin *HubWriteOrigin) (Message, error) {
 	input.Sender = strings.TrimSpace(input.Sender)
 	input.Recipient = strings.TrimSpace(input.Recipient)
 	if input.Sender == "" || strings.TrimSpace(input.Body) == "" || len(input.Body) > 16000 {
@@ -165,6 +182,11 @@ func (s *Store) CreateMessage(ctx context.Context, input Message) (Message, erro
 	})
 	if err != nil {
 		return Message{}, err
+	}
+	if origin != nil {
+		if err := insertHubWrite(ctx, tx, origin.MachineID, input.Sender, origin.Action, "message:"+strconv.FormatInt(noteID, 10), time.Now().UTC()); err != nil {
+			return Message{}, fmt.Errorf("record hub write: %w", err)
+		}
 	}
 
 	if err = tx.Commit(); err != nil {

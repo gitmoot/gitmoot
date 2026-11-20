@@ -63,7 +63,7 @@ func hubTestClient(t *testing.T, dir, name string) *http.Client {
 	if !roots.AppendCertsFromPEM(caPEM) {
 		t.Fatal("ca.pem holds no certificate")
 	}
-	certificate, err := tls.LoadX509KeyPair(filepath.Join(dir, name+".pem"), filepath.Join(dir, name+".key"))
+	certificate, err := tls.LoadX509KeyPair(filepath.Join(dir, name+".crt"), filepath.Join(dir, name+".key"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,5 +258,19 @@ func TestHubRefusesARoleNoLongerInTheOrg(t *testing.T) {
 	}
 	if status, body := hubCall(t, client, http.MethodGet, base+"/v1/messages", "", ""); status != http.StatusForbidden {
 		t.Fatalf("after removal: %d %s", status, body)
+	}
+}
+
+// Every valid machine name enrolls, including one that matches the CA file's
+// stem, and its certificate works.
+func TestHubMachineNamedCAEnrolls(t *testing.T) {
+	home := messageTestHome(t)
+	certs := filepath.Join(t.TempDir(), "ca-machine")
+	if code, _, diag := hubCLI(t, home, "machine", "add", "ca", "--role", "deimos", "--out", certs); code != 0 {
+		t.Fatalf("machine add ca exit=%d: %s", code, diag)
+	}
+	base := hubTestServer(t, home)
+	if status, body := hubCall(t, hubTestClient(t, certs, "ca"), http.MethodGet, base+"/v1/whoami", "", ""); status != http.StatusOK || !strings.Contains(body, `"machine": "ca"`) {
+		t.Fatalf("whoami as ca: %d %s", status, body)
 	}
 }

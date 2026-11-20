@@ -29,6 +29,9 @@ const (
 	hubDefaultMachineDays = 365
 	hubMaxMachineDays     = 3 * 365
 	hubMaxRequestBody     = 64 << 10
+	// hubCAFile is the authority certificate `hub machine add` writes; the
+	// client files are NAME.crt and NAME.key, so no name collides with it.
+	hubCAFile = "ca.pem"
 )
 
 func runHub(args []string, stdout, stderr io.Writer) int {
@@ -72,7 +75,7 @@ func printHubUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot hub machine revoke NAME [--home DIR]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "add issues a client certificate from the hub's authority and writes ca.pem,")
-	fmt.Fprintln(w, "NAME.pem and NAME.key (mode 600) into DIR, a new or empty directory. Copy them")
+	fmt.Fprintln(w, "NAME.crt and NAME.key (mode 600) into DIR, a new or empty directory. Copy them")
 	fmt.Fprintln(w, "to the machine; the private key exists nowhere else. The machine may act as")
 	fmt.Fprintln(w, "the listed org roles only. revoke stops the certificate on its next request.")
 	fmt.Fprintln(w, "The daemon serves the hub when [hub] listen is set.")
@@ -163,32 +166,41 @@ func runHubMachineAdd(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), orgSeatExternalTimeout)
-		defer cancel()
-		machine, err := store.AddHubMachine(ctx, db.HubMachine{Name: name, Fingerprint: hex.EncodeToString(leaf.Fingerprint[:]),
-			Roles: normalized, CreatedAt: now, ExpiresAt: leaf.NotAfter})
-		if err != nil {
-			return err
-		}
+		// Distinct extensions keep NAME.crt and NAME.key from ever colliding
+		// with ca.pem, whatever the machine is called. The files are written
+		// before the machine is registered, so a failed write registers
+		// nothing; a failed registration removes exactly the files this call
+		// created in a directory it found empty.
 		files := []struct {
 			name string
 			data []byte
 			mode os.FileMode
 		}{
-			{"ca.pem", authority.CertificatePEM(), 0o644},
-			{name + ".pem", leaf.CertificatePEM, 0o644},
+			{hubCAFile, authority.CertificatePEM(), 0o644},
+			{name + ".crt", leaf.CertificatePEM, 0o644},
 			{name + ".key", leaf.PrivateKeyPEM, 0o600},
 		}
 		written := make([]string, 0, len(files))
+		removeWritten := func() {
+			for _, path := range written {
+				_ = os.Remove(path)
+			}
+		}
 		for _, file := range files {
 			path := filepath.Join(outDir, file.name)
 			if err := writeNewFile(path, file.data, file.mode); err != nil {
-				// The certificate is unusable without its files; revoke it so no
-				// half-delivered machine stays registered.
-				_, _ = store.RevokeHubMachine(ctx, name, time.Now().UTC())
-				return fmt.Errorf("write %s (machine %s revoked): %w", path, name, err)
+				removeWritten()
+				return fmt.Errorf("write %s (nothing registered): %w", path, err)
 			}
 			written = append(written, path)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), orgSeatExternalTimeout)
+		defer cancel()
+		machine, err := store.AddHubMachine(ctx, db.HubMachine{Name: name, Fingerprint: hex.EncodeToString(leaf.Fingerprint[:]),
+			Roles: normalized, CreatedAt: now, ExpiresAt: leaf.NotAfter})
+		if err != nil {
+			removeWritten()
+			return err
 		}
 		if *jsonOutput {
 			result := newHubMachineJSON(machine)
@@ -414,11 +426,12 @@ func hubAPI(paths config.Paths, store *db.Store) http.Handler {
 				return http.StatusBadRequest, nil, err
 			}
 		}
-		message, err := sendMessage(ctx, store, org, caller.Role, input.To, input.Body, input.Campaign)
+		message, err := sendMessage(ctx, store, org, caller.Role, input.To, input.Body, input.Campaign,
+			&db.HubWriteOrigin{MachineID: caller.Machine.ID, Action: "message.send"})
 		if err != nil {
 			return http.StatusBadRequest, nil, err
 		}
-		return hubRecordWrite(ctx, store, caller, "message.send", message)
+		return http.StatusCreated, newMessageJSON(message), nil
 	})
 	handle("POST /v1/messages/{id}/reply", func(ctx context.Context, caller hub.Caller, org config.OrgConfig, r *http.Request) (int, any, error) {
 		id, err := hubMessageID(r)
@@ -431,22 +444,14 @@ func hubAPI(paths config.Paths, store *db.Store) http.Handler {
 		if err := decodeHubBody(r, &input); err != nil {
 			return http.StatusBadRequest, nil, err
 		}
-		message, err := replyMessage(ctx, store, org, caller.Role, id, input.Body)
+		message, err := replyMessage(ctx, store, org, caller.Role, id, input.Body,
+			&db.HubWriteOrigin{MachineID: caller.Machine.ID, Action: "message.reply"})
 		if err != nil {
 			return http.StatusBadRequest, nil, err
 		}
-		return hubRecordWrite(ctx, store, caller, "message.reply", message)
+		return http.StatusCreated, newMessageJSON(message), nil
 	})
 	return mux
-}
-
-// hubRecordWrite records which machine and role made a write. The message is
-// already saved, so a failure to record is reported but does not undo it.
-func hubRecordWrite(ctx context.Context, store *db.Store, caller hub.Caller, action string, message db.Message) (int, any, error) {
-	if err := store.RecordHubWrite(ctx, caller.Machine.ID, caller.Role, action, "message:"+strconv.FormatInt(message.ID, 10), time.Now().UTC()); err != nil {
-		return http.StatusInternalServerError, nil, fmt.Errorf("message %d saved, but recording the hub write failed", message.ID)
-	}
-	return http.StatusCreated, newMessageJSON(message), nil
 }
 
 func hubPage(r *http.Request) (int64, int, error) {

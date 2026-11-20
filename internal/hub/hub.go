@@ -142,20 +142,20 @@ type MachineLookup func(ctx context.Context, fingerprint string, now time.Time) 
 func Authenticate(lookup MachineLookup, now func() time.Time, peers []netip.Prefix, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !peerAllowed(r.RemoteAddr, peers) {
-			writeError(w, http.StatusForbidden, "the hub serves Tailscale peers only")
+			WriteError(w, http.StatusForbidden, "the hub serves Tailscale peers only")
 			return
 		}
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-			writeError(w, http.StatusUnauthorized, "a client certificate is required")
+			WriteError(w, http.StatusUnauthorized, "a client certificate is required")
 			return
 		}
 		machine, err := lookup(r.Context(), Fingerprint(r.TLS.PeerCertificates[0].Raw), now())
 		if errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusForbidden, "this certificate is not registered, or its machine was revoked")
+			WriteError(w, http.StatusForbidden, "this certificate is not registered, or its machine was revoked")
 			return
 		}
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "machine lookup failed")
+			WriteError(w, http.StatusInternalServerError, "machine lookup failed")
 			return
 		}
 		role := strings.ToLower(strings.TrimSpace(r.Header.Get(RoleHeader)))
@@ -163,10 +163,10 @@ func Authenticate(lookup MachineLookup, now func() time.Time, peers []netip.Pref
 		case role == "" && len(machine.Roles) == 1:
 			role = machine.Roles[0]
 		case role == "":
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("machine %s may act as %s; name one in %s", machine.Name, strings.Join(machine.Roles, ", "), RoleHeader))
+			WriteError(w, http.StatusBadRequest, fmt.Sprintf("machine %s may act as %s; name one in %s", machine.Name, strings.Join(machine.Roles, ", "), RoleHeader))
 			return
 		case !slices.Contains(machine.Roles, role):
-			writeError(w, http.StatusForbidden, fmt.Sprintf("machine %s may not act as %s", machine.Name, role))
+			WriteError(w, http.StatusForbidden, fmt.Sprintf("machine %s may not act as %s", machine.Name, role))
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), callerKey{}, Caller{Machine: machine, Role: role})))
@@ -233,9 +233,7 @@ func (s *Server) Close() {
 }
 
 // WriteError writes a JSON error body {"error": message}.
-func WriteError(w http.ResponseWriter, status int, message string) { writeError(w, status, message) }
-
-func writeError(w http.ResponseWriter, status int, message string) {
+func WriteError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
