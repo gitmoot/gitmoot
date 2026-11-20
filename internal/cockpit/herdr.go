@@ -92,6 +92,9 @@ type NotificationTarget struct {
 	PaneID   string
 	// Kind is Herdr's detected agent kind ("omp", "claude", "codex", ...).
 	Kind string
+	// Machine is the saved Herdr machine id of a remote recipient (an
+	// "agent:<machine>/<name>" binding), or "" for a local one.
+	Machine string
 }
 
 // paneListResult mirrors `herdr pane list`: only each pane's id is load-bearing
@@ -115,6 +118,89 @@ type registeredAgent struct {
 	AgentSession     struct {
 		Value string `json:"value"`
 	} `json:"agent_session"`
+	// Live state, read for remote agents, which the local api snapshot does not list.
+	AgentStatus       string                  `json:"agent_status"`
+	Turn              *json.Number            `json:"turn"`
+	LastCompletedTurn *herdrCompletedTurnWire `json:"last_completed_turn"`
+	TerminalTitle     string                  `json:"terminal_title"`
+	TerminalTitleText string                  `json:"terminal_title_stripped"`
+	// Reachability is Herdr's view of a remote agent's machine ("reachable" when live).
+	Reachability string `json:"reachability"`
+}
+
+// savedMachine is one entry of `herdr machine list --json`.
+type savedMachine struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+func (c herdrClient) savedMachines(ctx context.Context) ([]savedMachine, error) {
+	out, err := c.run(ctx, "machine", "list", "--json")
+	if err != nil {
+		return nil, err
+	}
+	var machines []savedMachine
+	if err := json.Unmarshal([]byte(out), &machines); err != nil {
+		return nil, fmt.Errorf("parse machine list: %w", err)
+	}
+	return machines, nil
+}
+
+// RemoteBinding splits an "agent:<machine>/<name>" binding: a role bound to an
+// agent on a federated Herdr peer. <machine> is a saved machine's id or label.
+// Any other binding (local agent:name, pane id or label) is not remote.
+func RemoteBinding(binding string) (machine, name string, ok bool) {
+	rest, isAgent := strings.CutPrefix(strings.TrimSpace(binding), "agent:")
+	if !isAgent {
+		return "", "", false
+	}
+	machine, name, found := strings.Cut(rest, "/")
+	machine, name = strings.TrimSpace(machine), strings.TrimSpace(name)
+	if !found || machine == "" || name == "" || strings.Contains(name, "/") {
+		return "", "", false
+	}
+	return machine, name, true
+}
+
+// remoteAgentForBinding resolves an "agent:<machine>/<name>" binding to the one
+// live remote agent Herdr lists for that saved machine under that name. The
+// machine reference must name exactly one saved machine, by id or by label;
+// anything ambiguous, archived or missing does not resolve.
+func remoteAgentForBinding(agents []registeredAgent, machines []savedMachine, binding string) (*registeredAgent, bool) {
+	ref, name, ok := RemoteBinding(binding)
+	if !ok {
+		return nil, false
+	}
+	machineID := ""
+	for _, m := range machines {
+		if m.ID == "" || (m.ID != ref && m.Label != ref) {
+			continue
+		}
+		if machineID != "" && machineID != m.ID {
+			return nil, false
+		}
+		machineID = m.ID
+	}
+	if machineID == "" {
+		return nil, false
+	}
+	var resolved *registeredAgent
+	for i := range agents {
+		agent := &agents[i]
+		if agent.MachineID != machineID || agent.PaneID == "" ||
+			(len(agent.Archived) != 0 && string(agent.Archived) != "null") {
+			continue
+		}
+		// Herdr lists a remote agent as "<machine id>/<name>".
+		if strings.TrimPrefix(agent.Name, machineID+"/") != name || agent.Name == name {
+			continue
+		}
+		if resolved != nil {
+			return nil, false
+		}
+		resolved = agent
+	}
+	return resolved, resolved != nil
 }
 
 func (c herdrClient) registeredAgents(ctx context.Context) ([]registeredAgent, error) {
@@ -177,6 +263,7 @@ func (c herdrClient) resolvePaneByLabel(ctx context.Context, binding string) (st
 
 // Explicit agent:name bindings follow registered local seats across terminal
 // replacement. Legacy pane ids/labels remain pinned, but must name an agent.
+// An agent:<machine>/<name> binding resolves only to that federated peer's agent.
 func (c herdrClient) resolveRegisteredRecipient(ctx context.Context, binding string) (*registeredAgent, bool, error) {
 	binding = strings.TrimSpace(binding)
 	if binding == "" {
@@ -185,6 +272,14 @@ func (c herdrClient) resolveRegisteredRecipient(ctx context.Context, binding str
 	agents, err := c.registeredAgents(ctx)
 	if err != nil {
 		return nil, false, err
+	}
+	if _, _, remote := RemoteBinding(binding); remote {
+		machines, err := c.savedMachines(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		agent, ok := remoteAgentForBinding(agents, machines, binding)
+		return agent, ok, nil
 	}
 	if strings.HasPrefix(binding, "agent:") {
 		agent, ok := registeredAgentForBinding(agents, binding)

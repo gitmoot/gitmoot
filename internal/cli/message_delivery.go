@@ -60,6 +60,11 @@ func messageRecipientReadiness(home string) func(context.Context, string) (messa
 			return messageRecipientStatus{reason: "recipient is offline or its binding is unresolved"}, nil
 		}
 		status := messageRecipientStatus{state: snapshot.States[role.Name].State}
+		if _, _, remote := cockpit.RemoteBinding(role.Pane); remote {
+			// Never typed into a remote pane: the message waits, visibly, for that machine's client.
+			status.reason = cockpit.NotificationRemotePending
+			return status, nil
+		}
 		switch status.state {
 		case org.StateIdle, org.StateWorking:
 			// Claude/Codex collect mail from turn hooks, not this transport.

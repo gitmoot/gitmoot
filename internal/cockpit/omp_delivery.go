@@ -29,6 +29,11 @@ const (
 	// Codex recipients. They have no safe external wake; their own turn hooks
 	// collect the mail.
 	NotificationAwaitingNextTurn = "waiting for recipient's next turn"
+	// NotificationRemotePending is the pending reason for a role bound to an
+	// agent on another machine (agent:<machine>/<name>). Its runtime's inbox
+	// add-on is not reachable from here, and nothing is typed into a remote
+	// pane, so the message waits for that machine's gitmoot client.
+	NotificationRemotePending = "recipient is on another machine; delivery waits for that machine's gitmoot client"
 
 	ompRegistrationVersion = 1
 	ompProtocolVersion     = 1
@@ -367,6 +372,9 @@ func (c herdrClient) paneForegroundPIDs(ctx context.Context, paneID string) ([]i
 // recipient's pane. It never types into the pane: unsupported runtimes and
 // unregistered processes stay deferred.
 func (c herdrClient) agentNotify(ctx context.Context, registryDir string, target NotificationTarget, content string) (delivered bool, uncertain bool, err error) {
+	if target.Machine != "" {
+		return false, false, &NotificationDeferred{Reason: NotificationRemotePending}
+	}
 	if reason := NotificationCapability(target.Kind); reason != "" {
 		return false, false, &NotificationDeferred{Reason: reason}
 	}

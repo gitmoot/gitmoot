@@ -114,11 +114,21 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 	}
 	states := make(map[string]org.RoleLiveState, len(p.roles))
 	var agents []registeredAgent
+	var machines []savedMachine
 	for _, role := range p.roles {
 		if strings.TrimSpace(role.Pane) != "" {
 			agents, err = (herdrClient{run: p.run}).registeredAgents(ctx)
 			if err != nil {
 				return org.Snapshot{}, fmt.Errorf("resolve registered org seats: %w", err)
+			}
+			break
+		}
+	}
+	for _, role := range p.roles {
+		if _, _, remote := RemoteBinding(role.Pane); remote {
+			machines, err = (herdrClient{run: p.run}).savedMachines(ctx)
+			if err != nil {
+				return org.Snapshot{}, fmt.Errorf("resolve remote org seats: %w", err)
 			}
 			break
 		}
@@ -131,6 +141,10 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 			detail := "Herdr pane binding is unset"
 			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: detail}
 			bindings[role.Name] = org.PaneBinding{Detail: detail}
+			continue
+		}
+		if _, _, remote := RemoteBinding(binding); remote {
+			p.remoteRole(role.Name, binding, agents, machines, states, bindings, sessions)
 			continue
 		}
 		paneID, _ := config.ResolveRolePaneBinding(ctx, binding, func(_ context.Context, label string) (string, bool) {
@@ -195,6 +209,44 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		PaneBindings: bindings, Panes: panes, Sessions: sessions,
 		Agents: liveLocalAgents(agents, unrestored),
 	}, nil
+}
+
+// remoteRole fills one role bound to an agent on a federated Herdr peer
+// (agent:<machine>/<name>). Its live state comes from that agent's entry in the
+// federated agent list, since the local api snapshot lists local panes only.
+// An unresolved binding or an unreachable machine leaves the role unknown.
+func (p *herdrOrgProvider) remoteRole(
+	role, binding string,
+	agents []registeredAgent,
+	machines []savedMachine,
+	states map[string]org.RoleLiveState,
+	bindings map[string]org.PaneBinding,
+	sessions map[string]org.SessionActivity,
+) {
+	agent, ok := remoteAgentForBinding(agents, machines, binding)
+	if !ok {
+		detail := fmt.Sprintf("no agent on a federated Herdr machine bound as %q", binding)
+		states[role] = org.RoleLiveState{State: org.StateUnknown, Detail: detail}
+		bindings[role] = org.PaneBinding{Detail: detail}
+		return
+	}
+	if agent.Reachability != "reachable" {
+		detail := fmt.Sprintf("Herdr reports the machine of %s as %q", agent.Name, agent.Reachability)
+		states[role] = org.RoleLiveState{State: org.StateUnknown, Detail: detail}
+		bindings[role] = org.PaneBinding{Detail: detail, Unavailable: true}
+		return
+	}
+	state := mapHerdrAgentStatus(agent.AgentStatus)
+	state.Activity = mapHerdrCompletedTurn(agent.LastCompletedTurn)
+	states[role] = state
+	bindings[role] = org.PaneBinding{PaneID: agent.PaneID, AgentName: agent.Name, Session: strings.TrimSpace(agent.AgentSession.Value)}
+	if strings.TrimSpace(agent.Agent) != "" {
+		title := strings.TrimSpace(agent.TerminalTitleText)
+		if title == "" {
+			title = strings.TrimSpace(agent.TerminalTitle)
+		}
+		sessions[role] = org.SessionActivity{PaneID: agent.PaneID, Agent: strings.TrimSpace(agent.Agent), TaskTitle: title, CurrentTurn: herdrTurnNumber(agent.Turn)}
+	}
 }
 
 // liveLocalAgents is the registered agents a binding may resolve to: local,

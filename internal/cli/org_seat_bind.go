@@ -18,7 +18,7 @@ func runOrgSeatBind(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory")
 	name := fs.String("name", "", "existing organization role")
-	agent := fs.String("agent", "", "exact registered local Herdr agent name")
+	agent := fs.String("agent", "", "exact registered Herdr agent name; MACHINE/NAME for an agent on a federated Herdr machine (saved machine id or label)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -49,7 +49,7 @@ func runOrgSeatBind(args []string, stdout, stderr io.Writer) int {
 	defer cancel()
 	pane, ok := cockpit.New(cockpit.Options{HerdrBin: "herdr"}).ResolvePaneByLabel(ctx, binding)
 	if !ok {
-		fmt.Fprintln(stderr, "org seat bind: agent is absent, remote, archived or ambiguous; binding unchanged")
+		fmt.Fprintln(stderr, "org seat bind: agent is absent, archived or ambiguous (a remote agent needs MACHINE/NAME); binding unchanged")
 		return 1
 	}
 	desired := role
@@ -58,6 +58,10 @@ func runOrgSeatBind(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "org seat bind:", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "bound role %s to %s (current pane %s); routes unchanged, old notices not replayed\n", role.Name, binding, pane)
+	where := "current pane"
+	if _, _, remote := cockpit.RemoteBinding(binding); remote {
+		where = "remote pane; messages wait for that machine's gitmoot client"
+	}
+	fmt.Fprintf(stdout, "bound role %s to %s (%s %s); routes unchanged, old notices not replayed\n", role.Name, binding, where, pane)
 	return 0
 }
