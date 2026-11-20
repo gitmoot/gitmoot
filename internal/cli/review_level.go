@@ -71,39 +71,10 @@ func runReviewLevel(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "review level requires --repo OWNER/REPO and --pr NUMBER")
 		return 2
 	}
-	ctx := context.Background()
-	gh := newReviewLevelGitHubClient()
-	pull, err := gh.GetPullRequest(ctx, repo, int64(*pr))
+	decision, err := decideReviewLevel(context.Background(), *home, repo, *pr, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "review level: %v\n", err)
 		return 1
-	}
-	files, err := gh.ListPullRequestFiles(ctx, repo, int64(*pr))
-	if err != nil {
-		fmt.Fprintf(stderr, "review level: %v\n", err)
-		return 1
-	}
-	input := reviewlevel.Input{Repo: repo.FullName(), PR: *pr, Title: pull.Title, HeadSHA: pull.HeadSHA}
-	for _, file := range files {
-		input.Files = append(input.Files, reviewlevel.File{Path: file.Filename, Patch: file.Patch})
-	}
-
-	decision := reviewlevel.Decide(ctx, newReviewLevelJudge(reviewLevelAPIKey(ctx, *home)), jev.DefaultModel, input)
-	decision, recorded, err := settleReviewLevel(*home, repo.FullName(), *pr, decision, time.Now(), false)
-	if err != nil {
-		fmt.Fprintf(stderr, "warning: could not save the decision to %s: %v\n", reviewLevelLogName, err)
-	} else if !recorded {
-		fmt.Fprintf(stderr, "warning: the decision was not saved to %s: %s\n", reviewLevelLogName, decision.Reason)
-	}
-
-	if _, err := gh.CreateCommitStatus(ctx, github.CommitStatusInput{
-		Repo:        repo,
-		SHA:         decision.HeadSHA,
-		State:       "success",
-		Context:     reviewLevelStatusContext,
-		Description: reviewLevelStatusDescription(decision),
-	}); err != nil {
-		fmt.Fprintf(stderr, "warning: could not post %s status: %v\n", reviewLevelStatusContext, err)
 	}
 
 	if *asJSON {
@@ -123,6 +94,44 @@ func runReviewLevel(args []string, stdout, stderr io.Writer) int {
 			repo.FullName(), *pr, decision.HeadSHA)
 	}
 	return 0
+}
+
+// decideReviewLevel classifies a pull request, saves the decision and posts
+// the commit status. `review level` and the hub API both call it; warnings
+// about the log and the status go to warn and do not fail the decision.
+func decideReviewLevel(ctx context.Context, home string, repo github.Repository, pr int, warn io.Writer) (reviewlevel.Decision, error) {
+	gh := newReviewLevelGitHubClient()
+	pull, err := gh.GetPullRequest(ctx, repo, int64(pr))
+	if err != nil {
+		return reviewlevel.Decision{}, err
+	}
+	files, err := gh.ListPullRequestFiles(ctx, repo, int64(pr))
+	if err != nil {
+		return reviewlevel.Decision{}, err
+	}
+	input := reviewlevel.Input{Repo: repo.FullName(), PR: pr, Title: pull.Title, HeadSHA: pull.HeadSHA}
+	for _, file := range files {
+		input.Files = append(input.Files, reviewlevel.File{Path: file.Filename, Patch: file.Patch})
+	}
+
+	decision := reviewlevel.Decide(ctx, newReviewLevelJudge(reviewLevelAPIKey(ctx, home)), jev.DefaultModel, input)
+	decision, recorded, err := settleReviewLevel(home, repo.FullName(), pr, decision, time.Now(), false)
+	if err != nil {
+		fmt.Fprintf(warn, "warning: could not save the decision to %s: %v\n", reviewLevelLogName, err)
+	} else if !recorded {
+		fmt.Fprintf(warn, "warning: the decision was not saved to %s: %s\n", reviewLevelLogName, decision.Reason)
+	}
+
+	if _, err := gh.CreateCommitStatus(ctx, github.CommitStatusInput{
+		Repo:        repo,
+		SHA:         decision.HeadSHA,
+		State:       "success",
+		Context:     reviewLevelStatusContext,
+		Description: reviewLevelStatusDescription(decision),
+	}); err != nil {
+		fmt.Fprintf(warn, "warning: could not post %s status: %v\n", reviewLevelStatusContext, err)
+	}
+	return decision, nil
 }
 
 // reviewLevelLogName is the file, in the Gitmoot home, that keeps every level
