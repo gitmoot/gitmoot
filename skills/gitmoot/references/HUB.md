@@ -144,6 +144,20 @@ On a client home:
 - Every other command that needs the org database refuses with "this gitmoot
   home is a hub client". It never answers from an empty local store.
 
+Check a new client first with `gitmoot client whoami [--json]`. It prints:
+- the hub;
+- this machine's certificate name, SHA-256 fingerprint and expiry, read
+  locally, so they show even when the hub can't be reached;
+- the hub's answer: the machine, the acting role, the machine's roles and the
+  allowed endpoint groups.
+
+It exits 1, naming the error, when the hub is unreachable or refuses the
+certificate. `--role ROLE` picks the role on a machine that holds several.
+
+Flags come after the subcommand and its arguments, as in
+`gitmoot client whoami --home DIR`; placed before the subcommand, `--home` is
+an unknown command. `--home DIR` means `DIR/.gitmoot`.
+
 An omp seat gets its mail through its machine's omp inbox add-on, which only a
 local process can reach. Run the delivery loop on that machine:
 

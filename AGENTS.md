@@ -339,8 +339,15 @@ portable code behavior.
 - Manage the live daemon via `systemctl --user`, never `gitmoot daemon restart`.
 - In E2E set `HERDR_SOCKET_PATH=/tmp/throwaway` and unset `HERDR_ENV`
   or panes leak to the prod Telegram group.
-- Global flags like `--home` use Go flag parsing, so they must precede positional
-  args (e.g. `run show --home /tmp/h <id>`, not after the id).
+- `--home` is a flag of the subcommand, never of `gitmoot` itself
+  (`gitmoot --home DIR ...` is "unknown command"). Most subcommands read their
+  positional arguments first and their flags after them, so put `--home` and
+  other flags at the end: `run show <id> --home /tmp/h`,
+  `message send ROLE "TEXT" --home /tmp/h`, `pr show REF --home /tmp/h`.
+  Measured on `53e6f274`: `run show --home /tmp/h <id>` fails with "requires
+  exactly one id", and `campaign show --home /tmp/h x` reads `--home` as the
+  label. A few subcommands (`workspace show`, `note show`) accept either
+  order. `--home DIR` means `DIR/.gitmoot`.
 - Killing a foreground `ask` strands a runtime-session resource lock;
   clear the lock to recover.
 - Reviewer permission policies gate the shell: `--policy workspace-write` (omp

@@ -17,6 +17,7 @@ disagrees, trust its live `--help`.
 - [gitmoot campaign register](#gitmoot-campaign-register)
 - [gitmoot campaign show](#gitmoot-campaign-show)
 - [gitmoot client](#gitmoot-client)
+- [gitmoot client whoami](#gitmoot-client-whoami)
 - [gitmoot config](#gitmoot-config)
 - [gitmoot config path](#gitmoot-config-path)
 - [gitmoot config show](#gitmoot-config-show)
@@ -256,16 +257,33 @@ Usage: gitmoot campaign show <label> [--json] [--limit N] [--home DIR]
 ## gitmoot client
 
 ```text
-Deliver this machine's gitmoot mail to its local omp agent (#2710).
+This machine as a client of a gitmoot hub (#2710).
 
 Usage:
+  gitmoot client whoami [--role ROLE] [--json] [--home DIR]
   gitmoot client deliver [--once] [--interval 10s] [--home DIR]
 
-Needs [client] hub, certs, name and agent in config.toml. Each pass claims the
+whoami shows this machine's certificate (fingerprint, expiry), the role it acts
+as, its roles and the hub's allowed endpoint groups, and whether the hub
+answered. It exits 1 when the hub is unreachable or refuses the certificate.
+
+deliver needs [client] hub, certs, name and agent in config.toml. Each pass claims the
 role's pending mail on the hub and hands it to the omp inbox add-on of the
 local agent named by [client] agent. A delivery the add-on refuses goes back
 to pending with its reason; an unknown outcome is left for the hub's checks
 and is never sent twice. The pane is never typed into.
+```
+
+## gitmoot client whoami
+
+```text
+Usage of client whoami:
+  -home string
+    	home directory
+  -json
+    	JSON output
+  -role string
+    	role to act as, when the machine holds several
 ```
 
 ## gitmoot config
