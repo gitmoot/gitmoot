@@ -237,3 +237,44 @@ WHERE id = ? AND lower(target_role) = ? AND state = 'attempted' AND attempt_coun
 		return nil
 	})
 }
+
+// wakeOutboxCreatedLayout matches strftime('%Y-%m-%dT%H:%M:%fZ'), the form
+// wake_outbox.created_at is written in, so the two compare as strings.
+const wakeOutboxCreatedLayout = "2006-01-02T15:04:05.000Z"
+
+// RetireWakeBacklogForRole supersedes role's pending notifications created
+// before cutoff, recording detail, and reports how many it retired and how
+// many pending ones it kept. The messages themselves are untouched and stay
+// readable in the role's inbox; only their delivery is retired. Attempted
+// rows are left alone: their outcome is in flight (#2721: a role bound to a
+// new agent must not have weeks of stale mail pushed into it, and a routine
+// re-bind must not drop fresh work, so the caller picks the cutoff).
+func (s *Store) RetireWakeBacklogForRole(ctx context.Context, role string, cutoff, now time.Time, detail string) (retired, kept int64, err error) {
+	stamp := now.UTC().Format(BlockedEpisodeTimeLayout)
+	role = strings.ToLower(strings.TrimSpace(role))
+	writeCtx, cancel := s.durableWriteContext(ctx, 2)
+	defer cancel()
+	err = retryNotificationWrite(writeCtx, func() error {
+		tx, err := s.db.BeginTx(writeCtx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		result, err := tx.ExecContext(writeCtx, `UPDATE wake_outbox
+SET state = ?, coalesced_into = NULL, last_error = ?, finished_at = ?, updated_at = ?
+WHERE lower(target_role) = ? AND state = 'pending' AND created_at < ?`,
+			WakeOutboxStateSuperseded, strings.TrimSpace(detail), stamp, stamp,
+			role, cutoff.UTC().Format(wakeOutboxCreatedLayout))
+		if err != nil {
+			return err
+		}
+		if retired, err = result.RowsAffected(); err != nil {
+			return err
+		}
+		if err := tx.QueryRowContext(writeCtx, `SELECT count(*) FROM wake_outbox WHERE lower(target_role) = ? AND state = 'pending'`, role).Scan(&kept); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+	return retired, kept, err
+}

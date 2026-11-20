@@ -378,6 +378,13 @@ gitmoot org await list
   that machine's gitmoot client": gitmoot never types into a remote pane. They
   are delivered once that machine runs a gitmoot client (#2710). An unqualified
   `agent:<name>` binding never matches an agent on another machine.
+- Binding a role (`org seat bind`, local or remote) retires the role's
+  notifications that have waited longer than `--retire-older-than` (24h by
+  default; 0 retires everything waiting from before the bind). A new agent is
+  then not handed weeks of stale mail as new work, and a routine re-bind
+  keeps recent work pending. The messages stay readable in
+  `gitmoot message inbox --role <role>`. Bind prints both counts, retired and
+  kept pending (#2721).
 
 ## 6. When something is stuck
 
