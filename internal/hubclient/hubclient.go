@@ -28,6 +28,7 @@ const maxResponseBytes = 4 << 20
 type Client struct {
 	base string
 	http *http.Client
+	leaf *x509.Certificate
 }
 
 // New loads ca.pem, NAME.crt and NAME.key from certs and returns a client for
@@ -59,7 +60,11 @@ func New(base, certs, name string) (*Client, error) {
 		IdleConnTimeout:     90 * time.Second,
 		Proxy:               nil, // the hub is a Tailscale peer; never route it through a proxy
 	}
-	return &Client{base: strings.TrimSuffix(base, "/"), http: &http.Client{Transport: transport, Timeout: 4 * time.Minute}}, nil
+	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("hub client: parse certificate: %w", err)
+	}
+	return &Client{base: strings.TrimSuffix(base, "/"), http: &http.Client{Transport: transport, Timeout: 4 * time.Minute}, leaf: leaf}, nil
 }
 
 // Error is a refusal from the hub: its HTTP status and {"error"} text.
@@ -121,6 +126,12 @@ func (c *Client) Do(ctx context.Context, method, path, role string, in, out any)
 	}
 	return nil
 }
+
+// Base is the hub's https origin.
+func (c *Client) Base() string { return c.base }
+
+// Certificate is this machine's client certificate.
+func (c *Client) Certificate() *x509.Certificate { return c.leaf }
 
 // Close releases idle connections.
 func (c *Client) Close() { c.http.CloseIdleConnections() }

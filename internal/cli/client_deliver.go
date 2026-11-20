@@ -30,6 +30,9 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 		printClientUsage(stdout)
 		return 0
 	}
+	if args[0] == "whoami" {
+		return runClientWhoami(args[1:], stdout, stderr)
+	}
 	if args[0] != "deliver" {
 		fmt.Fprintf(stderr, "unknown client command %q\n\n", args[0])
 		printClientUsage(stderr)
@@ -88,12 +91,17 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 }
 
 func printClientUsage(w io.Writer) {
-	fmt.Fprintln(w, "Deliver this machine's gitmoot mail to its local omp agent (#2710).")
+	fmt.Fprintln(w, "This machine as a client of a gitmoot hub (#2710).")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot client whoami [--role ROLE] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot client deliver [--once] [--interval 10s] [--home DIR]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Needs [client] hub, certs, name and agent in config.toml. Each pass claims the")
+	fmt.Fprintln(w, "whoami shows this machine's certificate (fingerprint, expiry), the role it acts")
+	fmt.Fprintln(w, "as, its roles and the hub's allowed endpoint groups, and whether the hub")
+	fmt.Fprintln(w, "answered. It exits 1 when the hub is unreachable or refuses the certificate.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "deliver needs [client] hub, certs, name and agent in config.toml. Each pass claims the")
 	fmt.Fprintln(w, "role's pending mail on the hub and hands it to the omp inbox add-on of the")
 	fmt.Fprintln(w, "local agent named by [client] agent. A delivery the add-on refuses goes back")
 	fmt.Fprintln(w, "to pending with its reason; an unknown outcome is left for the hub's checks")

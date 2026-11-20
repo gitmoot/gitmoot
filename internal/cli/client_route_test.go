@@ -206,3 +206,36 @@ func TestClientPRShowRefWithSlashAndHashReachesTheHub(t *testing.T) {
 		t.Fatalf("pr show owner/repo#N through the hub: exit=%d %s", code, diag)
 	}
 }
+
+// client whoami reports the certificate the hub knows (same fingerprint and
+// expiry as hub_machines), the role, roles and allow list; with the hub gone
+// it still shows the certificate and exits 1 (#2710).
+func TestClientWhoamiReportsCertificateRoleAndAllow(t *testing.T) {
+	t.Setenv("GITMOOT_ORG_ROLE", "")
+	hubHome := messageTestHome(t)
+	clientHome, _ := clientTestHome(t, hubHome, "mac", "deimos", "")
+	code, out, diag := runCLI(t, "client", "whoami", "--json", "--home", clientHome)
+	if code != 0 {
+		t.Fatalf("whoami exit=%d out=%s diag=%s", code, out, diag)
+	}
+	var got clientWhoami
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	_, list, _ := hubCLI(t, hubHome, "machine", "ls", "--json")
+	var machines []hubMachineJSON
+	if err := json.Unmarshal([]byte(list), &machines); err != nil || len(machines) != 1 {
+		t.Fatalf("machines = %s %v", list, err)
+	}
+	if !got.Reachable || got.Machine != "mac" || got.Role != "deimos" || got.Fingerprint != machines[0].Fingerprint ||
+		got.NotAfter != machines[0].ExpiresAt || strings.Join(got.Allow, ",") != strings.Join(config.HubGroups, ",") {
+		t.Fatalf("whoami = %+v, hub machine = %+v", got, machines[0])
+	}
+	if code, _, _ := hubCLI(t, hubHome, "machine", "revoke", "mac"); code != 0 {
+		t.Fatal("revoke")
+	}
+	code, out, _ = runCLI(t, "client", "whoami", "--home", clientHome)
+	if code != 1 || !strings.Contains(out, "fingerprint "+machines[0].Fingerprint) || !strings.Contains(out, "hub answer   none") || !strings.Contains(out, "HTTP 403") {
+		t.Fatalf("whoami after revoke: exit=%d %s", code, out)
+	}
+}
