@@ -253,6 +253,39 @@ func claimTurnHookForRole(claimCtx context.Context, start time.Time, store *db.S
 // exactly as the daemon leaves it.
 func claimTurnHookRows(ctx context.Context, store *db.Store, role string, request turnHookRequest, stderr io.Writer) ([]db.WakeOutboxObligation, bool, error) {
 	now := turnHookNow()
+	// A tool-return hook is inside a working turn. Prompt-submit and Stop
+	// hooks are idle boundaries, so they release mail without a batching wait.
+	eligible, more, err := eligibleInboxRows(ctx, store, role, request.event == turnHookPostToolUse, now, stderr)
+	if err != nil || len(eligible) == 0 {
+		return nil, false, err
+	}
+	ids := make([]int64, 0, len(eligible))
+	for _, row := range eligible {
+		ids = append(ids, row.ID)
+	}
+	receipt := db.WakeOutboxTurnHookReceiptPrefix + request.runtime + ":" + request.event
+	claimedIDs, err := store.ClaimWakeOutboxForTurnHook(ctx, role, ids, receipt, now)
+	if err != nil {
+		return nil, false, fmt.Errorf("claim pending notifications: %w", err)
+	}
+	won := make(map[int64]struct{}, len(claimedIDs))
+	for _, id := range claimedIDs {
+		won[id] = struct{}{}
+	}
+	claimed := eligible[:0]
+	for _, row := range eligible {
+		if _, ok := won[row.ID]; ok {
+			claimed = append(claimed, row)
+		}
+	}
+	return claimed, more, nil
+}
+
+// eligibleInboxRows returns role's pending inbox rows that the daemon's
+// routing policy would deliver now, at most turnHookMaxItems, and whether more
+// are waiting. Rows that are not mail, are muted, or have no route stay with
+// the daemon. working holds a group back until its coalescing window passes.
+func eligibleInboxRows(ctx context.Context, store *db.Store, role string, working bool, now time.Time, stderr io.Writer) ([]db.WakeOutboxObligation, bool, error) {
 	obligations, err := store.ListWakeOutboxObligationsForRole(ctx, role, now)
 	if err != nil || len(obligations.Pending) == 0 {
 		return nil, false, err
@@ -263,9 +296,6 @@ func claimTurnHookRows(ctx context.Context, store *db.Store, role string, reques
 	}
 	eligible := make([]db.WakeOutboxObligation, 0, len(obligations.Pending))
 	more := false
-	// A tool-return hook is inside a working turn. Prompt-submit and Stop
-	// hooks are idle boundaries, so they release mail without a batching wait.
-	working := request.event == turnHookPostToolUse
 	dueGroups := make(map[string]bool)
 	for _, row := range obligations.Pending {
 		if row.MessageID == 0 {
@@ -305,29 +335,7 @@ func claimTurnHookRows(ctx context.Context, store *db.Store, role string, reques
 		}
 		eligible = append(eligible, row)
 	}
-	if len(eligible) == 0 {
-		return nil, false, nil
-	}
-	ids := make([]int64, 0, len(eligible))
-	for _, row := range eligible {
-		ids = append(ids, row.ID)
-	}
-	receipt := db.WakeOutboxTurnHookReceiptPrefix + request.runtime + ":" + request.event
-	claimedIDs, err := store.ClaimWakeOutboxForTurnHook(ctx, role, ids, receipt, now)
-	if err != nil {
-		return nil, false, fmt.Errorf("claim pending notifications: %w", err)
-	}
-	won := make(map[int64]struct{}, len(claimedIDs))
-	for _, id := range claimedIDs {
-		won[id] = struct{}{}
-	}
-	claimed := eligible[:0]
-	for _, row := range eligible {
-		if _, ok := won[row.ID]; ok {
-			claimed = append(claimed, row)
-		}
-	}
-	return claimed, more, nil
+	return eligible, more, nil
 }
 
 // recordTurnHookDirectiveReceipts writes the same transport delivery receipt

@@ -190,3 +190,23 @@ func (s *Store) RecordHubWrite(ctx context.Context, machineID int64, role, actio
 	}
 	return tx.Commit()
 }
+
+// WakeOutboxRowsTargetRole reports whether every id names an existing
+// wake_outbox row addressed to role. target_role never changes, so the answer
+// stays true for the later finish, whose own WHERE clause checks the state.
+func (s *Store) WakeOutboxRowsTargetRole(ctx context.Context, role string, ids []int64) (bool, error) {
+	if len(ids) == 0 {
+		return false, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, strings.ToLower(strings.TrimSpace(role)))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	var matched int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(DISTINCT id) FROM wake_outbox WHERE lower(target_role) = ? AND id IN (`+placeholders+`)`, args...).Scan(&matched); err != nil {
+		return false, err
+	}
+	return matched == len(slices.Compact(slices.Sorted(slices.Values(ids)))), nil
+}
