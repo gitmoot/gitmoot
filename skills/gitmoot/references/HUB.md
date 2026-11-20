@@ -57,7 +57,7 @@ certificate, revoke the machine and add it again.
 ## Endpoints
 
 All responses are JSON; errors are `{"error": "..."}`. Message objects have the
-same fields as `gitmoot message ... --json`.
+same fields as the JSON output of the matching `message` command.
 
 | Method and path | Same as |
 |---|---|
