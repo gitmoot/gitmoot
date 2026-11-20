@@ -26,7 +26,7 @@ var hubFullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // registerHubWorkEndpoints adds the endpoints beyond messages (#2710):
 //
 //	GET  /v1/org/brief                    org brief for the caller's role
-//	GET  /v1/tasks/{ref}?repo=OWNER/REPO  pr show
+//	GET  /v1/tasks?ref=REF&repo=OWNER/REPO pr show
 //	POST /v1/reviews/level {"repo","pr"}  review level
 //	POST /v1/reviews {"repo","pr","head_sha","message",...} review request
 //	POST /v1/notifications/claim {"runtime","event"}        turn-hook claim
@@ -51,8 +51,14 @@ func registerHubWorkEndpoints(handle func(string, hubHandler), home string, stor
 		snapshot, snapshotErr := orgProviderSnapshot(ctx, org)
 		return http.StatusOK, buildOrgBriefOutput(org, presence, role, snapshot, snapshotErr), nil
 	})
-	handle("GET /v1/tasks/{ref}", func(ctx context.Context, caller hub.Caller, org config.OrgConfig, r *http.Request) (int, any, error) {
-		record, err := resolvePRRecord(ctx, store, r.PathValue("ref"), strings.TrimSpace(r.URL.Query().Get("repo")))
+	// The ref is a query parameter, not a path segment: an owner/repo#N ref
+	// would need escapes, and the hub refuses any escaped path.
+	handle("GET /v1/tasks", func(ctx context.Context, caller hub.Caller, org config.OrgConfig, r *http.Request) (int, any, error) {
+		ref := strings.TrimSpace(r.URL.Query().Get("ref"))
+		if ref == "" {
+			return http.StatusBadRequest, nil, errors.New("ref is required")
+		}
+		record, err := resolvePRRecord(ctx, store, ref, strings.TrimSpace(r.URL.Query().Get("repo")))
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "not found") {
 				return http.StatusNotFound, nil, err

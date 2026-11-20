@@ -313,7 +313,7 @@ func TestHubDefaultAllowServesMessagingOnly(t *testing.T) {
 	}
 	for _, call := range []struct{ method, path, body, group string }{
 		{http.MethodGet, "/v1/org/brief", "", "org"},
-		{http.MethodGet, "/v1/tasks/7?repo=gitmoot/implementation", "", "tasks"},
+		{http.MethodGet, "/v1/tasks?ref=7&repo=gitmoot/implementation", "", "tasks"},
 		{http.MethodPost, "/v1/reviews/level", `{"repo":"gitmoot/implementation","pr":7}`, "reviews"},
 		{http.MethodPost, "/v1/reviews", `{"repo":"gitmoot/implementation","pr":7,"message":"m"}`, "reviews"},
 	} {
@@ -364,7 +364,10 @@ func TestHubAllowRefusesARouteInNoGroup(t *testing.T) {
 // does not normalise paths itself can never be handed one group's path that
 // the check classified as another (#2710 [hub] allow).
 func TestHubAllowRefusesUncleanPathsBeforeRouting(t *testing.T) {
-	for _, target := range []string{"/v1/messages/../reviews/level", "/v1/messages/./x", "/v1/messages%2F..%2Freviews"} {
+	// %20, %25, %3F and %2F are the default escapes Go records with an empty
+	// URL.RawPath, the review's probes; they must be refused like the rest.
+	for _, target := range []string{"/v1/messages/../reviews/level", "/v1/messages/./x", "/v1/messages%2F..%2Freviews",
+		"/v1/messages/a%20b", "/v1/messages/%25", "/v1/messages/%3F", "/v1/tasks/%207"} {
 		reached := false
 		next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true })
 		recorder := httptest.NewRecorder()

@@ -570,7 +570,7 @@ func hubGroupForPath(requestPath string) (group string, ok bool) {
 		return "notifications", true
 	case strings.HasPrefix(requestPath, "/v1/org/"):
 		return "org", true
-	case strings.HasPrefix(requestPath, "/v1/tasks/"):
+	case requestPath == "/v1/tasks" || strings.HasPrefix(requestPath, "/v1/tasks/"):
 		return "tasks", true
 	case requestPath == "/v1/reviews" || strings.HasPrefix(requestPath, "/v1/reviews/"):
 		return "reviews", true
@@ -585,8 +585,11 @@ func hubGroupForPath(requestPath string) (group string, ok bool) {
 func hubAllow(allow []string, next http.Handler) http.Handler {
 	allowed := slices.Clone(allow)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// r.URL.RawPath is set only for non-default escapes, so the escaped
+		// form itself is checked: no hub path needs an escape (a task ref
+		// travels in the query), and any percent sign is refused.
 		requestPath := r.URL.Path
-		if path.Clean(requestPath) != requestPath || r.URL.RawPath != "" {
+		if path.Clean(requestPath) != requestPath || strings.Contains(r.URL.EscapedPath(), "%") {
 			hub.WriteError(w, http.StatusBadRequest, "request path must be in clean, unescaped form")
 			return
 		}

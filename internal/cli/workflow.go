@@ -590,11 +590,11 @@ func runPRShow(args []string, stdout, stderr io.Writer) int {
 	}
 	var record taskListOutput
 	handled, code := withHubClient(*home, "", "pr show", stderr, func(ctx context.Context, client *hubclient.Client, role string) error {
-		query := url.Values{}
+		query := url.Values{"ref": {ref}}
 		if *repo != "" {
 			query.Set("repo", *repo)
 		}
-		return client.Do(ctx, http.MethodGet, "/v1/tasks/"+url.PathEscape(ref)+"?"+query.Encode(), role, nil, &record)
+		return client.Do(ctx, http.MethodGet, "/v1/tasks?"+query.Encode(), role, nil, &record)
 	})
 	if handled && code != 0 {
 		return code

@@ -72,7 +72,7 @@ with 403 naming the group.
 | `messages` | `/v1/messages`, `/v1/messages/...` |
 | `notifications` | `/v1/notifications/...`: claiming the caller role's own mail |
 | `org` | `/v1/org/...` |
-| `tasks` | `/v1/tasks/...` |
+| `tasks` | `/v1/tasks`, `/v1/tasks/...` |
 | `reviews` | `/v1/reviews`, `/v1/reviews/...` |
 
 - The default is `["messages", "notifications"]`: messaging, plus the claims a
@@ -80,8 +80,9 @@ with 403 naming the group.
   `/v1/whoami`.
 - `/v1/whoami` is always served and reports the allowed groups.
 - A path that belongs to no group gets 404.
-- A path that is not in clean, unescaped form gets 400, so no spelling of a
-  path can be checked as one group and routed as another.
+- A path that is not clean, or contains any percent-escape, gets 400, so no
+  spelling of a path can be checked as one group and routed as another. No
+  endpoint needs an escape: the `pr show` ref travels in the query.
 
 | Method and path | Same as |
 |---|---|
@@ -92,7 +93,7 @@ with 403 naming the group.
 | `POST /v1/messages` `{"to", "body", "campaign"?}` | `message send TO BODY [--campaign ID]` |
 | `POST /v1/messages/{id}/reply` `{"body"}` | `message reply ID BODY` |
 | `GET /v1/org/brief` | `org brief --role <caller's role>` (presence noted as `org brief (hub: MACHINE)`) |
-| `GET /v1/tasks/{ref}?repo=OWNER/REPO` | `pr show REF [--repo]` |
+| `GET /v1/tasks?ref=REF&repo=OWNER/REPO` | `pr show REF [--repo]` |
 | `POST /v1/reviews/level` `{"repo", "pr"}` | `review level`; returns `{"decision", "warnings"}` |
 | `POST /v1/reviews` `{"repo", "pr", "head_sha"?, "message", "purpose"?, "reviewer"?, "model"?, "post_merge"?, "no_execution"?}` | `review request --org-role <caller's role>`; returns `{"review", "warnings"}` |
 | `POST /v1/notifications/claim` `{"runtime", "event"}` | `message pending --claim --hook EVENT --runtime claude\|codex` for the caller's role; returns `{"hook_output"}` (null when nothing is pending), the same output a local turn hook prints |
