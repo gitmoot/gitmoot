@@ -156,10 +156,36 @@ http.server.ThreadingHTTPServer((args.host, args.port), Proxy).serve_forever()
 // holds the account and performs any OAuth refresh; the sandbox only knows this
 // loopback forwarder and an inert placeholder. Codex, xAI's subscription
 // (xai-oauth) and Kimi Code (kimi-code, #2469) are built into OMP's catalog and
-// need only a route. Devin's swe-2
-// is not in a fresh OMP catalog, so it also needs an explicit model entry.
+// need only a route. Devin's swe-2 is not in a fresh OMP catalog, so it also
+// needs an explicit model entry.
+//
+// openai-codex/gpt-6.2-sol needs one too, and it is only HALF of what a remote
+// 6.2-sol run needs. omp 19.0.1's BUILT-IN catalog ends at gpt-6.1-sol, so
+// without this entry omp in a fresh sandbox refuses "Model not found" before
+// sending anything. A models list on a built-in provider is added to that
+// provider's built-in models (measured on omp 19.0.1 and 18.20.0: 6.1-sol and
+// the rest stay listed). The values match the online catalog entry.
+//
+// The other half is the host: a pi-native request carries only the model id,
+// and the host OMP auth-gateway resolves it with its own catalog. A gateway
+// that does not know the id answers "Unknown model" (omp 18.20.0 does not
+// know gpt-6.2-sol; 19.0.1 resolves it from its online catalog cache). This
+// entry cannot teach the gateway anything.
 var remoteOmpCatalogProviders = []struct{ name, models string }{
-	{name: "openai-codex"},
+	{name: "openai-codex", models: `    models:
+      - id: gpt-6.2-sol
+        name: GPT-6.2 Sol
+        api: openai-codex-responses
+        reasoning: true
+        input: [text, image]
+        contextWindow: 500000
+        maxTokens: 128000
+        cost:
+          input: 2
+          output: 10
+          cacheRead: 0.1
+          cacheWrite: 0
+`},
 	{name: "xai-oauth"},
 	{name: "kimi-code"},
 	{name: "devin", models: `    api: openai-completions
