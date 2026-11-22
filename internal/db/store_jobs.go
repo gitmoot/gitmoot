@@ -539,8 +539,8 @@ const listRunningReviewJobsSQL = `SELECT id, repo, pull_request, payload FROM jo
 // (#2726) reads it once per dispatch pass that has a queued review. It touches
 // only running rows, and the type filter keeps other jobs' payloads (an
 // implement payload can be megabytes) unread. Externally driven session jobs
-// are excluded: the daemon neither times them out nor reaps them on a lease, so
-// they cannot bound a hold.
+// are excluded: the daemon never recovers them (no lease reaping, no
+// stale-running recovery), so a hold on one might never end.
 func (s *Store) ListRunningReviewJobs(ctx context.Context) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, listRunningReviewJobsSQL)
 	if err != nil {
@@ -1589,6 +1589,11 @@ func (s *Store) RerouteQueuedJobPayload(ctx context.Context, id string, payload 
 // none of this cap. A job's provider is its payload exec_provider, absent
 // meaning e2b. The count and the write are one statement, so concurrent callers
 // cannot both take the last slot.
+//
+// A queued review the review overlap hold (#2726) holds is left out of the
+// count (routeCapHeldReviewSQL): it may have been routed before its hold began,
+// and it cannot start until its holder ends, so counting it would let a held
+// review keep an unrelated one waiting for the whole hold.
 func (s *Store) RouteQueuedJobRemote(ctx context.Context, id string, payload string, atGeneration int64, cap ExecBackendCostCap, event JobEvent) (bool, error) {
 	if !cap.Configured || cap.MaxReservedUSD <= 0 || cap.PerAttemptUSD <= 0 {
 		return false, nil
@@ -1606,7 +1611,8 @@ func (s *Store) RouteQueuedJobRemote(ctx context.Context, id string, payload str
 	marks, states := billingStatePlaceholders()
 	pending := `(SELECT COUNT(*) FROM jobs r WHERE r.state IN ('queued','running') AND json_extract(r.payload, '$.exec_backend') = 'remote'
 		AND COALESCE(NULLIF(json_extract(r.payload, '$.exec_provider'), ''), 'e2b') = ?
-		AND r.id NOT IN (SELECT a.job_id FROM execbackend_attempts a WHERE a.provider = ? AND a.state IN (` + marks + `)))`
+		AND r.id NOT IN (SELECT a.job_id FROM execbackend_attempts a WHERE a.provider = ? AND a.state IN (` + marks + `))
+		AND NOT (` + routeCapHeldReviewSQL + `))`
 	pendingArgs := append([]any{provider, provider}, states...)
 	billing := `FROM execbackend_attempts WHERE provider = ? AND state IN (` + marks + `)`
 	billingArgs := append([]any{provider}, states...)
@@ -1619,6 +1625,24 @@ func (s *Store) RouteQueuedJobRemote(ctx context.Context, id string, payload str
 	}
 	return s.rerouteQueuedJob(ctx, id, payload, atGeneration, event, clause, args)
 }
+
+// routeCapHeldReviewSQL is true for a jobs row r that is a queued review the
+// review overlap hold (#2726) holds by a running review: an engine-owned review
+// (externally_driven = 0) of the same repo and pull request, by the projected
+// columns, is running at a different payload head. It is the hold's rule for
+// running holders; a sibling the daemon has dispatched but not yet claimed is
+// in-process state the store cannot see, so a review held only by that counts
+// until the sibling claims. Every term is non-NULL, so NOT (...) never drops a
+// row from the count by accident. The EXISTS reads the running partial index:
+// INDEXED BY is required, left to itself SQLite builds an automatic index over
+// the whole jobs table on every execution (measured with EXPLAIN QUERY PLAN,
+// TestRouteCapHeldReviewSQLReadsTheRunningIndex).
+const routeCapHeldReviewSQL = `r.state = 'queued' AND r.type = 'review' AND COALESCE(r.repo, '') != '' AND COALESCE(r.pull_request, 0) > 0
+		AND COALESCE(trim(json_extract(r.payload, '$.head_sha')), '') != ''
+		AND EXISTS (SELECT 1 FROM jobs h INDEXED BY idx_jobs_running_updated_at WHERE h.state = 'running' AND h.type = 'review' AND h.externally_driven = 0
+			AND lower(h.repo) = lower(r.repo) AND h.pull_request = r.pull_request
+			AND COALESCE(trim(json_extract(h.payload, '$.head_sha')), '') != ''
+			AND lower(trim(json_extract(h.payload, '$.head_sha'))) != lower(trim(json_extract(r.payload, '$.head_sha'))))`
 
 func (s *Store) rerouteQueuedJob(ctx context.Context, id string, payload string, atGeneration int64, event JobEvent, clause string, clauseArgs []any) (bool, error) {
 	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)

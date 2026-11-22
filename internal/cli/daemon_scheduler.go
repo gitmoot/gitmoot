@@ -2715,8 +2715,12 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 		for _, job := range admitted {
 			job := job
 			wg.Add(1)
+			// #2726: a dispatched review holds the other heads of its pull
+			// request from here until this goroutine returns.
+			worker.dispatchedReviews.register(job)
 			go func() {
 				defer wg.Done()
+				defer worker.dispatchedReviews.release(job.ID)
 				defer worker.Admission.Release(job.ID)
 				errs <- worker.run(ctx, job)
 			}()
@@ -2764,7 +2768,17 @@ func parallelizableSerialJobs(ctx context.Context, worker jobWorker, repoFilter 
 		return 0, ""
 	}
 	sessions := map[string]bool{}
+	// The selector admits reviews of one head per pull request per selection
+	// (#2726), so a review of another head than the first queued one of its
+	// pull request is no parallel slot more workers could fill.
+	reviewHeads := map[string]string{}
 	for _, job := range pending {
+		if prKey, head, ok := queuedJobReviewOverlap(job); ok {
+			if first, seen := reviewHeads[prKey]; seen && first != head {
+				continue
+			}
+			reviewHeads[prKey] = head
+		}
 		key := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
 		if key == "" {
 			// Each session-less job is its own parallel slot; key it by job ID
@@ -2871,15 +2885,15 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		return nil, err
 	}
 	// #2726: a review waits while another review of the same (repo, PR) at a
-	// different head is running, so its prior-verdict list, rendered at
-	// dispatch, has that review's verdict. Only running reviews hold, so the
-	// hold depends on nothing decided later, and it runs first: a held review is
-	// never routed to remote, counted against a routing cap or given a lane,
-	// and takes no checkout or runtime lock, no reservation and no spend. It
-	// cancels nothing. Only the dispatch path records events and prunes the hold
-	// log, on every call, before any early return below; the preflight count
-	// gets the same filtering read-only.
-	jobs, err = holdOverlappingReviews(ctx, worker.Store, worker.reviewHolds, jobs, repoFilter, rootFilter, forDispatch)
+	// different head is running, or dispatched by this process and not yet
+	// reaped, so its prior-verdict list, rendered at dispatch, has that
+	// review's verdict. Only those hold, so the hold depends on nothing decided
+	// later, and it runs first: a held review is never routed to remote or
+	// given a lane, and takes no checkout or runtime lock, no reservation and
+	// no spend. It cancels nothing. Only the dispatch path records events and
+	// prunes the hold log, on every call, before any early return below; the
+	// preflight count gets the same filtering read-only.
+	jobs, err = holdOverlappingReviews(ctx, worker.Store, worker.reviewHolds, worker.dispatchedReviews, jobs, repoFilter, rootFilter, forDispatch)
 	if err != nil {
 		return nil, err
 	}
@@ -3100,10 +3114,6 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 		remote bool
 	}
 	inflightCheckouts := map[string]bool{}
-	// inflightJobs is every job this pass dispatched and has not yet reaped; a
-	// review among them that is still queued (not yet claimed) seeds the
-	// selector's one-head-per-pull-request rule (#2726).
-	inflightJobs := map[string]bool{}
 	inflightRuntimes := map[string]bool{}
 	// running is this pass's per-repo HOST count, the budget input (#2470).
 	// inflight is every job this pass admitted on either lane and has not yet
@@ -3150,7 +3160,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 
 	reap := func(f finished) {
 		delete(inflightCheckouts, f.checkoutKey)
-		delete(inflightJobs, f.jobID)
+		worker.dispatchedReviews.release(f.jobID)
 		if f.runtimeKey != "" {
 			delete(inflightRuntimes, f.runtimeKey)
 		}
@@ -3284,7 +3294,6 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 				// busy-excluded the loop reaches dispatched==0 && running==0 and
 				// returns, so "busy must not count as progress" holds structurally.
 				pending = excludeBouncedBusy(ctx, worker, pending, bouncedBusy, bouncedBusyRuntimes, runtimeKeyMemo)
-				dispatchedReviews := dispatchedReviewHeads(pending, func(jobID string) bool { return inflightJobs[jobID] || tracker.inflightJob(jobID) })
 				// Union in the supervisor tracker's in-flight keys (#562): a tracked
 				// non-pool job (e.g. dispatched before a warm scheduler flip) must
 				// block same-key pool dispatch exactly like a pool-local one. Jobs
@@ -3304,7 +3313,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					seedCheckouts = unionStringSets(inflightCheckouts, trackerCheckouts)
 					seedRuntimes = unionStringSets(inflightRuntimes, trackerRuntimes)
 				}
-				queued, remaining := selectRunnableByLane(ctx, worker.Store, pending, localBudget, remoteBudget, laneOn, seedCheckouts, seedRuntimes, dispatchedReviews)
+				queued, remaining := selectRunnableByLane(ctx, worker.Store, pending, localBudget, remoteBudget, laneOn, seedCheckouts, seedRuntimes)
 				for _, job := range queued {
 					job := job
 					// Host-global admission gate (#365): reserve a session slot + RAM
@@ -3330,7 +3339,9 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					}
 					deliveryCtx := tracker.trackedJobContext(job.ID, ctx)
 					inflightCheckouts[checkoutKey] = true
-					inflightJobs[job.ID] = true
+					// #2726: held for the other heads of its pull request until
+					// reap releases it, whatever the outcome.
+					worker.dispatchedReviews.register(job)
 					if runtimeKey != "" {
 						inflightRuntimes[runtimeKey] = true
 					}
@@ -3467,7 +3478,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					if iso.runtimeKey != "" {
 						inflightRuntimes[iso.runtimeKey] = true
 					}
-					inflightJobs[iso.job.ID] = true
+					worker.dispatchedReviews.register(iso.job)
 					// #739: make the reactive isolation observable on SUCCESS too (it was
 					// silent both ways). Emitted only past the host-cap/double-dispatch gate
 					// above, so the event means the job is truly dispatched in its own

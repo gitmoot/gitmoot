@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -216,9 +217,9 @@ func TestReviewHeldForRunningReviewDispatchesWithItsVerdict(t *testing.T) {
 
 // Reviews of several heads held by one running review stay queued. Once it
 // ends the scheduler starts one head at a time: a selection admits one head per
-// pull request, and a review dispatched but not yet claimed holds the other
-// heads in the selector. So the later head's prior verdicts carry both earlier
-// reviews' verdicts.
+// pull request, and a dispatched review, registered until it is reaped, holds
+// the other heads before it is claimed. So the later head's prior verdicts
+// carry both earlier reviews' verdicts.
 func TestReviewHoldDispatchesHeldHeadsInQueueOrder(t *testing.T) {
 	h := newOverlapHoldHarness(t)
 	h.enqueue("review-a", "owner/repo", 12, overlapHeadA)
@@ -245,9 +246,15 @@ func TestReviewHoldDispatchesHeldHeadsInQueueOrder(t *testing.T) {
 	if len(queued) != 1 || queued[0].ID != "review-b" || len(remaining) != 1 || remaining[0].ID != "review-c" {
 		t.Fatalf("selection = %v, remaining = %v; want review-b alone, one head per pull request", queued, remaining)
 	}
-	dispatched := dispatchedReviewHeads(pending, func(jobID string) bool { return jobID == "review-b" })
-	if again, _ := selectRunnableByLane(h.ctx, h.store, remaining, 4, 0, false, nil, nil, dispatched); len(again) != 0 {
-		t.Fatalf("selected %v while review-b was dispatched and not yet claimed", again)
+	registered := h.worker
+	registered.dispatchedReviews = newReviewDispatchRegistry()
+	registered.dispatchedReviews.register(queued[0])
+	if again, err := listPendingQueuedJobs(h.ctx, registered, "", "", false); err != nil || len(again) != 1 || again[0].ID != "review-b" {
+		t.Fatalf("listed %v (err %v) while review-b was dispatched and not yet claimed; want review-b alone", again, err)
+	}
+	registered.dispatchedReviews.release("review-b")
+	if again, err := listPendingQueuedJobs(h.ctx, registered, "", "", false); err != nil || len(again) != 2 {
+		t.Fatalf("listed %v (err %v) after review-b was released; want both", again, err)
 	}
 
 	h.pass()
@@ -379,5 +386,36 @@ func TestReviewHeldEventNamesHolderAndIsNotStalled(t *testing.T) {
 	facts.ReviewRunning, facts.Verdict, facts.VerdictAt = review.running, review.verdict, review.verdictAt
 	if stall, stalled := classifyStalledPR(facts, config.DefaultPRStalledPolicy(), stallNow); stalled {
 		t.Fatalf("PR with a held review at its head classified stalled: %+v", stall)
+	}
+}
+
+// The tracked barrier registers a dispatched review before its goroutine runs
+// and releases it when the goroutine ends (#2726): while the review prepares it
+// is registered, and once delivered nothing is left behind.
+func TestTrackedDispatchRegistersAReviewUntilItEnds(t *testing.T) {
+	h := newOverlapHoldHarness(t)
+	h.enqueue("review-x", "owner/repo", 12, overlapHeadA)
+	worker := h.worker
+	registry := newReviewDispatchRegistry()
+	worker.dispatchedReviews = registry
+	var registeredWhilePreparing bool
+	validate := worker.CheckoutValidator
+	worker.CheckoutValidator = func(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent) (string, error) {
+		registeredWhilePreparing = len(registry.holders()[reviewOverlapKey("owner/repo", 12)]) == 1
+		return validate(ctx, job, payload, agent)
+	}
+	tracker := newInflightJobTracker(h.ctx)
+	if err := dispatchQueuedJobsTracked(h.ctx, worker, 1, 1, "owner/repo", "", tracker); err != nil {
+		t.Fatal(err)
+	}
+	tracker.drain(io.Discard, 10*time.Second)
+	if _, delivered := h.delivery("review-x"); !delivered {
+		t.Fatal("review-x was not delivered")
+	}
+	if !registeredWhilePreparing {
+		t.Fatal("review-x was not registered while it prepared")
+	}
+	if left := registry.holders(); len(left) != 0 {
+		t.Fatalf("registry kept %v after review-x ended", left)
 	}
 }

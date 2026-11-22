@@ -2651,6 +2651,65 @@ func TestListRunningReviewJobsReadsOnlyEngineRunningReviews(t *testing.T) {
 	}
 }
 
+// TestRouteCapHeldReviewSQLReadsTheRunningIndex pins the review overlap rule the
+// routing cap applies (#2726): a queued review is left out of the count only
+// while an engine review of the same repo and pull request runs at another
+// head, and the holder lookup reads the running partial index.
+func TestRouteCapHeldReviewSQLReadsTheRunningIndex(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	seed := []Job{
+		{ID: "running-a", Type: "review", State: "running", Payload: `{"repo":"owner/repo","pull_request":12,"head_sha":"AAA"}`},
+		{ID: "held-b", Type: "review", State: "queued", Payload: `{"repo":"Owner/Repo","pull_request":12,"head_sha":"bbb"}`},
+		{ID: "same-head", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","pull_request":12,"head_sha":"aaa"}`},
+		{ID: "other-pr", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","pull_request":13,"head_sha":"bbb"}`},
+		{ID: "other-repo", Type: "review", State: "queued", Payload: `{"repo":"other/repo","pull_request":12,"head_sha":"bbb"}`},
+		{ID: "no-head", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","pull_request":12}`},
+		{ID: "ask", Type: "ask", State: "queued", Payload: `{"repo":"owner/repo","pull_request":12,"head_sha":"bbb"}`},
+		{ID: "session-c", Type: "review", State: "running", ExternallyDriven: true, Payload: `{"repo":"owner/repo","pull_request":14,"head_sha":"aaa"}`},
+		{ID: "under-session", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","pull_request":14,"head_sha":"bbb"}`},
+	}
+	for _, job := range seed {
+		job.Agent = "a"
+		create := store.CreateJob
+		if job.ExternallyDriven {
+			create = func(ctx context.Context, job Job) error {
+				return store.CreateExternallyDrivenJobWithEvent(ctx, job, JobEvent{Kind: "running", Message: "session"})
+			}
+		}
+		if err := create(ctx, job); err != nil {
+			t.Fatalf("create %s returned error: %v", job.ID, err)
+		}
+	}
+	query := `SELECT r.id FROM jobs r WHERE ` + routeCapHeldReviewSQL + ` ORDER BY r.id`
+	rows, err := store.db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var held []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(held, ",") != "held-b" {
+		t.Fatalf("held rows = %v, want only held-b", held)
+	}
+	if plan := explainQueryPlan(t, store, query); !strings.Contains(plan, "USING INDEX idx_jobs_running_updated_at") || strings.Contains(plan, "AUTOMATIC") {
+		t.Fatalf("held-review lookup does not read the running index (or builds an automatic index):\n%s", plan)
+	}
+}
+
 // TestListQueuedJobsForRepoScopesInSQL pins #1673's selection surface: the repo-scoped
 // queued lister returns ONLY this repo's queued rows with the denormalized repo and
 // pull_request projections populated, and is still served by the partial queued index.

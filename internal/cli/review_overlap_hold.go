@@ -22,9 +22,9 @@ type reviewOverlapEntry struct {
 	head string
 }
 
-// reviewOverlapHeads keeps the earliest running reviews of a pull request at
-// two distinct heads, which is all a holder lookup needs: a review at head h
-// waits on the first of them whose head is not h.
+// reviewOverlapHeads keeps the earliest holders (running or dispatched) of a
+// pull request at two distinct heads, which is all a holder lookup needs: a
+// review at head h waits on the first of them whose head is not h.
 type reviewOverlapHeads struct {
 	first, second *reviewOverlapEntry
 }
@@ -83,25 +83,67 @@ func queuedJobReviewOverlap(job db.Job) (key, head string, ok bool) {
 	return key, entry.head, true
 }
 
-// dispatchedReviewHeads returns, keyed by pull request, the heads of the
-// reviews in pending that this process has dispatched (dispatched reports it)
-// but whose worker has not claimed them yet, so they are still queued. The
-// overlap hold reads running reviews from the store and cannot see them in that
-// window, so the dispatch selector is seeded with these heads instead (#2726).
-func dispatchedReviewHeads(pending []db.Job, dispatched func(jobID string) bool) map[string]string {
-	var heads map[string]string
-	for _, job := range pending {
-		if job.Type != "review" || !dispatched(job.ID) {
-			continue
-		}
-		if key, head, ok := queuedJobReviewOverlap(job); ok {
-			if heads == nil {
-				heads = map[string]string{}
-			}
-			heads[key] = head
-		}
+// reviewDispatchRegistry is the reviews this process has dispatched, from the
+// moment their dispatch registers until the dispatching path reaps them,
+// whatever the outcome. A dispatched review stays queued in the store until its
+// worker claims it, and preparation before the claim (worktree, remote
+// admission) can take a while; the overlap hold treats a registered review as
+// running, so another head of its pull request cannot start in that window
+// whatever later listings decide about the registered one (#2726). A nil
+// registry registers nothing.
+type reviewDispatchRegistry struct {
+	mu      sync.Mutex
+	reviews map[string]reviewDispatchEntry
+}
+
+type reviewDispatchEntry struct {
+	key, head string
+}
+
+func newReviewDispatchRegistry() *reviewDispatchRegistry {
+	return &reviewDispatchRegistry{reviews: map[string]reviewDispatchEntry{}}
+}
+
+// register records job if it is a review the hold can place. Call it once the
+// dispatch has registered, with release on the same path's reap.
+func (r *reviewDispatchRegistry) register(job db.Job) {
+	if r == nil {
+		return
 	}
-	return heads
+	key, head, ok := queuedJobReviewOverlap(job)
+	if !ok {
+		return
+	}
+	r.mu.Lock()
+	r.reviews[job.ID] = reviewDispatchEntry{key: key, head: head}
+	r.mu.Unlock()
+}
+
+func (r *reviewDispatchRegistry) release(jobID string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	delete(r.reviews, jobID)
+	r.mu.Unlock()
+}
+
+// holders returns the registered reviews as hold entries, keyed by pull
+// request.
+func (r *reviewDispatchRegistry) holders() map[string][]*reviewOverlapEntry {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.reviews) == 0 {
+		return nil
+	}
+	out := make(map[string][]*reviewOverlapEntry, len(r.reviews))
+	for id, entry := range r.reviews {
+		out[entry.key] = append(out[entry.key], &reviewOverlapEntry{job: db.Job{ID: id, Type: "review"}, head: entry.head})
+	}
+	return out
 }
 
 // holdOverlappingReviews removes from jobs (the queued list, in queue order)
@@ -114,20 +156,18 @@ func dispatchedReviewHeads(pending []db.Job, dispatched func(jobID string) bool)
 // review's findings. The rule here:
 //
 //   - HOLD: a queued review of (repo, PR) at head h does not dispatch while a
-//     review of the same (repo, PR) at another head is running. Only running
-//     engine reviews hold; a queued review never holds another, so nothing
-//     that may or may not dispatch later (lane, disk guard, routing cap)
-//     decides a hold. Reviews of the same head never hold each other, so split
-//     parts and the request-level dedupe keep their behaviour. The held review
-//     dispatches on the first pass after the holder ends, with the verdicts
-//     recorded by then.
+//     review of the same (repo, PR) at another head is running, or has been
+//     dispatched by this process and not yet reaped (dispatched, a
+//     reviewDispatchRegistry). Only those hold; a queued review never holds
+//     another, so nothing that may or may not dispatch later (lane, disk
+//     guard, routing cap) decides a hold. Reviews of the same head never hold
+//     each other, so split parts and the request-level dedupe keep their
+//     behaviour. The held review dispatches on the first pass after the holder
+//     ends, with the verdicts recorded by then.
 //   - ORDER: once the holder ends, the scheduler picks among the waiting
 //     reviews as usual; its selector admits reviews of one head per pull
-//     request per selection (queuedJobResourceSelector), seeded with the
-//     reviews this process dispatched that are not claimed yet
-//     (dispatchedReviewHeads). The first one dispatched holds the rest from
-//     then on, through the selector until it is claimed and through this hold
-//     while it runs.
+//     request per selection (queuedJobResourceSelector). The first one
+//     dispatched is registered and holds the rest from then on.
 //   - NON-DESTRUCTIVE: the hold only filters and cancels neither review. The
 //     PR watcher's stale-head supersession (Daemon.supersedeStaleReviewJobs)
 //     can still cancel a queued or running review of a head the pull request
@@ -138,25 +178,27 @@ func dispatchedReviewHeads(pending []db.Job, dispatched func(jobID string) bool)
 //     check counts it as a review in progress at its head.
 //
 // The hold runs first in the dispatch listing, so a held review is never
-// routed to remote, counted against a routing cap or given a lane, and takes
-// no checkout or runtime lock, no reservation and no spend. A local review
-// keeps the exact-head worktree it was created with before enqueue, as any
-// queued review does while it waits for a worker slot.
+// routed to remote or given a lane, and takes no checkout or runtime lock, no
+// reservation and no spend. A review routed before its hold began is left out
+// of the routing cap's count while held (Store.RouteQueuedJobRemote). A local
+// review keeps the exact-head worktree it was created with before enqueue, as
+// any queued review does while it waits for a worker slot.
 //
-// The hold is bounded by its holder, an engine-owned job with its own delivery
-// timeout, runtime lease and stale-running recovery. Externally driven session
-// reviews, which have none of those, never hold. Queued reviews outside the
-// pass's repo or --session filter are left alone.
+// The hold ends when its holder leaves running: it settles, or the daemon
+// recovers it (lease reaping, stale-running recovery), not at a wall-clock
+// timeout of its own. Externally driven session reviews, which the daemon never
+// recovers, never hold. Queued reviews outside the pass's repo or --session
+// filter are left alone.
 //
 // Cost: with no queued review it reads nothing. Otherwise it reads the running
 // reviews once and decodes a queued review's payload only when a review of its
-// pull request is running (matched on the projected repo and pull_request
-// columns); a row without them is decoded to be placed.
+// pull request is running or registered (matched on the projected repo and
+// pull_request columns); a row without them is decoded to be placed.
 //
 // act is false for read-only callers (the serialization preflight): they get
 // the same filtering without events or the hold log. With act, every call
 // also prunes the hold log, whatever the queue holds.
-func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewHoldLog, jobs []db.Job, repoFilter, rootFilter string, act bool) ([]db.Job, error) {
+func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewHoldLog, dispatched *reviewDispatchRegistry, jobs []db.Job, repoFilter, rootFilter string, act bool) ([]db.Job, error) {
 	queuedKeys := map[string]bool{}
 	unprojected := false
 	for _, job := range jobs {
@@ -196,6 +238,17 @@ func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewH
 			heads[key] = &reviewOverlapHeads{}
 		}
 		heads[key].add(entry)
+	}
+	for key, entries := range dispatched.holders() {
+		if !unprojected && !queuedKeys[key] {
+			continue
+		}
+		if heads[key] == nil {
+			heads[key] = &reviewOverlapHeads{}
+		}
+		for _, entry := range entries {
+			heads[key].add(entry)
+		}
 	}
 
 	// held maps each queued review this pass weighed to whether it is held.
@@ -248,7 +301,7 @@ func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewH
 // (ids and heads), never on the holder's state, so the store's exact-message
 // dedupe is a dedupe on that identity.
 func reviewOverlapHeldMessage(key, head string, holder *reviewOverlapEntry) string {
-	return fmt.Sprintf("review held: waiting on running review %s of %s at head %s; this review at head %s dispatches once that one ends, with the verdicts recorded by then",
+	return fmt.Sprintf("review held: waiting on review %s of %s at head %s, which is running or starting; this review at head %s dispatches once that one ends, with the verdicts recorded by then",
 		holder.job.ID, key, shortReviewHead(holder.head), shortReviewHead(head))
 }
 

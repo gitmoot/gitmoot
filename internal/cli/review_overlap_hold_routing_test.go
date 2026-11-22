@@ -28,7 +28,7 @@ func TestReviewHoldNeverLetsAQueuedReviewHoldAnother(t *testing.T) {
 	if !slices.Equal(listed, []string{"review-b", "review-c"}) {
 		t.Fatalf("listed %v with nothing running, want review-b and review-c", listed)
 	}
-	queued, _ := selectRunnableByLane(ctx, store, pending, 0, 2, true, nil, nil, nil)
+	queued, _ := selectRunnableByLane(ctx, store, pending, 0, 2, true, nil, nil)
 	if len(queued) != 1 || queued[0].ID != "review-c" {
 		t.Fatalf("zero host slots and two E2B slots selected %v, want review-c", queued)
 	}
