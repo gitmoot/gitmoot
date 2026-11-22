@@ -427,6 +427,18 @@ func TestCommandArgumentsAreNotDenials(t *testing.T) {
 		{"denial in a quoted error message", "go test ./internal/workflow -count=1 -> could not start; plain go attempted to download go1.26 and reported 'toolchain not available'", false},
 		// An unclosed quote is not a span: it must not hide the denial after it.
 		{"unbalanced quote after a flag", "go test ./internal/cli -run 'TestEvidence -> did not run, sandbox denied go", false},
+		// #2731 review. A boolean flag takes no value: the word after it is
+		// the reviewer's prose, and only enumValueFlags' values are inert.
+		{"denial after a boolean flag", "pytest tests/test_cli.py --verbose never ran (sandbox)", false},
+		{"assigned value of an unlisted flag", "go test ./... --failfast -custom=never -> ok", false},
+		// An explicit assignment is read on its own token, so the long flag
+		// before it cannot shadow it.
+		{"assigned enum value after a boolean flag", "go test ./... --failfast --color=never -> ok", true},
+		// Nothing after the output separator is a command argument.
+		{"quoted diagnostic after the separator", "pytest tests/test_cli.py -> option --capture 'not recognized'", false},
+		{"unquoted diagnostic after the separator", "pytest tests/test_cli.py -> option --capture not recognized", false},
+		{"quote closed by a diagnostic after the separator", "go test ./... -run 'TestEvidence -> didn't run; shell reported 'unterminated quote'", false},
+		{"quoted diagnostic after an em dash", "pytest tests/test_cli.py — option --capture 'not recognized'", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
