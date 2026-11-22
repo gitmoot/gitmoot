@@ -390,3 +390,49 @@ func TestExecutedClaimNeedsARunnableTarget(t *testing.T) {
 		t.Fatalf("an honest static-only review failed %v; under result_checks=block that KILLS the job", keys(failed))
 	}
 }
+
+// TestCommandArgumentsAreNotDenials pins #2730: a negation word that is a
+// command's ARGUMENT - a flag's quoted filter, or a flag's value - says nothing
+// about whether the command ran, while the same word in the reviewer's prose
+// still denies it.
+func TestCommandArgumentsAreNotDenials(t *testing.T) {
+	// The two tests_run entries of Grok's approval of herdr#490
+	// (local-review-review-router-18ea56dab8cabf92-1), verbatim.
+	const (
+		herdr490CompileOnly = "cargo nextest run -p herdr --no-run --color never -> Finished test profile [unoptimized + debuginfo] in 3m 54s"
+		herdr490Run         = "cargo nextest run -p herdr --failure-output final --status-level fail --color never -E 'test(/agent_topics::/) or test(/app::api::topics::/) or test(/api::fence_policy::/) or test(/a_topic_suggestion_shows/) or test(/a_suggestion_before_the_clients/) or test(/guest_gate::tests::a_guest_(acts_on_the_granted_agents_topic|cannot_switch_topics|reaches_the_granted_agents_topics|sees_topic_suggestions)/) or test(/fence_gate_/) or test(/proxy_forwards_the_topics_switch/) or test(/every_wire_method_resolves_to_a_deliberate_access/) or test(/api::federation::tests::/) or test(/topics_switch/) or test(/topics_enable/) or test(/topics_disable/) or test(/only_omp_agents_have_a_topics/) or test(/omp_agents_report_whether_topics/) or test(/enabling_topics_without/) or test(/switching_off_drops_the_topics/) or test(/switching_to_the_state_the_agent_is_in/) or test(/a_plain_restart_keeps_the_topics/) or test(/agent_list_advertises_the_topics_switch/)' -> 64 passed, 0 failed (includes guest by-label and set_enabled refusal, fence Talk/Denied, federation method table, switch peer advertisement refusal, transcript merge/resend, suggestion events, FakeControl path bound)"
+	)
+	cases := []struct {
+		name  string
+		entry string
+		ran   bool
+	}{
+		// The cause, measured: `never` is the value of --color, not a denial.
+		{"herdr490 nextest run with --color never", herdr490Run, true},
+		// Compile-only names no runnable target; it must stay NOT an execution.
+		{"herdr490 compile-only --no-run", herdr490CompileOnly, false},
+		{"flag value --color never", "cargo nextest run --color never --manifest-path crates/herdr/Cargo.toml -> 12 passed", true},
+		{"flag value --success-output=never", "cargo nextest run --success-output=never --manifest-path crates/herdr/Cargo.toml -> 12 passed", true},
+		// A flag nearby does not make a later `never` its value.
+		{"denial after a flag's value", "go test ./... --count 1, never ran (sandbox)", false},
+		{"quoted filter with not", "pytest -q tests/core/test_clip.py -k 'not slow and not db' -> 20 passed, 3 deselected", true},
+		{"double-quoted -E filter with not", `cargo nextest run --manifest-path crates/herdr/Cargo.toml -E "test(a) and not test(b)" -> 9 passed`, true},
+		// The quote holds a clause-ending token: the spans are found before the
+		// clause split, so the second half's `not` is still inside the filter.
+		{"quoted filter spanning a clause end", "go test -run 'TestSkipsAStage. not when idle' ./internal/workflow -> ok", true},
+		{"unquoted denial", "did not run go test ./...", false},
+		{"denial outside a quoted command", `"go test ./..." was not run`, false},
+		// A quote that is not a flag's argument is OUTPUT, and output saying
+		// "not available" is the evidence that nothing was tested.
+		{"denial in a quoted error message", "go test ./internal/workflow -count=1 -> could not start; plain go attempted to download go1.26 and reported 'toolchain not available'", false},
+		// An unclosed quote is not a span: it must not hide the denial after it.
+		{"unbalanced quote after a flag", "go test ./internal/cli -run 'TestEvidence -> did not run, sandbox denied go", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := entryClaimsExecution(tc.entry); got != tc.ran {
+				t.Fatalf("entryClaimsExecution(%q) = %v, want %v", tc.entry, got, tc.ran)
+			}
+		})
+	}
+}

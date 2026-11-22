@@ -765,15 +765,206 @@ func deniesExecution(entry string) bool {
 	//
 	// So the question is per clause, and an entry claims an execution when SOME
 	// clause names a runnable target with no denial in it.
-	for _, clause := range executionClauses(entry) {
-		if namesARunnableTarget(clause) && !executionNegation.MatchString(clause) {
+	text := normalizedEvidenceEntry(entry)
+	inert := commandArgumentSpans(text)
+	for _, clause := range executionClauses(text) {
+		if namesARunnableTarget(text[clause.start:clause.end]) && !clauseDeniesExecution(text, clause, inert) {
 			return false
 		}
 	}
 	return true
 }
 
-// executionClauses normalises an entry and splits it into clauses.
+// textSpan is a half-open byte range [start, end) of a normalized entry.
+type textSpan struct{ start, end int }
+
+// normalizedEvidenceEntry lowercases an entry and collapses every whitespace
+// run to one space. Clauses and argument spans are byte ranges of this one
+// string, so a clause reads exactly as the space-joined clause it replaced and
+// the denial patterns, whose phrases are written with single spaces, match the
+// same text they always did.
+func normalizedEvidenceEntry(entry string) string {
+	return strings.Join(strings.Fields(strings.ToLower(entry)), " ")
+}
+
+// clauseDeniesExecution reports whether a denial phrase sits in the clause
+// OUTSIDE every inert span. A match is inert only when it lies wholly inside
+// one, so a phrase straddling a quote still counts as a denial.
+//
+// #2730, 2026-11-22. A FLAG'S ARGUMENT IS NOT PROSE. Grok's approval of
+// herdr#490 was clamped to static_only for a real 64-test nextest run, and the
+// issue blamed the `not` operator inside its quoted -E filter. MEASURED, that
+// was not the cause: the filter holds no standalone `not`; both #490 entries
+// were denied by `\bnever\b` matching the flag value in `--color never`. Two
+// rules followed, each measured separately on the live ledger (105,860
+// tests_run entries) against the previous predicate:
+//
+//	the flag-value rule      4 entries denied -> executed, 0 the other way;
+//	                         all four are real nextest runs, one is #490 entry
+//	                         2, the only clamped review it un-clamps
+//	the flag-argument quote  50 entries denied -> executed, 0 the other way;
+//	                         every one read by hand is a real run - pytest -k
+//	                         'not slow', vitest -t 'never taps ...', grep -c
+//	                         'not established' - and none was a clamped review
+//
+// THE OBVIOUS RULE, "ignore every quoted span", WAS MEASURED AND REFUSED. On ' and
+// " it flips 360 entries (383 with backticks), and reading them found genuine
+// denials whose only in-clause negation was a QUOTED ERROR MESSAGE: a JSON
+// entry whose whole "result":"NOT RUN - gh refused ..." is a double-quoted
+// value, and "go test ... -> could not start; plain go attempted to download
+// go1.26 and reported 'toolchain not available'", where the clause after the
+// boundary names go1.26 and its only denial is the quote. With backticks it
+// also accepted a "NOT RUN, and why" entry whose target clause denied only
+// through `command not found`. A quote after an outcome arrow is usually a
+// command's OUTPUT, and output saying "not found" is exactly the evidence that
+// nothing was tested. A quote that is the argument of a flag is a test filter
+// or a search pattern, which is why `pytest -k 'not slow'` carries the word at
+// all. So only that quote is inert. Backticks were measured under this rule
+// too and change nothing: a backticked command's own -k/-t argument is
+// single-quoted inside it.
+//
+// The issue's figure does not reproduce on this box: it cites 34 of 942 Grok
+// approvals over 7 days, while this ledger holds 8 clamped Grok reviews in
+// total, and #490 is the only one either rule explains. Another,
+// review-router-18ea36a588255ed9, was clamped by the OTHER half of the
+// predicate - its nextest -E entry names no path-shaped target at all - which
+// this round deliberately does not touch.
+func clauseDeniesExecution(text string, clause textSpan, inert []textSpan) bool {
+	for _, match := range executionNegation.FindAllStringIndex(text[clause.start:clause.end], -1) {
+		if !insideAnySpan(clause.start+match[0], clause.start+match[1], inert) {
+			return true
+		}
+	}
+	return false
+}
+
+func insideAnySpan(start, end int, spans []textSpan) bool {
+	for _, span := range spans {
+		if start >= span.start && end <= span.end {
+			return true
+		}
+	}
+	return false
+}
+
+// commandArgumentSpans returns the spans of a normalized entry that are a
+// command's ARGUMENTS rather than the reviewer's prose, so a denial phrase
+// inside one says nothing about whether the command ran. Two shapes qualify,
+// and nothing else:
+//
+//   - A FLAG'S QUOTED ARGUMENT: a ' or " quote opening right after a flag
+//     token ("-k 'not slow'", "-E 'test(a) and not test(b)'") or attached to
+//     one ("--filter='not slow'"). It closes at the next same quote that no
+//     letter or digit follows, so the apostrophe in "didn't" closes nothing. A
+//     quote that never closes is NOT a span: the rest of the entry stays
+//     visible to the denial check rather than vanishing into an argument that
+//     was never terminated.
+//
+//   - A FLAG'S VALUE that is itself a denial word: "--color never",
+//     "--success-output=never", "-x=never". Only the IMMEDIATE value, and only
+//     when the whole value is the word, so "--count 1, never ran" keeps its
+//     denial.
+//
+// THE SPANS ARE FOUND ON THE WHOLE ENTRY, BEFORE THE CLAUSE SPLIT. The split
+// is on tokens and does not know about quotes, so "-run 'skips a stage. not
+// when idle'" is cut after "stage."; finding quotes per clause would leave each
+// half with an unbalanced quote and read the filter's `not` as a denial. The
+// split itself is unchanged, so no clause gains text it did not have before.
+func commandArgumentSpans(text string) []textSpan {
+	var spans []textSpan
+	tokenStart := 0
+	previousToken := ""
+	for i := 0; i < len(text); i++ {
+		switch c := text[i]; {
+		case c == ' ':
+			previousToken = text[tokenStart:i]
+			tokenStart = i + 1
+		case c == '\'' || c == '"':
+			if !opensFlagArgument(text, tokenStart, i, previousToken) {
+				continue
+			}
+			end := closingQuote(text, i)
+			if end < 0 {
+				continue
+			}
+			spans = append(spans, textSpan{start: i, end: end + 1})
+			// The quoted argument may hold spaces; the token after it starts
+			// fresh, and nothing inside it is a flag.
+			i = end
+		}
+	}
+	return append(spans, flagValueDenials(text)...)
+}
+
+// opensFlagArgument reports whether the quote at i opens a flag's argument: it
+// starts a token whose predecessor is a flag, or it directly follows "flag=".
+func opensFlagArgument(text string, tokenStart, i int, previousToken string) bool {
+	if i == tokenStart {
+		return tokenStart > 0 && isFlagToken(previousToken)
+	}
+	return text[i-1] == '=' && isFlagToken(text[tokenStart:i-1])
+}
+
+// closingQuote returns the index of the quote closing the one at open, or -1.
+func closingQuote(text string, open int) int {
+	for j := open + 1; j < len(text); j++ {
+		if text[j] == text[open] && (j+1 == len(text) || !isAlphanumericByte(text[j+1])) {
+			return j
+		}
+	}
+	return -1
+}
+
+// flagValueDenials returns the value tokens of flags whose whole value is a
+// denial phrase: "--color never", "--success-output=never".
+func flagValueDenials(text string) []textSpan {
+	var spans []textSpan
+	previousToken := ""
+	start := 0
+	for start < len(text) {
+		end := strings.IndexByte(text[start:], ' ')
+		if end < 0 {
+			end = len(text)
+		} else {
+			end += start
+		}
+		token := text[start:end]
+		value := -1
+		if strings.HasPrefix(previousToken, "--") && isFlagToken(previousToken) {
+			value = start
+		} else if eq := strings.IndexByte(token, '='); eq > 0 && isFlagToken(token[:eq]) {
+			value = start + eq + 1
+		}
+		if value >= 0 && value < end && isWholeDenial(text[value:end]) {
+			spans = append(spans, textSpan{start: value, end: end})
+		}
+		previousToken = token
+		start = end + 1
+	}
+	return spans
+}
+
+func isWholeDenial(value string) bool {
+	match := executionNegation.FindStringIndex(value)
+	return match != nil && match[0] == 0 && match[1] == len(value)
+}
+
+// isFlagToken reports whether token is a command-line flag: "-k", "-run",
+// "--color", "--success-output". "->" and "-" are not.
+func isFlagToken(token string) bool {
+	name := strings.TrimPrefix(strings.TrimPrefix(token, "-"), "-")
+	if len(name) == len(token) || name == "" || name[0] < 'a' || name[0] > 'z' {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if c := name[i]; c != '-' && !isAlphanumericByte(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// executionClauses splits a normalized entry into clause spans.
 //
 // IT SPLITS ON TOKENS, NOT ON CHARACTERS, and the fixtures forced that twice.
 // Splitting on every '.' shatters "./..." - the very target the clause is about
@@ -785,27 +976,27 @@ func deniesExecution(entry string) bool {
 // A clause ends at a token that ENDS with '.', ';' or ':' and is otherwise
 // ordinary prose: no '/' and no interior '.'. "stage." ends a clause;
 // "./...", "internal/run.go:10" and "go1.26.4" do not.
-func executionClauses(entry string) []string {
-	var out []string
-	var clause []string
-	flush := func() {
-		if len(clause) > 0 {
-			out = append(out, strings.Join(clause, " "))
-			clause = nil
+func executionClauses(text string) []textSpan {
+	var out []textSpan
+	clauseStart := 0
+	for start := 0; start < len(text); {
+		end := strings.IndexByte(text[start:], ' ')
+		if end < 0 {
+			end = len(text)
+		} else {
+			end += start
 		}
-	}
-	for _, field := range strings.Fields(strings.ToLower(entry)) {
-		clause = append(clause, field)
+		field := text[start:end]
 		core := strings.TrimRight(field, ".;:")
-		if len(core) == len(field) {
-			continue
+		// A path, package target or version is not a sentence ending.
+		if len(core) != len(field) && !strings.ContainsAny(core, "/.") {
+			out = append(out, textSpan{start: clauseStart, end: end})
+			clauseStart = end + 1
 		}
-		if strings.ContainsAny(core, "/.") {
-			// A path, package target or version - not a sentence ending.
-			continue
-		}
-		flush()
+		start = end + 1
 	}
-	flush()
+	if clauseStart < len(text) {
+		out = append(out, textSpan{start: clauseStart, end: len(text)})
+	}
 	return out
 }
