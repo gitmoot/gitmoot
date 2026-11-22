@@ -507,11 +507,12 @@ func laneBudgets(repoLocalSlots, hostCap int, tracker *inflightJobTracker) (loca
 // against the remote budget, each in FIFO order, so a local backlog on a full
 // host never consumes slots a remote job could use, and vice versa. The remote
 // pass is seeded with the keys the local pass just selected so the two never
-// pick jobs that share a checkout or runtime session. With the lane off this is
-// exactly the single selection used before #2470.
+// pick jobs that share a checkout or runtime session, or reviews of one pull
+// request at different heads (#2726). With the lane off this is exactly the
+// single selection used before #2470.
 func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job, local, remote int, laneOn bool, seedCheckouts, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
 	if !laneOn {
-		return selectRunnableQueuedJobsSeeded(ctx, store, pending, local, seedCheckouts, seedRuntimes)
+		return selectRunnableQueuedJobsSeeded(ctx, store, pending, local, seedCheckouts, seedRuntimes, nil)
 	}
 	var localJobs, remoteJobs []db.Job
 	for _, job := range pending {
@@ -521,12 +522,13 @@ func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job
 			localJobs = append(localJobs, job)
 		}
 	}
-	queued, remaining := selectRunnableQueuedJobsSeeded(ctx, store, localJobs, local, seedCheckouts, seedRuntimes)
+	queued, remaining := selectRunnableQueuedJobsSeeded(ctx, store, localJobs, local, seedCheckouts, seedRuntimes, nil)
 	if len(remoteJobs) == 0 {
 		return queued, remaining
 	}
 	checkouts := copyStringSet(seedCheckouts)
 	runtimes := copyStringSet(seedRuntimes)
+	reviews := map[string]string{}
 	for _, job := range queued {
 		if key := queuedJobCheckoutKey(ctx, store, job); key != "" {
 			checkouts[key] = true
@@ -534,8 +536,11 @@ func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job
 		if key := queuedJobRuntimeResourceKey(ctx, store, job); key != "" {
 			runtimes[key] = true
 		}
+		if key, head, ok := queuedJobReviewOverlap(job); ok {
+			reviews[key] = head
+		}
 	}
-	remoteQueued, remoteRemaining := selectRunnableQueuedJobsSeeded(ctx, store, remoteJobs, remote, checkouts, runtimes)
+	remoteQueued, remoteRemaining := selectRunnableQueuedJobsSeeded(ctx, store, remoteJobs, remote, checkouts, runtimes, reviews)
 	return append(queued, remoteQueued...), append(remaining, remoteRemaining...)
 }
 
@@ -1075,9 +1080,14 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 			worker.Admission.Release(job.ID)
 			continue
 		}
+		// #2726: held for the other heads of its pull request until this
+		// goroutine returns, whatever the outcome (runPoolJobRecovered turns a
+		// panic into an error, and the defers run either way).
+		worker.dispatchedReviews.register(job)
 		runCtx := tracker.trackedJobContext(job.ID, ctx)
 		go func() {
 			defer tracker.end(job.ID)
+			defer worker.dispatchedReviews.release(job.ID)
 			defer worker.Admission.Release(job.ID)
 			err := runPoolJobRecovered(runCtx, worker, job)
 			if err != nil && !errors.Is(err, errRuntimeSessionBusy) && !errors.Is(err, context.Canceled) {

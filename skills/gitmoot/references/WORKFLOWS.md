@@ -66,6 +66,27 @@ status` shows that it is running.
    lines the pull request adds or changes; anything else goes under "Outside
    this PR" as P3 at most, never blocks, and is not carried into the next
    round. `--full` re-reads the whole diff.
+   A review waits while another review of the same pull request (same
+   repository and number) at a different head is running, or has been
+   started by the daemon and is still preparing. A review that is only queued
+   never makes another wait. The waiting review dispatches once that one ends,
+   and its frozen prior-verdict list has the verdicts recorded by then,
+   normally including the one it waited on. `gitmoot run show <run-id>` shows
+   `review_held_for_running_review` naming the review it waits on. While it
+   waits it is not routed to the remote backend, does not count against the
+   remote routing cap, holds no lock and spends nothing; a local review keeps
+   the worktree it was created with. If you push again while it waits, the
+   waiting reviews start one head at a time once it ends, so each later one
+   also sees the verdict of the one started before it. Waiting cancels neither
+   review. The daemon's pull request watcher still ends a queued or running
+   review of a head the pull request has moved past as
+   `superseded_stale_head`, as it does without a wait; a review it cuts short
+   records no verdict, so the next review gets only the verdicts actually
+   recorded. The wait has no clock of its own: it ends when the running review
+   settles, or when the daemon recovers it (its lease is reaped or it is found
+   stale). Reviews of the same head, reviews of other pull requests, and,
+   under `daemon --session`, queued reviews outside the session never wait on
+   each other.
 5. On `approved` at the current head with green CI, the gate merges (when
    automatic merge is on) or a `/gitmoot merge` comment asks it to (when it is
    off, and your role's `merge_rule` is `self`). If it holds, the reason names

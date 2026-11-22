@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -2714,8 +2715,12 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 		for _, job := range admitted {
 			job := job
 			wg.Add(1)
+			// #2726: a dispatched review holds the other heads of its pull
+			// request from here until this goroutine returns.
+			worker.dispatchedReviews.register(job)
 			go func() {
 				defer wg.Done()
+				defer worker.dispatchedReviews.release(job.ID)
 				defer worker.Admission.Release(job.ID)
 				errs <- worker.run(ctx, job)
 			}()
@@ -2763,7 +2768,17 @@ func parallelizableSerialJobs(ctx context.Context, worker jobWorker, repoFilter 
 		return 0, ""
 	}
 	sessions := map[string]bool{}
+	// The selector admits reviews of one head per pull request per selection
+	// (#2726), so a review of another head than the first queued one of its
+	// pull request is no parallel slot more workers could fill.
+	reviewHeads := map[string]string{}
 	for _, job := range pending {
+		if prKey, head, ok := queuedJobReviewOverlap(job); ok {
+			if first, seen := reviewHeads[prKey]; seen && first != head {
+				continue
+			}
+			reviewHeads[prKey] = head
+		}
 		key := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
 		if key == "" {
 			// Each session-less job is its own parallel slot; key it by job ID
@@ -2869,6 +2884,19 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	if err != nil {
 		return nil, err
 	}
+	// #2726: a review waits while another review of the same (repo, PR) at a
+	// different head is running, or dispatched by this process and not yet
+	// reaped, so its prior-verdict list, rendered at dispatch, has that
+	// review's verdict. Only those hold, so the hold depends on nothing decided
+	// later, and it runs first: a held review is never routed to remote or
+	// given a lane, and takes no checkout or runtime lock, no reservation and
+	// no spend. It cancels nothing. Only the dispatch path records events and
+	// prunes the hold log, on every call, before any early return below; the
+	// preflight count gets the same filtering read-only.
+	jobs, err = holdOverlappingReviews(ctx, worker.Store, worker.reviewHolds, worker.dispatchedReviews, jobs, repoFilter, rootFilter, forDispatch)
+	if err != nil {
+		return nil, err
+	}
 	// Both barrier and pool schedulers (including every continuous-pool re-query)
 	// pass through this exact forDispatch path immediately before selecting work.
 	// Returning an empty eligible set pauses dispatch without changing job state,
@@ -2920,14 +2948,24 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	}
 	pending := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
-		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+		// One decode per job for every check below (it was decoded up to four
+		// times here before #2726).
+		payload, payloadErr := daemonJobPayload(job)
+		if strings.TrimSpace(repoFilter) != "" && (payloadErr != nil || !queuedPayloadMatchesRepo(payload, repoFilter)) {
+			continue
+		}
+		if !queuedDecodedJobMatchesSession(job.ID, payload, payloadErr, rootFilter) {
+			continue
+		}
+		if payloadErr != nil {
+			pending = append(pending, job)
 			continue
 		}
 		// Operational-blocker hold (#532): a job deferred behind a classified
 		// blocker is not eligible until its earliest-retry-at passes. Both
 		// schedulers (barrier and pool) funnel through this listing, so the hold
 		// is honored everywhere; jobs without the payload field are unaffected.
-		if queuedJobBlockerHeld(job, time.Now().UTC()) {
+		if queuedPayloadBlockerHeld(payload, time.Now().UTC()) {
 			continue
 		}
 		// Provider-declared role unavailability (#1136): queued work attributed to
@@ -2939,11 +2977,9 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		// a claude quota row held every queued job of the role, including codex and
 		// kimi work that had no wall. The agent lookup runs only for a job whose
 		// role is actually walled, so the common path stays the map lookup it was.
-		if payload, payloadErr := daemonJobPayload(job); payloadErr == nil {
-			if row, unavailable := unavailableRoles[strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))]; unavailable {
-				if orgRoleUnavailableRefusesRuntime(row, selectedJobDispatchRuntime(ctx, worker.Store, job, payload)) {
-					continue
-				}
+		if row, unavailable := unavailableRoles[strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))]; unavailable {
+			if orgRoleUnavailableRefusesRuntime(row, selectedJobDispatchRuntime(ctx, worker.Store, job, payload)) {
+				continue
 			}
 		}
 		pending = append(pending, job)
@@ -3124,6 +3160,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 
 	reap := func(f finished) {
 		delete(inflightCheckouts, f.checkoutKey)
+		worker.dispatchedReviews.release(f.jobID)
 		if f.runtimeKey != "" {
 			delete(inflightRuntimes, f.runtimeKey)
 		}
@@ -3302,6 +3339,9 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					}
 					deliveryCtx := tracker.trackedJobContext(job.ID, ctx)
 					inflightCheckouts[checkoutKey] = true
+					// #2726: held for the other heads of its pull request until
+					// reap releases it, whatever the outcome.
+					worker.dispatchedReviews.register(job)
 					if runtimeKey != "" {
 						inflightRuntimes[runtimeKey] = true
 					}
@@ -3438,6 +3478,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					if iso.runtimeKey != "" {
 						inflightRuntimes[iso.runtimeKey] = true
 					}
+					worker.dispatchedReviews.register(iso.job)
 					// #739: make the reactive isolation observable on SUCCESS too (it was
 					// silent both ways). Emitted only past the host-cap/double-dispatch gate
 					// above, so the event means the job is truly dispatched in its own
@@ -3629,18 +3670,23 @@ type queuedJobResourceSelector struct {
 	limit     int
 	checkouts map[string]bool
 	runtimes  map[string]bool
+	// reviews maps a pull request (reviewOverlapKey) to the head of the review
+	// of it this selection admitted (#2726).
+	reviews map[string]string
 }
 
 func selectRunnableQueuedJobs(ctx context.Context, store *db.Store, pending []db.Job, limit int) ([]db.Job, []db.Job) {
-	return selectRunnableQueuedJobsSeeded(ctx, store, pending, limit, nil, nil)
+	return selectRunnableQueuedJobsSeeded(ctx, store, pending, limit, nil, nil, nil)
 }
 
 // selectRunnableQueuedJobsSeeded is selectRunnableQueuedJobs with the
 // checkout/runtime resource sets pre-seeded from already-running jobs. The
 // barrier path passes nil seeds (empty, == the original behavior); the pool path
 // (#394) seeds the live in-flight keys so a job whose checkout key is already
-// held by a running job is not selected. The seed maps are copied, never mutated.
-func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pending []db.Job, limit int, seedCheckouts map[string]bool, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
+// held by a running job is not selected. seedReviews carries the review heads
+// an earlier selection of the same pass admitted (the local lane, for the
+// remote one). The seed maps are copied, never mutated.
+func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pending []db.Job, limit int, seedCheckouts map[string]bool, seedRuntimes map[string]bool, seedReviews map[string]string) ([]db.Job, []db.Job) {
 	if limit <= 0 {
 		// A FOURTH DECLINE POINT, outside selects and not in the issue's list: with
 		// no slots every queued job is declined and nothing recorded why. A repo
@@ -3654,7 +3700,9 @@ func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pendin
 		limit:     limit,
 		checkouts: copyStringSet(seedCheckouts),
 		runtimes:  copyStringSet(seedRuntimes),
+		reviews:   make(map[string]string, len(seedReviews)),
 	}
+	maps.Copy(selector.reviews, seedReviews)
 	queued := make([]db.Job, 0, min(limit, len(pending)))
 	remaining := make([]db.Job, 0, len(pending))
 	for _, job := range pending {
@@ -3741,9 +3789,23 @@ func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store,
 	if runtimeKey != "" && s.runtimes[runtimeKey] {
 		return false, "runtime", fmt.Sprintf("runtime already taken this pass: runtime=%s", runtimeKey)
 	}
+	// #2726: reviews of one pull request at different heads never start in the
+	// same selection. The overlap hold only sees running reviews, so two
+	// waiting heads released together by their holder would otherwise start
+	// side by side, and the later one would miss the earlier one's verdict. The
+	// first admitted one runs, and holds the rest once it is running.
+	reviewKey, reviewHead, isReview := queuedJobReviewOverlap(job)
+	if isReview {
+		if head, taken := s.reviews[reviewKey]; taken && head != reviewHead {
+			return false, "review_overlap", fmt.Sprintf("a review of %s at head %s was selected this pass; this one at head %s waits for its verdict", reviewKey, shortReviewHead(head), shortReviewHead(reviewHead))
+		}
+	}
 	s.checkouts[checkoutKey] = true
 	if runtimeKey != "" {
 		s.runtimes[runtimeKey] = true
+	}
+	if isReview {
+		s.reviews[reviewKey] = reviewHead
 	}
 	return true, "", ""
 }
@@ -3762,7 +3824,14 @@ func queuedJobMatchesRepo(job db.Job, repoFilter string) bool {
 		return true
 	}
 	payload, err := daemonJobPayload(job)
-	return err == nil && payload.Repo == repoFilter
+	return err == nil && queuedPayloadMatchesRepo(payload, repoFilter)
+}
+
+// queuedPayloadMatchesRepo is queuedJobMatchesRepo for a caller that already
+// decoded the payload.
+func queuedPayloadMatchesRepo(payload workflow.JobPayload, repoFilter string) bool {
+	repoFilter = strings.TrimSpace(repoFilter)
+	return repoFilter == "" || payload.Repo == repoFilter
 }
 
 // queuedJobMatchesSession reports whether a job is in scope for the daemon's
@@ -3771,14 +3840,21 @@ func queuedJobMatchesRepo(job db.Job, repoFilter string) bool {
 // (job.ID == rootFilter) or carries that id as payload.RootJobID.
 func queuedJobMatchesSession(job db.Job, rootFilter string) bool {
 	rootFilter = strings.TrimSpace(rootFilter)
-	if rootFilter == "" {
-		return true
-	}
-	if job.ID == rootFilter {
+	if rootFilter == "" || job.ID == rootFilter {
 		return true
 	}
 	payload, err := daemonJobPayload(job)
-	return err == nil && payload.RootJobID == rootFilter
+	return queuedDecodedJobMatchesSession(job.ID, payload, err, rootFilter)
+}
+
+// queuedDecodedJobMatchesSession is queuedJobMatchesSession for a caller that
+// already decoded the payload; decodeErr is that decode's error.
+func queuedDecodedJobMatchesSession(jobID string, payload workflow.JobPayload, decodeErr error, rootFilter string) bool {
+	rootFilter = strings.TrimSpace(rootFilter)
+	if rootFilter == "" || jobID == rootFilter {
+		return true
+	}
+	return decodeErr == nil && payload.RootJobID == rootFilter
 }
 
 func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) string {
