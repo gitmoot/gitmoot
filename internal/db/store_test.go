@@ -2608,6 +2608,49 @@ func TestListQueuedJobsUsesQueuedIndex(t *testing.T) {
 	}
 }
 
+// TestListRunningReviewJobsReadsOnlyEngineRunningReviews pins the review
+// overlap hold's query (#2726): only running, engine-owned review rows, with
+// their repo and pull request projected, read off the running partial index
+// without a sort.
+func TestListRunningReviewJobsReadsOnlyEngineRunningReviews(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	seed := []Job{
+		{ID: "review-running", Type: "review", State: "running", Payload: `{"repo":"owner/repo","pull_request":12,"head_sha":"aaa"}`},
+		{ID: "review-queued", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","pull_request":12}`},
+		{ID: "review-session", Type: "review", State: "running", ExternallyDriven: true, Payload: `{"repo":"owner/repo","pull_request":12}`},
+		{ID: "implement-running", Type: "implement", State: "running", Payload: `{"repo":"owner/repo","pull_request":12}`},
+		{ID: "review-done", Type: "review", State: "succeeded", Payload: `{"repo":"owner/repo","pull_request":12}`},
+	}
+	for _, job := range seed {
+		job.Agent = "a"
+		create := store.CreateJob
+		if job.ExternallyDriven {
+			create = func(ctx context.Context, job Job) error {
+				return store.CreateExternallyDrivenJobWithEvent(ctx, job, JobEvent{Kind: "running", Message: "session"})
+			}
+		}
+		if err := create(ctx, job); err != nil {
+			t.Fatalf("create %s returned error: %v", job.ID, err)
+		}
+	}
+	plan := explainQueryPlan(t, store, listRunningReviewJobsSQL)
+	if !strings.Contains(plan, "USING INDEX idx_jobs_running_updated_at") || strings.Contains(plan, "TEMP B-TREE") {
+		t.Fatalf("ListRunningReviewJobs plan does not read the running index without a sort:\n%s", plan)
+	}
+	got, err := store.ListRunningReviewJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListRunningReviewJobs returned error: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "review-running" || got[0].Repo != "owner/repo" || got[0].PullRequest != 12 || !strings.Contains(got[0].Payload, `"head_sha":"aaa"`) {
+		t.Fatalf("ListRunningReviewJobs = %+v, want only review-running with repo, pull request and payload", got)
+	}
+}
+
 // TestListQueuedJobsForRepoScopesInSQL pins #1673's selection surface: the repo-scoped
 // queued lister returns ONLY this repo's queued rows with the denormalized repo and
 // pull_request projections populated, and is still served by the partial queued index.

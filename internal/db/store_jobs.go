@@ -526,6 +526,38 @@ func (s *Store) ListReviewJobsForPullRequest(ctx context.Context, repo string, p
 	return scanJobs(rows)
 }
 
+// listRunningReviewJobsSQL is ListRunningReviewJobs' exact query. The literal
+// state predicate lets SQLite read the rows off the partial index
+// idx_jobs_running_updated_at, and ordering by that index's own key (updated_at,
+// then rowid) needs no sort.
+const listRunningReviewJobsSQL = `SELECT id, repo, pull_request, payload FROM jobs
+		WHERE state = 'running' AND type = 'review' AND externally_driven = 0
+		ORDER BY updated_at, rowid`
+
+// ListRunningReviewJobs returns the engine-owned review jobs that are running
+// now, with id, repo, pull_request and payload set. The review overlap hold
+// (#2726) reads it once per dispatch pass that has a queued review. It touches
+// only running rows, and the type filter keeps other jobs' payloads (an
+// implement payload can be megabytes) unread. Externally driven session jobs
+// are excluded: the daemon neither times them out nor reaps them on a lease, so
+// they cannot bound a hold.
+func (s *Store) ListRunningReviewJobs(ctx context.Context) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, listRunningReviewJobsSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []Job
+	for rows.Next() {
+		job := Job{Type: "review", State: "running"}
+		if err := rows.Scan(&job.ID, &job.Repo, &job.PullRequest, &job.Payload); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 // ListReviewJobsInTaskScope returns every review job that could belong to the
 // same task as a job on repo/pullRequest, for workflow.sameTask to decide
 // exactly (#2470). It replaces full ListJobs scans in review-round lookups and

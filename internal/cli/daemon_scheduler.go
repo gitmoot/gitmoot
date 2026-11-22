@@ -2894,6 +2894,19 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		if draining {
 			return nil, nil
 		}
+	}
+	// #2726: a review waits for another review of the same (repo, PR) that is
+	// running or queued ahead of it, so its prior-verdict list, rendered at
+	// dispatch, carries that review's verdict. It runs here, before the disk
+	// guard, the admission gate and worker.run, so a held review takes no
+	// resource: no remote switch or reservation, no worktree, no checkout or
+	// runtime lock. Only the dispatch path supersedes or records events; the
+	// preflight count gets the same filtering read-only.
+	jobs, err = holdOverlappingReviews(ctx, worker.Store, jobs, repoFilter, rootFilter, forDispatch)
+	if err != nil {
+		return nil, err
+	}
+	if forDispatch {
 		// Below the hard floor nothing new dispatches, reviews included. In the
 		// review warning band ([disk_guard] remote_reviews) reviews move to E2B
 		// and every other job keeps dispatching. This runs after the drain check,

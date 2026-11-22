@@ -66,6 +66,16 @@ status` shows that it is running.
    lines the pull request adds or changes; anything else goes under "Outside
    this PR" as P3 at most, never blocks, and is not carried into the next
    round. `--full` re-reads the whole diff.
+   A review of a new head waits while another review of the same pull request
+   (same repository and number) is running or queued ahead of it. It
+   dispatches once that one ends, so its frozen prior-verdict list includes
+   that verdict and can answer its findings. `gitmoot run show <run-id>`
+   shows `review_held_for_running_review` naming the review it waits on. If
+   you push again while it waits, only the newest head's request is kept:
+   older waiting requests for the same question end as `superseded_stale_head`.
+   The running review is never cut short by this, and the wait ends when it
+   does, at the latest at its own timeout. Reviews of the same head, and
+   reviews of other pull requests, never wait on each other.
 5. On `approved` at the current head with green CI, the gate merges (when
    automatic merge is on) or a `/gitmoot merge` comment asks it to (when it is
    off, and your role's `merge_rule` is `self`). If it holds, the reason names
