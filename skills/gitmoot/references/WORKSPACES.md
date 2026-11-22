@@ -140,13 +140,14 @@ exit **3** (`not_found`) for a path that does not exist and **4**
 line.
 
 `requirements_unmet` adds `failed_check` (the command), `exit_code` (its
-status, 124 on timeout) and `output_tail` (at most the last 2 KiB of its
-combined stdout and stderr, with tokens, keys and passwords redacted). Only
-the last 64 KiB of output is kept; when more was printed, the partial first
-line of what remains is dropped before redacting, since a secret cut there
-may have lost the prefix that identifies it. Redaction is a courtesy, not a
-boundary: the same seat can run the check with `workspace exec` and read its
-raw output):
+status, 124 on timeout) and `output_tail`: at most 2 KiB, the last lines of
+the check's stdout followed by the last lines of its stderr, with tokens, keys
+and passwords redacted. stderr is kept first when both don't fit, since it
+usually says why the check failed. Each stream keeps only its last 64 KiB;
+when more was printed, the partial first line of what remains is dropped
+before redacting, since a secret cut there may have lost the prefix that
+identifies it. Redaction is a courtesy, not a boundary: the same seat can run
+the check with `workspace exec` and read its raw output.
 
 ```json
 {"error":{"code":"requirements_unmet","message":"require check \"go version\" exited 127",

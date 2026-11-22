@@ -57,3 +57,55 @@ func TestWorkspaceRequireTailRedactsAnUncutCapture(t *testing.T) {
 		t.Fatalf("an uncut capture lost text: %q", tail)
 	}
 }
+
+// TestWorkspaceRequireReportSurvivesInterleavedStreams pins #2712: stdout and
+// stderr are pumped separately, so a stderr line can arrive in the middle of a
+// long stdout line. A capture shared by both took that stderr newline as the
+// end of stdout's cut fragment and reported the rest of the stdout secret.
+// The reviewer's probe: password= plus about 84 KiB of value on stdout, with
+// a stderr line written after 40 KiB of it.
+func TestWorkspaceRequireReportSurvivesInterleavedStreams(t *testing.T) {
+	const marker = "s3cr3tVALUE"
+	value := strings.Repeat(marker, (84<<10)/len(marker)+1)
+	stdout := &workspaceRequireCapture{max: workspaceRequireCaptureBytes}
+	stderr := &workspaceRequireCapture{max: workspaceRequireCaptureBytes}
+	line := "password=" + value + "\n"
+	split := 40 << 10
+	for _, chunk := range []struct {
+		w    *workspaceRequireCapture
+		data string
+	}{
+		{stdout, line[:split]},
+		{stderr, "warning: slow disk\n"},
+		{stdout, line[split:]},
+		{stderr, "bash: line 1: bun: command not found\n"},
+	} {
+		for start := 0; start < len(chunk.data); start += 4 << 10 {
+			chunk.w.Write([]byte(chunk.data[start:min(start+4<<10, len(chunk.data))]))
+		}
+	}
+	report := workspaceRequireReport(stdout.redacted(), stderr.redacted())
+	if strings.Contains(report, "3cr3tVAL") {
+		t.Fatalf("the report leaks the stdout secret: %.200q", report)
+	}
+	if !strings.HasSuffix(report, "bash: line 1: bun: command not found\n") {
+		t.Fatalf("the report lost stderr's last line: %.200q", report)
+	}
+	if len(report) > workspaceRequireTailBytes {
+		t.Fatalf("report is %d bytes, over %d", len(report), workspaceRequireTailBytes)
+	}
+}
+
+// TestWorkspaceRequireReportKeepsStderrWhenBothOverflow: stderr wins the
+// budget, and stdout gets the rest on its own line.
+func TestWorkspaceRequireReportKeepsStderrWhenBothOverflow(t *testing.T) {
+	out := strings.Repeat("o", 3000)
+	errText := strings.Repeat("e", 1000) + "\nfatal: missing tool\n"
+	report := workspaceRequireReport(out, errText)
+	if len(report) > workspaceRequireTailBytes || !strings.HasSuffix(report, errText) {
+		t.Fatalf("stderr not kept whole within the budget: %d bytes, suffix %q", len(report), report[max(0, len(report)-40):])
+	}
+	if !strings.HasPrefix(report, "o") || !strings.Contains(report, "o\n"+strings.Repeat("e", 10)) {
+		t.Fatalf("stdout part missing or not on its own line: %.80q", report)
+	}
+}

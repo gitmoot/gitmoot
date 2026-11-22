@@ -317,3 +317,26 @@ func TestWorkspaceOpenRefusesUnreadableWorkspaceHeader(t *testing.T) {
 		t.Fatalf("a refused open created %s", list)
 	}
 }
+
+// TestWorkspaceRequireTailKeepsStreamsApart runs #2712's interleaving through
+// the real open path: a stdout secret longer than the capture, with a stderr
+// line arriving in its middle. With one capture shared by both streams, the
+// stderr newline ended the dropped fragment early and the rest of the stdout
+// secret was reported.
+func TestWorkspaceRequireTailKeepsStreamsApart(t *testing.T) {
+	env := newWorkspaceTestEnv(t, workspaceTestConfig{local: true})
+	failing := `printf password=; head -c 40000 /dev/zero | tr '\\0' Z; sleep 0.3; echo slow-disk >&2; sleep 0.3; head -c 40000 /dev/zero | tr '\\0' Z; echo; sleep 0.3; echo bun-missing >&2; exit 3`
+	appendWorkspaceConfig(t, env.paths, "\n[repos.\"acme/widget\".workspace]\nrequire = [\""+failing+"\"]\n")
+	result := env.run("workspace", "open", "--repo", "acme/widget", "--issue", "12", "--json")
+	unmet := workspaceErrorShape(t, result)
+	if unmet.Code != wsErrRequirementsUnmet || unmet.OutputTail == nil {
+		t.Fatalf("open = exit %d %+v, want requirements_unmet", result.code, unmet)
+	}
+	tail := *unmet.OutputTail
+	if strings.Contains(tail, "ZZZZ") {
+		t.Fatalf("output_tail leaks the stdout secret: %.200q", tail)
+	}
+	if !strings.HasSuffix(tail, "slow-disk\nbun-missing\n") {
+		t.Fatalf("output_tail = %q, want stderr's lines at the end", tail)
+	}
+}
