@@ -391,11 +391,11 @@ func TestExecutedClaimNeedsARunnableTarget(t *testing.T) {
 	}
 }
 
-// TestCommandArgumentsAreNotDenials pins #2730: a negation word that is a
-// command's ARGUMENT - a flag's quoted filter, or a flag's value - says nothing
-// about whether the command ran, while the same word in the reviewer's prose
-// still denies it.
-func TestCommandArgumentsAreNotDenials(t *testing.T) {
+// TestNeverAsAFlagValueIsNotADenial pins #2730: "never" as the value of
+// --color, --colour, --success-output or --failure-output says nothing about
+// whether the command ran. That is the ONLY exemption; every other denial word
+// - in prose, in an outcome, or inside a quoted test filter - still denies.
+func TestNeverAsAFlagValueIsNotADenial(t *testing.T) {
 	// The two tests_run entries of Grok's approval of herdr#490
 	// (local-review-review-router-18ea56dab8cabf92-1), verbatim.
 	const (
@@ -413,39 +413,31 @@ func TestCommandArgumentsAreNotDenials(t *testing.T) {
 		{"herdr490 compile-only --no-run", herdr490CompileOnly, false},
 		{"flag value --color never", "cargo nextest run --color never --manifest-path crates/herdr/Cargo.toml -> 12 passed", true},
 		{"flag value --success-output=never", "cargo nextest run --success-output=never --manifest-path crates/herdr/Cargo.toml -> 12 passed", true},
+		// An explicit assignment is read on its own token, so the flag before
+		// it cannot shadow it.
+		{"assigned value after a boolean flag", "go test ./... --failfast --color=never -> ok", true},
 		// A flag nearby does not make a later `never` its value.
 		{"denial after a flag's value", "go test ./... --count 1, never ran (sandbox)", false},
-		{"quoted filter with not", "pytest -q tests/core/test_clip.py -k 'not slow and not db' -> 20 passed, 3 deselected", true},
-		{"double-quoted -E filter with not", `cargo nextest run --manifest-path crates/herdr/Cargo.toml -E "test(a) and not test(b)" -> 9 passed`, true},
-		// The quote holds a clause-ending token: the spans are found before the
-		// clause split, so the second half's `not` is still inside the filter.
-		{"quoted filter spanning a clause end", "go test -run 'TestSkipsAStage. not when idle' ./internal/workflow -> ok", true},
-		{"unquoted denial", "did not run go test ./...", false},
-		{"denial outside a quoted command", `"go test ./..." was not run`, false},
-		// A quote that is not a flag's argument is OUTPUT, and output saying
-		// "not available" is the evidence that nothing was tested.
-		{"denial in a quoted error message", "go test ./internal/workflow -count=1 -> could not start; plain go attempted to download go1.26 and reported 'toolchain not available'", false},
-		// An unclosed quote is not a span: it must not hide the denial after it.
-		{"unbalanced quote after a flag", "go test ./internal/cli -run 'TestEvidence -> did not run, sandbox denied go", false},
-		// #2731 review. A boolean flag takes no value: the word after it is
-		// the reviewer's prose, and only enumFlagValues' values are inert.
+		// A boolean flag takes no value: the word after it is prose.
 		{"denial after a boolean flag", "pytest tests/test_cli.py --verbose never ran (sandbox)", false},
 		{"assigned value of an unlisted flag", "go test ./... --failfast -custom=never -> ok", false},
-		// An explicit assignment is read on its own token, so the long flag
-		// before it cannot shadow it.
-		{"assigned enum value after a boolean flag", "go test ./... --failfast --color=never -> ok", true},
-		// Nothing after the output separator is a command argument.
-		{"quoted diagnostic after the separator", "pytest tests/test_cli.py -> option --capture 'not recognized'", false},
-		{"unquoted diagnostic after the separator", "pytest tests/test_cli.py -> option --capture not recognized", false},
-		{"quote closed by a diagnostic after the separator", "go test ./... -run 'TestEvidence -> didn't run; shell reported 'unterminated quote'", false},
-		{"quoted diagnostic after an em dash", "pytest tests/test_cli.py — option --capture 'not recognized'", false},
-		// #2731 round 3. Only a separator TOKEN ends the command part: an
-		// arrow inside a quoted filter is the filter's own text.
-		{"arrow inside a quoted filter", "go test -buildvcs=false -count=1 -run '^(TestRemoteChecksEvidenceCeiling|not->slow)$' ./internal/workflow -> ok", true},
-		// A listed flag exempts only its own documented values; anything else
-		// after it is judged like any other word.
-		{"listed flag with a value outside its set", "cargo nextest run --color nope --manifest-path crates/herdr/Cargo.toml -> 12 passed", true},
-		{"denial word that is not the listed flag's value", "cargo test --manifest-path crates/herdr/Cargo.toml --failure-output not run (no toolchain)", false},
+		// Only "never" is exempt, not any other denial word after a listed flag.
+		{"other denial word after a listed flag", "cargo test --manifest-path crates/herdr/Cargo.toml --failure-output not run (no toolchain)", false},
+		// Nothing after the earliest arrow of any kind is exempt.
+		{"never after the arrow", "go test ./internal/workflow -> --color never ran", false},
+		{"never after an unspaced arrow", "go test ./internal/workflow->ok --color never ran", false},
+		{"unquoted denial", "did not run go test ./...", false},
+		{"denial outside a quoted command", `"go test ./..." was not run`, false},
+		// INTENDED: a quoted test filter's `not` is a denial again. The
+		// quoted-argument exemption was dropped after three review rounds; it
+		// un-clamped no real clamped review, and each round found a new way for
+		// it to hide a real denial. These are false positives in the safe
+		// direction.
+		{"quoted filter with not is denied", "pytest -q tests/core/test_clip.py -k 'not slow and not db' -> 20 passed, 3 deselected", false},
+		{"arrow inside a quoted filter is denied", "go test -buildvcs=false -count=1 -run '^(TestRemoteChecksEvidenceCeiling|not->slow)$' ./internal/workflow -> ok", false},
+		// #2731 review probes: an outcome arrow missing one space.
+		{"quoted diagnostic after an arrow missing its left space", "pytest tests/test_cli.py-> option --capture 'not recognized'", false},
+		{"quoted diagnostic after an arrow missing its right space", "pytest tests/test_cli.py ->option --capture 'not recognized'", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

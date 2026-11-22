@@ -767,9 +767,9 @@ func deniesExecution(entry string) bool {
 	// So the question is per clause, and an entry claims an execution when SOME
 	// clause names a runnable target with no denial in it.
 	text := normalizedEvidenceEntry(entry)
-	inert := commandArgumentSpans(text)
+	exempt := neverFlagValues(text)
 	for _, clause := range executionClauses(text) {
-		if namesARunnableTarget(text[clause.start:clause.end]) && !clauseDeniesExecution(text, clause, inert) {
+		if namesARunnableTarget(text[clause.start:clause.end]) && !clauseDeniesExecution(text, clause, exempt) {
 			return false
 		}
 	}
@@ -780,7 +780,7 @@ func deniesExecution(entry string) bool {
 type textSpan struct{ start, end int }
 
 // normalizedEvidenceEntry lowercases an entry and collapses every whitespace
-// run to one space. Clauses and argument spans are byte ranges of this one
+// run to one space. Clauses and exempt values are byte ranges of this one
 // string, so a clause reads exactly as the space-joined clause it replaced and
 // the denial patterns, whose phrases are written with single spaces, match the
 // same text they always did.
@@ -789,184 +789,74 @@ func normalizedEvidenceEntry(entry string) string {
 }
 
 // clauseDeniesExecution reports whether a denial phrase sits in the clause
-// OUTSIDE every inert span. A match is inert only when it lies wholly inside
-// one, so a phrase straddling a quote still counts as a denial.
+// outside every exempt span.
 //
-// #2730, 2026-11-22. A COMMAND'S OWN ARGUMENT IS NOT PROSE. herdr#490's real
-// nextest run was clamped to static_only because `\bnever\b` matched the value
-// in `--color never`, and pytest's `-k 'not slow'` filters were denied the same
-// way. So a denial word inside a command argument is inert, and only there:
-// the argument must sit in the COMMAND part of the entry (before its first
-// output separator), and it must be either a flag's quoted argument or one of
-// the documented values of a flag whose enum includes "never". Everything else -
-// an outcome, a quoted diagnostic, the word after a boolean flag - still
-// denies. Each rule was measured on the live tests_run ledger before it was
-// kept; the counts and every flipped entry are in #2730, #2731 and
-// /root/fleet-tools/state/gitmoot-2730/.
-func clauseDeniesExecution(text string, clause textSpan, inert []textSpan) bool {
+// #2730, 2026-11-22. ONE EXEMPTION, AND IT IS DELIBERATELY NARROW.
+// herdr#490's real nextest run was clamped to static_only because `\bnever\b`
+// matched the value in `--color never`. So the word "never" is not a denial
+// when it is the immediate value - "--f never" or "--f=never" - of one of the
+// flags in neverValueFlags, and only in the text before the entry's earliest
+// arrow of any kind. Measured on the live tests_run ledger, this un-clamps
+// #490 and changes nothing in the other direction; the numbers and every
+// flipped entry are in #2730, #2731 and /root/fleet-tools/state/gitmoot-2730/.
+//
+// A broader rule - "a denial word inside a flag's quoted argument is inert",
+// which would accept `pytest -k 'not slow'` - was built and DROPPED after
+// three review rounds. Every round found another way for it to swallow a real
+// denial: a quoted diagnostic after the outcome arrow, an apostrophe pairing
+// with the diagnostic's quote, an arrow inside the filter, an arrow missing one
+// space. Which quoted text is a command argument is an unbounded class, and
+// it un-clamped no real clamped review. So `-k 'not slow'` is denied again, a
+// false positive in the safe direction.
+func clauseDeniesExecution(text string, clause textSpan, exempt []textSpan) bool {
 	for _, match := range executionNegation.FindAllStringIndex(text[clause.start:clause.end], -1) {
-		if !insideAnySpan(clause.start+match[0], clause.start+match[1], inert) {
+		if !slices.Contains(exempt, textSpan{start: clause.start + match[0], end: clause.start + match[1]}) {
 			return true
 		}
 	}
 	return false
 }
 
-func insideAnySpan(start, end int, spans []textSpan) bool {
-	for _, span := range spans {
-		if start >= span.start && end <= span.end {
-			return true
+// neverValueFlags take "never" as a value: --color/--colour (cargo, nextest,
+// git, grep, ls, rg) and nextest's --success-output/--failure-output. No
+// other value of theirs is a denial, so "never" is the only one exempted.
+var neverValueFlags = []string{"--color", "--colour", "--success-output", "--failure-output"}
+
+// outputArrows end the command part of an entry. The earliest one of ANY kind
+// counts, spaced or not: cutting earlier can only remove exemptions, so a
+// misread arrow costs an exemption and never hides a denial.
+var outputArrows = []string{"->", "=>", "→", "—"}
+
+// neverFlagValues returns the spans of every "never" that is the immediate
+// value of a flag in neverValueFlags, before the earliest output arrow.
+func neverFlagValues(text string) []textSpan {
+	command := text
+	for _, arrow := range outputArrows {
+		if i := strings.Index(command, arrow); i >= 0 {
+			command = command[:i]
 		}
 	}
-	return false
-}
-
-// outputSeparators end the command part of an entry: what follows is the
-// command's outcome, which is exactly where "not found" or "didn't run" means
-// nothing was tested. The spaced em dash is here because reviewers introduce
-// an outcome with it too ("jest ... — passed").
-//
-// A separator counts only as a WHOLE TOKEN, with whitespace (or the end of the
-// entry) on both sides. An arrow inside a token is the command's own text - a
-// test filter's `not->slow`, a state transition `queued->failed` - and cutting
-// there would expose the rest of a quoted filter to the denial check. Measured
-// on the ledger (#2731 round 3), an unspaced arrow is not used as an output
-// separator: the entries whose first arrow is unspaced and followed by an
-// outcome word are state transitions ("running->failed", "fail->pass").
-var outputSeparators = []string{"->", "=>", "→", "—"}
-
-// enumFlagValues are the flags whose immediate value may be a denial word
-// without denying anything, each with its documented values. Syntax cannot
-// tell a boolean flag from a value flag - "--verbose never ran" is a denial -
-// so the list is closed, and a value is exempt only when it is one of ITS
-// flag's values: the exemption does not depend on what executionNegation
-// happens to match.
-//
-// nextest's --status-level and --final-status-level are NOT here: their values
-// (none, fail, retry, slow, pass, skip, all) hold no denial word, so listing
-// them would only make a hiding place.
-var enumFlagValues = map[string][]string{
-	// cargo, nextest, git, grep, ls, rg.
-	"--color":  {"always", "auto", "never"},
-	"--colour": {"always", "auto", "never"},
-	// nextest.
-	"--success-output": {"immediate", "immediate-final", "final", "never"},
-	"--failure-output": {"immediate", "immediate-final", "final", "never"},
-}
-
-func isEnumFlagValue(flag, value string) bool {
-	return slices.Contains(enumFlagValues[flag], value)
-}
-
-// commandArgumentSpans returns the spans of a normalized entry that are a
-// command's ARGUMENTS rather than the reviewer's prose, so a denial phrase
-// inside one says nothing about whether the command ran.
-//
-// It is ONE pass over the command part - the text before the first output
-// separator token, found before any quote is read so that a quote cannot carry
-// the scan past it - tracking quotes and flags together. Two shapes qualify,
-// and nothing else:
-//
-//   - A FLAG'S QUOTED ARGUMENT: a ' or " quote opening a token right after a
-//     flag token ("-k 'not slow'", "-E 'test(a) and not test(b)'") or right
-//     after "flag=" ("--filter='not slow'"). It closes at the next same quote
-//     in the command part that no letter or digit follows, so the apostrophe in
-//     "didn't" closes nothing. A quote that never closes is NOT a span: it is
-//     read as unquoted, so the rest of the entry stays visible to the denial
-//     check.
-//
-//   - AN ENUM FLAG'S VALUE: "--color never" or "--color=never", for the flags
-//     in enumFlagValues and their listed values only. "flag=value" is read on
-//     its own token, so a preceding flag cannot shadow it.
-//
-// THE SPANS ARE FOUND ON THE WHOLE ENTRY, BEFORE THE CLAUSE SPLIT. The split
-// is on tokens and does not know about quotes, so "-run 'skips a stage. not
-// when idle'" is cut after "stage."; finding quotes per clause would leave each
-// half with an unbalanced quote and read the filter's `not` as a denial.
-func commandArgumentSpans(text string) []textSpan {
-	command := commandPart(text)
 	var spans []textSpan
 	previous := ""
 	for start := 0; start < len(command); {
-		if command[start] == ' ' {
-			start++
-			continue
+		end := strings.IndexByte(command[start:], ' ')
+		if end < 0 {
+			end = len(command)
+		} else {
+			end += start
 		}
-		end := tokenEnd(command, start)
 		token := command[start:end]
-		name, value, assigned := strings.Cut(token, "=")
-		assigned = assigned && isFlagToken(name)
-		valueStart := start
-		if assigned {
-			valueStart += len(name) + 1
-		}
-		switch {
-		case (assigned || isFlagToken(previous)) && valueStart < end && isQuote(command[valueStart]):
-			if closing := closingQuote(command, valueStart); closing >= 0 {
-				spans = append(spans, textSpan{start: valueStart, end: closing + 1})
-				// The argument may hold spaces; resume after the token its
-				// closing quote ends, and nothing inside it is a flag.
-				start = tokenEnd(command, closing+1)
-				previous = ""
-				continue
+		if flag, value, assigned := strings.Cut(token, "="); assigned {
+			if value == "never" && slices.Contains(neverValueFlags, flag) {
+				spans = append(spans, textSpan{start: end - len("never"), end: end})
 			}
-		case assigned && isEnumFlagValue(name, value):
-			spans = append(spans, textSpan{start: valueStart, end: end})
-		case !assigned && isEnumFlagValue(previous, token):
+		} else if token == "never" && slices.Contains(neverValueFlags, previous) {
 			spans = append(spans, textSpan{start: start, end: end})
 		}
 		previous = token
-		start = end
-	}
-	return spans
-}
-
-// commandPart returns text up to its first output separator token.
-func commandPart(text string) string {
-	for start := 0; start < len(text); {
-		end := tokenEnd(text, start)
-		if slices.Contains(outputSeparators, text[start:end]) {
-			return text[:start]
-		}
 		start = end + 1
 	}
-	return text
-}
-
-// tokenEnd returns the index of the space ending the token at start, or
-// len(text).
-func tokenEnd(text string, start int) int {
-	if i := strings.IndexByte(text[start:], ' '); i >= 0 {
-		return start + i
-	}
-	return len(text)
-}
-
-func isQuote(c byte) bool { return c == '\'' || c == '"' }
-
-// closingQuote returns the index of the quote closing the one at open, or -1.
-func closingQuote(text string, open int) int {
-	for j := open + 1; j < len(text); j++ {
-		if text[j] == text[open] && (j+1 == len(text) || !isAlphanumericByte(text[j+1])) {
-			return j
-		}
-	}
-	return -1
-}
-
-// isFlagToken reports whether token is a command-line flag: "-k", "-run",
-// "--color", "--success-output". "->" and "-" are not.
-func isFlagToken(token string) bool {
-	name := strings.TrimPrefix(strings.TrimPrefix(token, "-"), "-")
-	if len(name) == len(token) || name == "" || name[0] < 'a' || name[0] > 'z' {
-		return false
-	}
-	for i := 1; i < len(name); i++ {
-		if c := name[i]; c != '-' && !isAlphanumericByte(c) {
-			return false
-		}
-	}
-	return true
+	return spans
 }
 
 // executionClauses splits a normalized entry into clause spans.
