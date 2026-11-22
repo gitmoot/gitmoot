@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -765,15 +766,109 @@ func deniesExecution(entry string) bool {
 	//
 	// So the question is per clause, and an entry claims an execution when SOME
 	// clause names a runnable target with no denial in it.
-	for _, clause := range executionClauses(entry) {
-		if namesARunnableTarget(clause) && !executionNegation.MatchString(clause) {
+	text := normalizedEvidenceEntry(entry)
+	exempt := neverFlagValues(text)
+	for _, clause := range executionClauses(text) {
+		if namesARunnableTarget(text[clause.start:clause.end]) && !clauseDeniesExecution(text, clause, exempt) {
 			return false
 		}
 	}
 	return true
 }
 
-// executionClauses normalises an entry and splits it into clauses.
+// textSpan is a half-open byte range [start, end) of a normalized entry.
+type textSpan struct{ start, end int }
+
+// normalizedEvidenceEntry lowercases an entry and collapses every whitespace
+// run to one space. Clauses and exempt values are byte ranges of this one
+// string, so a clause reads exactly as the space-joined clause it replaced and
+// the denial patterns, whose phrases are written with single spaces, match the
+// same text they always did.
+func normalizedEvidenceEntry(entry string) string {
+	return strings.Join(strings.Fields(strings.ToLower(entry)), " ")
+}
+
+// clauseDeniesExecution reports whether a denial phrase sits in the clause
+// outside every exempt span.
+//
+// #2730, 2026-11-22. ONE EXEMPTION, AND IT IS DELIBERATELY NARROW.
+// herdr#490's real nextest run was clamped to static_only because `\bnever\b`
+// matched the value in `--color never`. So the word "never" is not a denial
+// when it is the immediate value - "--f never" or "--f=never" - of one of the
+// flags in neverValueFlags, and only in the text before the entry's earliest
+// arrow of any kind. Measured on the live tests_run ledger, this un-clamps
+// #490 and changes nothing in the other direction; the numbers and every
+// flipped entry are in #2730, #2731 and /root/fleet-tools/state/gitmoot-2730/.
+//
+// A broader rule - "a denial word inside a flag's quoted argument is inert",
+// which would accept `pytest -k 'not slow'` - was built and DROPPED after
+// three review rounds. Every round found another way for it to swallow a real
+// denial: a quoted diagnostic after the outcome arrow, an apostrophe pairing
+// with the diagnostic's quote, an arrow inside the filter, an arrow missing one
+// space. Which quoted text is a command argument is an unbounded class, and
+// it un-clamped no real clamped review. So `-k 'not slow'` is denied again, a
+// false positive in the safe direction.
+func clauseDeniesExecution(text string, clause textSpan, exempt []textSpan) bool {
+	for _, match := range executionNegation.FindAllStringIndex(text[clause.start:clause.end], -1) {
+		if !slices.Contains(exempt, textSpan{start: clause.start + match[0], end: clause.start + match[1]}) {
+			return true
+		}
+	}
+	return false
+}
+
+// neverValueFlags take "never" as a value: --color/--colour (cargo, nextest,
+// git, grep, ls, rg) and nextest's --success-output/--failure-output. No
+// other value of theirs is a denial, so "never" is the only one exempted.
+var neverValueFlags = []string{"--color", "--colour", "--success-output", "--failure-output"}
+
+// outputArrows end the command part of an entry. The earliest one of ANY kind
+// counts, spaced or not: cutting earlier can only remove exemptions, so a
+// misread arrow costs an exemption and never hides a denial.
+var outputArrows = []string{"->", "=>", "→", "—"}
+
+// neverFlagValues returns the spans of every "never" that is the immediate
+// value of a flag in neverValueFlags, before the earliest output arrow.
+//
+// Tokens are read from the WHOLE entry, and only then compared with the cut.
+// Cutting first would turn "--color never->approval required" into a clean
+// "never" token; read whole, "never->approval" is not the value "never".
+// So the exempt "never" must be followed by whitespace or the end of the
+// entry, and must end before the earliest arrow.
+func neverFlagValues(text string) []textSpan {
+	cut := len(text)
+	for _, arrow := range outputArrows {
+		if i := strings.Index(text, arrow); i >= 0 && i < cut {
+			cut = i
+		}
+	}
+	var spans []textSpan
+	previous := ""
+	for start := 0; start < cut; {
+		end := strings.IndexByte(text[start:], ' ')
+		if end < 0 {
+			end = len(text)
+		} else {
+			end += start
+		}
+		if end > cut {
+			break
+		}
+		token := text[start:end]
+		if flag, value, assigned := strings.Cut(token, "="); assigned {
+			if value == "never" && slices.Contains(neverValueFlags, flag) {
+				spans = append(spans, textSpan{start: end - len("never"), end: end})
+			}
+		} else if token == "never" && slices.Contains(neverValueFlags, previous) {
+			spans = append(spans, textSpan{start: start, end: end})
+		}
+		previous = token
+		start = end + 1
+	}
+	return spans
+}
+
+// executionClauses splits a normalized entry into clause spans.
 //
 // IT SPLITS ON TOKENS, NOT ON CHARACTERS, and the fixtures forced that twice.
 // Splitting on every '.' shatters "./..." - the very target the clause is about
@@ -785,27 +880,27 @@ func deniesExecution(entry string) bool {
 // A clause ends at a token that ENDS with '.', ';' or ':' and is otherwise
 // ordinary prose: no '/' and no interior '.'. "stage." ends a clause;
 // "./...", "internal/run.go:10" and "go1.26.4" do not.
-func executionClauses(entry string) []string {
-	var out []string
-	var clause []string
-	flush := func() {
-		if len(clause) > 0 {
-			out = append(out, strings.Join(clause, " "))
-			clause = nil
+func executionClauses(text string) []textSpan {
+	var out []textSpan
+	clauseStart := 0
+	for start := 0; start < len(text); {
+		end := strings.IndexByte(text[start:], ' ')
+		if end < 0 {
+			end = len(text)
+		} else {
+			end += start
 		}
-	}
-	for _, field := range strings.Fields(strings.ToLower(entry)) {
-		clause = append(clause, field)
+		field := text[start:end]
 		core := strings.TrimRight(field, ".;:")
-		if len(core) == len(field) {
-			continue
+		// A path, package target or version is not a sentence ending.
+		if len(core) != len(field) && !strings.ContainsAny(core, "/.") {
+			out = append(out, textSpan{start: clauseStart, end: end})
+			clauseStart = end + 1
 		}
-		if strings.ContainsAny(core, "/.") {
-			// A path, package target or version - not a sentence ending.
-			continue
-		}
-		flush()
+		start = end + 1
 	}
-	flush()
+	if clauseStart < len(text) {
+		out = append(out, textSpan{start: clauseStart, end: len(text)})
+	}
 	return out
 }

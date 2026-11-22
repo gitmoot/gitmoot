@@ -390,3 +390,66 @@ func TestExecutedClaimNeedsARunnableTarget(t *testing.T) {
 		t.Fatalf("an honest static-only review failed %v; under result_checks=block that KILLS the job", keys(failed))
 	}
 }
+
+// TestNeverAsAFlagValueIsNotADenial pins #2730: "never" as the value of
+// --color, --colour, --success-output or --failure-output says nothing about
+// whether the command ran. That is the ONLY exemption; every other denial word
+// - in prose, in an outcome, or inside a quoted test filter - still denies.
+func TestNeverAsAFlagValueIsNotADenial(t *testing.T) {
+	// The two tests_run entries of Grok's approval of herdr#490
+	// (local-review-review-router-18ea56dab8cabf92-1), verbatim.
+	const (
+		herdr490CompileOnly = "cargo nextest run -p herdr --no-run --color never -> Finished test profile [unoptimized + debuginfo] in 3m 54s"
+		herdr490Run         = "cargo nextest run -p herdr --failure-output final --status-level fail --color never -E 'test(/agent_topics::/) or test(/app::api::topics::/) or test(/api::fence_policy::/) or test(/a_topic_suggestion_shows/) or test(/a_suggestion_before_the_clients/) or test(/guest_gate::tests::a_guest_(acts_on_the_granted_agents_topic|cannot_switch_topics|reaches_the_granted_agents_topics|sees_topic_suggestions)/) or test(/fence_gate_/) or test(/proxy_forwards_the_topics_switch/) or test(/every_wire_method_resolves_to_a_deliberate_access/) or test(/api::federation::tests::/) or test(/topics_switch/) or test(/topics_enable/) or test(/topics_disable/) or test(/only_omp_agents_have_a_topics/) or test(/omp_agents_report_whether_topics/) or test(/enabling_topics_without/) or test(/switching_off_drops_the_topics/) or test(/switching_to_the_state_the_agent_is_in/) or test(/a_plain_restart_keeps_the_topics/) or test(/agent_list_advertises_the_topics_switch/)' -> 64 passed, 0 failed (includes guest by-label and set_enabled refusal, fence Talk/Denied, federation method table, switch peer advertisement refusal, transcript merge/resend, suggestion events, FakeControl path bound)"
+	)
+	cases := []struct {
+		name  string
+		entry string
+		ran   bool
+	}{
+		// The cause, measured: `never` is the value of --color, not a denial.
+		{"herdr490 nextest run with --color never", herdr490Run, true},
+		// Compile-only names no runnable target; it must stay NOT an execution.
+		{"herdr490 compile-only --no-run", herdr490CompileOnly, false},
+		{"flag value --color never", "cargo nextest run --color never --manifest-path crates/herdr/Cargo.toml -> 12 passed", true},
+		{"flag value --success-output=never", "cargo nextest run --success-output=never --manifest-path crates/herdr/Cargo.toml -> 12 passed", true},
+		// An explicit assignment is read on its own token, so the flag before
+		// it cannot shadow it.
+		{"assigned value after a boolean flag", "go test ./... --failfast --color=never -> ok", true},
+		// A flag nearby does not make a later `never` its value.
+		{"denial after a flag's value", "go test ./... --count 1, never ran (sandbox)", false},
+		// A boolean flag takes no value: the word after it is prose.
+		{"denial after a boolean flag", "pytest tests/test_cli.py --verbose never ran (sandbox)", false},
+		{"assigned value of an unlisted flag", "go test ./... --failfast -custom=never -> ok", false},
+		// Only "never" is exempt, not any other denial word after a listed flag.
+		{"other denial word after a listed flag", "cargo test --manifest-path crates/herdr/Cargo.toml --failure-output not run (no toolchain)", false},
+		// Nothing after the earliest arrow of any kind is exempt.
+		{"never after the arrow", "go test ./internal/workflow -> --color never ran", false},
+		{"never after an unspaced arrow", "go test ./internal/workflow->ok --color never ran", false},
+		{"unquoted denial", "did not run go test ./...", false},
+		{"denial outside a quoted command", `"go test ./..." was not run`, false},
+		// INTENDED: a quoted test filter's `not` is a denial again. The
+		// quoted-argument exemption was dropped after three review rounds; it
+		// un-clamped no real clamped review, and each round found a new way for
+		// it to hide a real denial. These are false positives in the safe
+		// direction.
+		{"quoted filter with not is denied", "pytest -q tests/core/test_clip.py -k 'not slow and not db' -> 20 passed, 3 deselected", false},
+		{"arrow inside a quoted filter is denied", "go test -buildvcs=false -count=1 -run '^(TestRemoteChecksEvidenceCeiling|not->slow)$' ./internal/workflow -> ok", false},
+		// #2731 review probes: an outcome arrow missing one space.
+		{"quoted diagnostic after an arrow missing its left space", "pytest tests/test_cli.py-> option --capture 'not recognized'", false},
+		{"quoted diagnostic after an arrow missing its right space", "pytest tests/test_cli.py ->option --capture 'not recognized'", false},
+		// #2731 round 4 probes: "never" glued to an arrow or punctuation is
+		// not the flag's value, even though the arrow cut would leave it bare.
+		{"never glued to an em dash", "git -C internal/workflow diff --color never—runner refused to start it", false},
+		{"never glued to an arrow", "git -C internal/workflow diff --color never->approval required", false},
+		{"never glued to a full stop", "go test ./internal/workflow --color never. sandbox refused it", false},
+		{"assigned never glued to an em dash", "go test ./internal/workflow --color=never—x", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := entryClaimsExecution(tc.entry); got != tc.ran {
+				t.Fatalf("entryClaimsExecution(%q) = %v, want %v", tc.entry, got, tc.ran)
+			}
+		})
+	}
+}
