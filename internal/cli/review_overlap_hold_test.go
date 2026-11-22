@@ -128,15 +128,13 @@ func (h *overlapHoldHarness) pass() {
 	}
 }
 
-// filter runs the hold alone over a fresh queue snapshot, as the dispatch
-// listing does, and returns the ids it lets through.
+// filter runs the dispatch listing once without dispatching, with holds as the
+// scheduler's hold log, and returns the ids it lets through.
 func (h *overlapHoldHarness) filter(holds *reviewHoldLog, rootFilter string) map[string]bool {
 	h.t.Helper()
-	queued, err := h.store.ListQueuedJobs(h.ctx)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	kept, err := holdOverlappingReviews(h.ctx, h.store, holds, nil, queued, "", rootFilter, true)
+	worker := h.worker
+	worker.reviewHolds = holds
+	kept, err := listPendingQueuedJobs(h.ctx, worker, "", rootFilter, true)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -358,5 +356,55 @@ func TestReviewHeldEventNamesHolderAndIsNotStalled(t *testing.T) {
 	facts.ReviewRunning, facts.Verdict, facts.VerdictAt = review.running, review.verdict, review.verdictAt
 	if stall, stalled := classifyStalledPR(facts, config.DefaultPRStalledPolicy(), stallNow); stalled {
 		t.Fatalf("PR with a held review at its head classified stalled: %+v", stall)
+	}
+}
+
+// Only a queued review eligible in the same pass holds another. In the disk
+// guard's review warning band, a pinned-local review B of an older head cannot
+// dispatch, so once the running review A settles it must not hold C, a review
+// of the current head that the guard routes to remote. When the disk recovers
+// and B can dispatch, B holds C and goes first.
+func TestReviewHoldCountsOnlyQueuedHoldersEligibleThisPass(t *testing.T) {
+	ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
+	queueDiskGuardJob(t, ctx, store, "review-a", "rev-omp", "review", `,"head_sha":"`+overlapHeadA+`"`)
+	if claimed, err := store.ClaimRunningJob(ctx, "review-a", string(workflow.JobQueued), string(workflow.JobRunning), db.JobEvent{Kind: string(workflow.JobRunning)}, 1, "boot"); err != nil || !claimed {
+		t.Fatalf("claim review-a: claimed=%v err=%v", claimed, err)
+	}
+	queueDiskGuardJob(t, ctx, store, "review-b", "rev-omp", "review", `,"head_sha":"`+overlapHeadB+`","exec_backend":"local"`)
+	queueDiskGuardJob(t, ctx, store, "review-c", "rev-omp", "review", `,"head_sha":"`+overlapHeadC+`"`)
+
+	if got := strings.Join(pendingIDs(t, ctx, worker), ","); got != "" {
+		t.Fatalf("pending while review-a runs = %q, want none", got)
+	}
+	if b := storedBackend(t, ctx, store, "review-c"); b != "remote" {
+		t.Fatalf("review-c backend = %q, want remote (routed by the warning band)", b)
+	}
+	if moved, err := store.TransitionJobState(ctx, "review-a", string(workflow.JobRunning), string(workflow.JobSucceeded)); err != nil || !moved {
+		t.Fatalf("settle review-a: moved=%v err=%v", moved, err)
+	}
+	for range 2 {
+		if got := strings.Join(pendingIDs(t, ctx, worker), ","); got != "review-c" {
+			t.Fatalf("warning-band pending after review-a settled = %q, want review-c: review-b cannot dispatch, so it must not hold it", got)
+		}
+	}
+
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 50 << 30}, nil
+	})
+	if got := strings.Join(pendingIDs(t, ctx, worker), ","); got != "review-b" {
+		t.Fatalf("healthy-disk pending = %q, want review-b alone: an eligible review-b queued ahead holds review-c", got)
+	}
+	events, err := store.ListJobEvents(ctx, "review-c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var holders []string
+	for _, event := range events {
+		if event.Kind == reviewHeldForRunningReviewEventKind {
+			holders = append(holders, event.Message)
+		}
+	}
+	if len(holders) != 2 || !strings.Contains(holders[0], "review-a") || !strings.Contains(holders[1], "review-b") {
+		t.Fatalf("review-c hold events = %q, want one naming review-a then one naming review-b", holders)
 	}
 }

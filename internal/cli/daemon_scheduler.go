@@ -2869,6 +2869,8 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	if err != nil {
 		return nil, err
 	}
+	// queued is every queued job, for the overlap hold's log (see the end).
+	queued := jobs
 	// Both barrier and pool schedulers (including every continuous-pool re-query)
 	// pass through this exact forDispatch path immediately before selecting work.
 	// Returning an empty eligible set pauses dispatch without changing job state,
@@ -2894,23 +2896,6 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		if draining {
 			return nil, nil
 		}
-	}
-	// #2726: a review waits for another review of the same (repo, PR) that is
-	// running or queued ahead of it, so its prior-verdict list, rendered at
-	// dispatch, carries that review's verdict. It runs here, before the disk
-	// guard, the admission gate and worker.run, so a held review takes no
-	// checkout or runtime lock, no remote switch or reservation, and no spend.
-	// A local review keeps the exact-head worktree it was created with before
-	// enqueue, as any queued review does while it waits for a worker slot. The
-	// hold never cancels anything. Only the dispatch path records events; the
-	// preflight count gets the same filtering read-only. Its payload decodes
-	// are kept for the eligibility loop below, so it adds none.
-	payloads := newQueuedPayloadCache(len(jobs))
-	jobs, err = holdOverlappingReviews(ctx, worker.Store, worker.reviewHolds, payloads, jobs, repoFilter, rootFilter, forDispatch)
-	if err != nil {
-		return nil, err
-	}
-	if forDispatch {
 		// Below the hard floor nothing new dispatches, reviews included. In the
 		// review warning band ([disk_guard] remote_reviews) reviews move to E2B
 		// and every other job keeps dispatching. This runs after the drain check,
@@ -2936,11 +2921,13 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		unavailableRoles[row.Role] = row
 	}
 	pending := make([]db.Job, 0, len(jobs))
+	// reviewPayloads keeps the decode of each eligible review for the overlap
+	// hold below, its only other reader; nothing else is kept.
+	reviewPayloads := map[string]workflow.JobPayload{}
 	for _, job := range jobs {
-		// One decode per job for every check below, reused from the overlap
-		// hold's decode when the payload is unchanged (it was decoded up to four
+		// One decode per job for every check below (it was decoded up to four
 		// times here before #2726).
-		payload, payloadErr := payloads.decode(job)
+		payload, payloadErr := daemonJobPayload(job)
 		if strings.TrimSpace(repoFilter) != "" && (payloadErr != nil || !queuedPayloadMatchesRepo(payload, repoFilter)) {
 			continue
 		}
@@ -2973,8 +2960,23 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 			}
 		}
 		pending = append(pending, job)
+		if job.Type == "review" {
+			reviewPayloads[job.ID] = payload
+		}
 	}
-	return pending, nil
+	// #2726: a review waits for another review of the same (repo, PR) that is
+	// running, or that is eligible in this same pass and queued ahead of it, so
+	// its prior-verdict list, rendered at dispatch, carries the verdicts recorded
+	// by then. It runs on the final eligible set, after the drain check, the disk
+	// guard, janitor admission and the checks above, so a queued review that
+	// cannot dispatch now never holds one that can. A held review takes no
+	// checkout or runtime lock, no remote reservation and no spend (the disk
+	// guard may already have routed it to remote, a payload change only). A
+	// local review keeps the exact-head worktree it was created with before
+	// enqueue, as any queued review does while it waits for a worker slot. The
+	// hold cancels nothing. Only the dispatch path records events; the
+	// preflight count gets the same filtering read-only.
+	return holdOverlappingReviews(ctx, worker.Store, worker.reviewHolds, queued, pending, reviewPayloads, forDispatch)
 }
 
 // runQueuedJobsForRepoPool is the opt-in (--scheduler=pool) continuous scheduler
@@ -3819,38 +3821,6 @@ func queuedDecodedJobMatchesSession(jobID string, payload workflow.JobPayload, d
 		return true
 	}
 	return decodeErr == nil && payload.RootJobID == rootFilter
-}
-
-// queuedPayloadCache decodes each queued job's payload at most once in one
-// listPendingQueuedJobs call: the overlap hold and the eligibility loop share
-// it. An entry is reused only while the job's raw payload is the string it was
-// decoded from, so a step in between that rewrites a payload (the disk guard's
-// move of a review to remote) gets a fresh decode. A nil cache decodes every
-// time.
-type queuedPayloadCache struct {
-	entries map[string]queuedPayloadCacheEntry
-}
-
-type queuedPayloadCacheEntry struct {
-	raw     string
-	payload workflow.JobPayload
-	err     error
-}
-
-func newQueuedPayloadCache(size int) *queuedPayloadCache {
-	return &queuedPayloadCache{entries: make(map[string]queuedPayloadCacheEntry, size)}
-}
-
-func (c *queuedPayloadCache) decode(job db.Job) (workflow.JobPayload, error) {
-	if c == nil {
-		return daemonJobPayload(job)
-	}
-	if entry, ok := c.entries[job.ID]; ok && entry.raw == job.Payload {
-		return entry.payload, entry.err
-	}
-	payload, err := daemonJobPayload(job)
-	c.entries[job.ID] = queuedPayloadCacheEntry{raw: job.Payload, payload: payload, err: err}
-	return payload, err
 }
 
 func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) string {

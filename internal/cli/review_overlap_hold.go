@@ -89,30 +89,34 @@ func reviewOverlapEntryFor(job db.Job, payload workflow.JobPayload) (key string,
 	return reviewOverlapKey(payload.Repo, payload.PullRequest), &reviewOverlapEntry{job: job, head: head}, true
 }
 
-// holdOverlappingReviews removes from jobs (the queued list, in queue order)
-// every queued review that must wait for another review of the same pull
-// request (#2726).
+// holdOverlappingReviews removes from eligible (the jobs this pass may
+// dispatch, in queue order) every review that must wait for another review of
+// the same pull request (#2726). payloads holds the decoded payload of each
+// eligible review; queued is every queued job, for the hold log.
 //
 // A review's prior-verdict list is rendered when it dispatches. A review of a
 // new head that dispatched while an older head's review was still running froze
 // that list without the running review's verdict, so it could not answer that
 // review's findings. The rule here:
 //
-//   - SCOPE: only queued reviews this pass may dispatch (its repo and --session
-//     filters) take part, so a review this daemon can never dispatch never
-//     holds one it can. Running engine reviews hold across scopes: they settle
-//     on their own.
-//   - HOLD: a queued review of (repo, PR) at head h does not dispatch while a
-//     review of the same (repo, PR) at another head is running, or is queued
-//     ahead of it. Reviews of the same head never hold each other, so split
-//     parts and the request-level dedupe keep their behaviour. The held review
-//     dispatches on the first pass after the holder settles, and its list is
-//     rendered then, with the settled verdict in it. Held reviews of several
-//     heads dispatch one after another in queue order, each with the verdicts
-//     recorded so far.
-//   - NON-DESTRUCTIVE: the hold only filters. It never cancels a review: a
-//     review of a head the pull request has moved past is left to the PR
-//     watcher's stale-head supersession (Daemon.supersedeStaleReviewJobs).
+//   - ELIGIBLE HOLDERS: a queued review holds another only when it is eligible
+//     in the same pass (repo and --session scope, drain, disk guard, janitor
+//     admission, blocker and role checks all passed), so a queued review that
+//     cannot dispatch now never holds one that can. Running engine reviews hold
+//     across scopes: they settle on their own.
+//   - HOLD: an eligible review of (repo, PR) at head h does not dispatch while
+//     a review of the same (repo, PR) at another head is running, or is
+//     eligible and queued ahead of it. Reviews of the same head never hold each
+//     other, so split parts and the request-level dedupe keep their behaviour.
+//     The held review dispatches on the first pass after the holder settles or
+//     stops being eligible, and its list is rendered then, with whatever
+//     verdicts are recorded by that time. Held reviews of several heads
+//     dispatch one after another in queue order.
+//   - NON-DESTRUCTIVE: the hold only filters and cancels neither review. The
+//     PR watcher's stale-head supersession (Daemon.supersedeStaleReviewJobs)
+//     can still cancel a queued or running review of a head the pull request
+//     has moved past, holder or held, as it does without a hold; a holder
+//     cancelled that way records no verdict.
 //   - VISIBLE: each held review gets one review_held_for_running_review event
 //     per holder, naming it. A held review is still queued, so the stalled-PR
 //     check counts it as a review in progress at its head.
@@ -124,22 +128,18 @@ func reviewOverlapEntryFor(job db.Job, payload workflow.JobPayload) (key string,
 // The hold is bounded by its holder. A running holder is an engine-owned job
 // with its own delivery timeout, runtime lease and stale-running recovery, and
 // externally driven session reviews, which have none of those, never hold. A
-// queued holder is first in line and dispatches as soon as it can.
+// queued holder is eligible and first in line.
 //
 // act is false for read-only callers (the serialization preflight): they get
-// the same filtering without events or the hold log. Each queued review is
-// decoded through payloads, which the caller reuses afterwards, so the hold
-// adds no decode of a queued job; the running reviews are read once per call,
-// and only when an in-scope queued review exists.
-func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewHoldLog, payloads *queuedPayloadCache, jobs []db.Job, repoFilter, rootFilter string, act bool) ([]db.Job, error) {
+// the same filtering without events or the hold log. The hold decodes no
+// queued payload; the running reviews are read once per call, and only when
+// an eligible review exists.
+func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewHoldLog, queued, eligible []db.Job, payloads map[string]workflow.JobPayload, act bool) ([]db.Job, error) {
 	groups := map[string]*reviewOverlapGroup{}
 	var order []string
-	for _, job := range jobs {
-		if job.Type != "review" {
-			continue
-		}
-		payload, err := payloads.decode(job)
-		if err != nil || !queuedPayloadMatchesRepo(payload, repoFilter) || !queuedDecodedJobMatchesSession(job.ID, payload, nil, rootFilter) {
+	for _, job := range eligible {
+		payload, decoded := payloads[job.ID]
+		if job.Type != "review" || !decoded {
 			continue
 		}
 		key, entry, ok := reviewOverlapEntryFor(job, payload)
@@ -156,9 +156,9 @@ func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewH
 	}
 	if len(groups) == 0 {
 		if act {
-			holds.sweep(jobs, groups)
+			holds.sweep(queued, groups)
 		}
-		return jobs, nil
+		return eligible, nil
 	}
 	running, err := store.ListRunningReviewJobs(ctx)
 	if err != nil {
@@ -198,13 +198,13 @@ func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewH
 		}
 	}
 	if act {
-		holds.sweep(jobs, groups)
+		holds.sweep(queued, groups)
 	}
 	if len(held) == 0 {
-		return jobs, nil
+		return eligible, nil
 	}
-	kept := make([]db.Job, 0, len(jobs))
-	for _, job := range jobs {
+	kept := make([]db.Job, 0, len(eligible))
+	for _, job := range eligible {
 		if !held[job.ID] {
 			kept = append(kept, job)
 		}
@@ -258,7 +258,8 @@ func (l *reviewHoldLog) record(ctx context.Context, store *db.Store, entry *revi
 
 // sweep evicts every hold that has ended: the held job left the queue, or this
 // pass weighed it and it is no longer held. A hold this pass did not weigh (a
-// job outside its repo or session filter) is kept for the pass that does.
+// job outside its repo or session filter, or not eligible this pass) is kept
+// for the pass that does.
 func (l *reviewHoldLog) sweep(queued []db.Job, groups map[string]*reviewOverlapGroup) {
 	if l == nil {
 		return
