@@ -428,7 +428,7 @@ func TestCommandArgumentsAreNotDenials(t *testing.T) {
 		// An unclosed quote is not a span: it must not hide the denial after it.
 		{"unbalanced quote after a flag", "go test ./internal/cli -run 'TestEvidence -> did not run, sandbox denied go", false},
 		// #2731 review. A boolean flag takes no value: the word after it is
-		// the reviewer's prose, and only enumValueFlags' values are inert.
+		// the reviewer's prose, and only enumFlagValues' values are inert.
 		{"denial after a boolean flag", "pytest tests/test_cli.py --verbose never ran (sandbox)", false},
 		{"assigned value of an unlisted flag", "go test ./... --failfast -custom=never -> ok", false},
 		// An explicit assignment is read on its own token, so the long flag
@@ -439,6 +439,13 @@ func TestCommandArgumentsAreNotDenials(t *testing.T) {
 		{"unquoted diagnostic after the separator", "pytest tests/test_cli.py -> option --capture not recognized", false},
 		{"quote closed by a diagnostic after the separator", "go test ./... -run 'TestEvidence -> didn't run; shell reported 'unterminated quote'", false},
 		{"quoted diagnostic after an em dash", "pytest tests/test_cli.py — option --capture 'not recognized'", false},
+		// #2731 round 3. Only a separator TOKEN ends the command part: an
+		// arrow inside a quoted filter is the filter's own text.
+		{"arrow inside a quoted filter", "go test -buildvcs=false -count=1 -run '^(TestRemoteChecksEvidenceCeiling|not->slow)$' ./internal/workflow -> ok", true},
+		// A listed flag exempts only its own documented values; anything else
+		// after it is judged like any other word.
+		{"listed flag with a value outside its set", "cargo nextest run --color nope --manifest-path crates/herdr/Cargo.toml -> 12 passed", true},
+		{"denial word that is not the listed flag's value", "cargo test --manifest-path crates/herdr/Cargo.toml --failure-output not run (no toolchain)", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

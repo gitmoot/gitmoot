@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -796,8 +797,8 @@ func normalizedEvidenceEntry(entry string) string {
 // in `--color never`, and pytest's `-k 'not slow'` filters were denied the same
 // way. So a denial word inside a command argument is inert, and only there:
 // the argument must sit in the COMMAND part of the entry (before its first
-// output separator), and it must be either a flag's quoted argument or the
-// value of a flag known to take an enum containing "never". Everything else -
+// output separator), and it must be either a flag's quoted argument or one of
+// the documented values of a flag whose enum includes "never". Everything else -
 // an outcome, a quoted diagnostic, the word after a boolean flag - still
 // denies. Each rule was measured on the live tests_run ledger before it was
 // kept; the counts and every flipped entry are in #2730, #2731 and
@@ -824,25 +825,37 @@ func insideAnySpan(start, end int, spans []textSpan) bool {
 // command's outcome, which is exactly where "not found" or "didn't run" means
 // nothing was tested. The spaced em dash is here because reviewers introduce
 // an outcome with it too ("jest ... — passed").
-var outputSeparators = []string{"->", "=>", "→", " — "}
-
-// enumValueFlags are the flags whose immediate value may be a denial word
-// without denying anything. Syntax cannot tell a boolean flag from a value
-// flag - "--verbose never ran" is a denial - so the list is closed, and each
-// flag is here because "never" is one of its documented values:
 //
-//	--color, --colour    cargo, nextest, git, grep, ls, rg: always|auto|never
-//	--success-output,    nextest: immediate|immediate-final|final|never
-//	--failure-output
+// A separator counts only as a WHOLE TOKEN, with whitespace (or the end of the
+// entry) on both sides. An arrow inside a token is the command's own text - a
+// test filter's `not->slow`, a state transition `queued->failed` - and cutting
+// there would expose the rest of a quoted filter to the denial check. Measured
+// on the ledger (#2731 round 3), an unspaced arrow is not used as an output
+// separator: the entries whose first arrow is unspaced and followed by an
+// outcome word are state transitions ("running->failed", "fail->pass").
+var outputSeparators = []string{"->", "=>", "→", "—"}
+
+// enumFlagValues are the flags whose immediate value may be a denial word
+// without denying anything, each with its documented values. Syntax cannot
+// tell a boolean flag from a value flag - "--verbose never ran" is a denial -
+// so the list is closed, and a value is exempt only when it is one of ITS
+// flag's values: the exemption does not depend on what executionNegation
+// happens to match.
 //
 // nextest's --status-level and --final-status-level are NOT here: their values
 // (none, fail, retry, slow, pass, skip, all) hold no denial word, so listing
 // them would only make a hiding place.
-var enumValueFlags = map[string]bool{
-	"--color":          true,
-	"--colour":         true,
-	"--success-output": true,
-	"--failure-output": true,
+var enumFlagValues = map[string][]string{
+	// cargo, nextest, git, grep, ls, rg.
+	"--color":  {"always", "auto", "never"},
+	"--colour": {"always", "auto", "never"},
+	// nextest.
+	"--success-output": {"immediate", "immediate-final", "final", "never"},
+	"--failure-output": {"immediate", "immediate-final", "final", "never"},
+}
+
+func isEnumFlagValue(flag, value string) bool {
+	return slices.Contains(enumFlagValues[flag], value)
 }
 
 // commandArgumentSpans returns the spans of a normalized entry that are a
@@ -850,9 +863,9 @@ var enumValueFlags = map[string]bool{
 // inside one says nothing about whether the command ran.
 //
 // It is ONE pass over the command part - the text before the first output
-// separator, found by plain search so that a quote cannot carry the scan past
-// it - tracking quotes and flags together. Two shapes qualify, and nothing
-// else:
+// separator token, found before any quote is read so that a quote cannot carry
+// the scan past it - tracking quotes and flags together. Two shapes qualify,
+// and nothing else:
 //
 //   - A FLAG'S QUOTED ARGUMENT: a ' or " quote opening a token right after a
 //     flag token ("-k 'not slow'", "-E 'test(a) and not test(b)'") or right
@@ -862,9 +875,9 @@ var enumValueFlags = map[string]bool{
 //     read as unquoted, so the rest of the entry stays visible to the denial
 //     check.
 //
-//   - AN ENUM FLAG'S VALUE that is wholly a denial word: "--color never" or
-//     "--color=never", for the flags in enumValueFlags only. "flag=value" is
-//     read on its own token, so a preceding flag cannot shadow it.
+//   - AN ENUM FLAG'S VALUE: "--color never" or "--color=never", for the flags
+//     in enumFlagValues and their listed values only. "flag=value" is read on
+//     its own token, so a preceding flag cannot shadow it.
 //
 // THE SPANS ARE FOUND ON THE WHOLE ENTRY, BEFORE THE CLAUSE SPLIT. The split
 // is on tokens and does not know about quotes, so "-run 'skips a stage. not
@@ -897,9 +910,9 @@ func commandArgumentSpans(text string) []textSpan {
 				previous = ""
 				continue
 			}
-		case assigned && enumValueFlags[name] && isWholeDenial(value):
+		case assigned && isEnumFlagValue(name, value):
 			spans = append(spans, textSpan{start: valueStart, end: end})
-		case !assigned && enumValueFlags[previous] && isWholeDenial(token):
+		case !assigned && isEnumFlagValue(previous, token):
 			spans = append(spans, textSpan{start: start, end: end})
 		}
 		previous = token
@@ -908,12 +921,14 @@ func commandArgumentSpans(text string) []textSpan {
 	return spans
 }
 
-// commandPart returns text up to its first output separator.
+// commandPart returns text up to its first output separator token.
 func commandPart(text string) string {
-	for _, separator := range outputSeparators {
-		if i := strings.Index(text, separator); i >= 0 {
-			text = text[:i]
+	for start := 0; start < len(text); {
+		end := tokenEnd(text, start)
+		if slices.Contains(outputSeparators, text[start:end]) {
+			return text[:start]
 		}
+		start = end + 1
 	}
 	return text
 }
@@ -937,11 +952,6 @@ func closingQuote(text string, open int) int {
 		}
 	}
 	return -1
-}
-
-func isWholeDenial(value string) bool {
-	match := executionNegation.FindStringIndex(value)
-	return match != nil && match[0] == 0 && match[1] == len(value)
 }
 
 // isFlagToken reports whether token is a command-line flag: "-k", "-run",
