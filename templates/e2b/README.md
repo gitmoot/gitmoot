@@ -74,6 +74,13 @@ OOM-killed herdrup's test process (3.8 GB resident, in
 timeout; both pass at 4 vCPU / 8 GiB. Rust uses the same size for
 herdr's ~4,700-test build. Flutter passes at 2 vCPU / 4 GiB.
 
+`E2B_REQUEST_TIMEOUT_MS` (optional, default 300000) is the e2b SDK's
+`requestTimeoutMs` for each API call the build makes. With the SDK's default
+retries it bounds how long a rate-limited call (HTTP 429 with `Retry-After`)
+keeps waiting and retrying; it does not cut one slow response short. The SDK's
+own 60 s default made two builds of `gitmoot-omp-review-rust-v2` give up while
+E2B was slow to accept them; 300 s let the same build through.
+
 The command prints the template ID and build ID; record both with the chosen
 resources before pointing any configuration at the new name. Never put an API
 key, GitHub credential, repository data, runtime session or job state in these
@@ -117,7 +124,7 @@ output streams to stderr.
 git clone --depth 1 https://github.com/jerryfane/herdr.git /tmp/herdr
 tar -C /tmp -czf /tmp/herdr.tar.gz herdr
 E2B_TEMPLATE_NAME=gitmoot-omp-review-rust-v2 VERIFY_SOURCE=/tmp/herdr.tar.gz \
-  VERIFY_COMMAND='cargo fmt --check && just ci-tests "all()"' \
+  VERIFY_COMMAND='bunx --version && cargo fmt --check && just ci-tests "all()"' \
   VERIFY_TIMEOUT_MINUTES=50 node verify.mjs
 ```
 
@@ -130,7 +137,7 @@ The canary checks per template:
 | --- | --- | --- |
 | swift | jerryfane/herdrup | `swift build && swift test` |
 | swift | themartianapp/keephair | `export LANG=C.UTF-8; cd ios/Scripts/typecheck-harness && ./run.sh` |
-| rust | jerryfane/herdr | `cargo fmt --check && just ci-tests "all()"` |
+| rust | jerryfane/herdr | `bunx --version && cargo fmt --check && just ci-tests "all()"` |
 | node | jerryfane/joltra | `pnpm install --frozen-lockfile && pnpm --filter @joltra/shared build && pnpm --filter @joltra/mcp-widget build && pnpm --filter @joltra/mcp build && pnpm test` |
 | flutter | themartianapp/among-friends, jerryfane/numbra | `cd apps/mobile && flutter pub get && flutter test` |
 

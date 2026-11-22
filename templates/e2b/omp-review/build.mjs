@@ -41,9 +41,11 @@ const minFreeDiskMb =
     ? undefined
     : positiveIntegerEnv("E2B_MIN_FREE_DISK_MB", 0);
 
-// The SDK aborts each API request after 60 s. E2B's build request (POST
-// /v3/templates) took longer than that twice on 2026-11-22 while the rest of
-// the API answered in 0.2 s; the same build then finished with 300 s (#2713).
+// requestTimeoutMs for each API call the build makes (#2713). With the SDK's
+// default retries it bounds how long a rate-limited call (429 + Retry-After)
+// keeps waiting and retrying; it does not cut one slow response short. The
+// SDK's 60 s default made two builds give up while E2B was slow to accept them
+// on 2026-11-22; 300 s let the same build through.
 const requestTimeoutMs = positiveIntegerEnv("E2B_REQUEST_TIMEOUT_MS", 300_000);
 
 // The template directory defaults to this one (omp-review). Toolchain
