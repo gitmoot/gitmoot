@@ -261,7 +261,7 @@ This machine as a client of a gitmoot hub (#2710).
 
 Usage:
   gitmoot client whoami [--role ROLE] [--json] [--home DIR]
-  gitmoot client deliver [--once] [--interval 10s] [--home DIR]
+  gitmoot client deliver [--once] [--interval 10s] [--max-age 24h] [--home DIR]
 
 whoami shows this machine's certificate (fingerprint, expiry), the role it acts
 as, its roles and the hub's allowed endpoint groups, and whether the hub

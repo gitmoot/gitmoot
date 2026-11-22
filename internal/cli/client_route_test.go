@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -134,7 +136,7 @@ func TestClientDeliverOnceReportsTheAddOnsOutcome(t *testing.T) {
 	var out bytes.Buffer
 
 	refusing := &fakeClientNotifier{found: true, deferred: "omp inbox add-on not listening"}
-	if err := clientDeliverOnce(context.Background(), client, refusing, cfg, &out); err != nil {
+	if err := clientDeliverOnce(context.Background(), client, refusing, cfg, defaultClientMaxAge, &out); err != nil {
 		t.Fatal(err)
 	}
 	if len(refusing.prompts) != 1 || !strings.Contains(refusing.prompts[0], fmt.Sprintf("gitmoot message show %d", first)) {
@@ -145,26 +147,26 @@ func TestClientDeliverOnceReportsTheAddOnsOutcome(t *testing.T) {
 	}
 
 	admitting := &fakeClientNotifier{found: true, delivered: true}
-	if err := clientDeliverOnce(context.Background(), client, admitting, cfg, &out); err != nil {
+	if err := clientDeliverOnce(context.Background(), client, admitting, cfg, defaultClientMaxAge, &out); err != nil {
 		t.Fatal(err)
 	}
 	if got := turnHookWakeReceipts(t, hubHome, "deimos")[fmt.Sprint(first)]; got != "delivered|omp-client:mac" {
 		t.Fatalf("after admission: %q", got)
 	}
-	if err := clientDeliverOnce(context.Background(), client, admitting, cfg, &out); err != nil || len(admitting.prompts) != 1 {
+	if err := clientDeliverOnce(context.Background(), client, admitting, cfg, defaultClientMaxAge, &out); err != nil || len(admitting.prompts) != 1 {
 		t.Fatalf("a delivered message was sent again: %d prompts, %v", len(admitting.prompts), err)
 	}
 
 	// Unknown outcome: the add-on may have shown it, so it is never resent.
 	second := sendTestMessage(t, hubHome, "gm-omp-nag", "deimos", "Second: confirm the deploy window.")
 	unsure := &fakeClientNotifier{found: true}
-	if err := clientDeliverOnce(context.Background(), client, unsure, cfg, &out); err != nil || len(unsure.prompts) != 1 {
+	if err := clientDeliverOnce(context.Background(), client, unsure, cfg, defaultClientMaxAge, &out); err != nil || len(unsure.prompts) != 1 {
 		t.Fatalf("uncertain pass: %d prompts, %v", len(unsure.prompts), err)
 	}
 	if got := turnHookWakeReceipts(t, hubHome, "deimos")[fmt.Sprint(second)]; !strings.HasPrefix(got, "attempted|") {
 		t.Fatalf("after an unknown outcome: %q, want attempted", got)
 	}
-	if err := clientDeliverOnce(context.Background(), client, admitting, cfg, &out); err != nil || len(admitting.prompts) != 1 {
+	if err := clientDeliverOnce(context.Background(), client, admitting, cfg, defaultClientMaxAge, &out); err != nil || len(admitting.prompts) != 1 {
 		t.Fatalf("an unknown-outcome message was resent: %d prompts, %v", len(admitting.prompts), err)
 	}
 }
@@ -237,5 +239,78 @@ func TestClientWhoamiReportsCertificateRoleAndAllow(t *testing.T) {
 	code, out, _ = runCLI(t, "client", "whoami", "--home", clientHome)
 	if code != 1 || !strings.Contains(out, "fingerprint "+machines[0].Fingerprint) || !strings.Contains(out, "hub answer   none") || !strings.Contains(out, "HTTP 403") {
 		t.Fatalf("whoami after revoke: exit=%d %s", code, out)
+	}
+}
+
+// A notification that waited past --max-age is retired on the hub, not handed
+// to the agent; a recent one is delivered; with --max-age 0 every waiting one
+// is delivered (#2725: the Mac Studio's loop restarted after 16h down).
+func TestClientDeliverRetiresMailOlderThanMaxAge(t *testing.T) {
+	hubHome := messageTestHome(t)
+	old := sendTestMessage(t, hubHome, "gm-omp-nag", "deimos", "Two days old: run the cleanup.")
+	recent := sendTestMessage(t, hubHome, "jarvis", "deimos", "Five minutes old: please look.")
+	backdateWake(t, hubHome, "deimos", old, 48*time.Hour)
+	backdateWake(t, hubHome, "deimos", recent, 5*time.Minute)
+	clientHome, _ := clientTestHome(t, hubHome, "mac", "deimos", "mac-studio")
+	client, cfg, ok, err := hubClientFor(clientHome)
+	if err != nil || !ok {
+		t.Fatalf("hub client: ok=%t %v", ok, err)
+	}
+	defer client.Close()
+	var out bytes.Buffer
+	admitting := &fakeClientNotifier{found: true, delivered: true}
+	if err := clientDeliverOnce(context.Background(), client, admitting, cfg, defaultClientMaxAge, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(admitting.prompts) != 1 || !strings.Contains(admitting.prompts[0], fmt.Sprintf("gitmoot message show %d", recent)) {
+		t.Fatalf("prompts = %q, want only message %d", admitting.prompts, recent)
+	}
+	if !strings.Contains(out.String(), "retired 1 notifications that waited longer than 24h0m0s") {
+		t.Fatalf("output = %q", out.String())
+	}
+	receipts := turnHookWakeReceipts(t, hubHome, "deimos")
+	if got := receipts[fmt.Sprint(old)]; !strings.HasPrefix(got, "superseded|not delivered: waited longer than 24h0m0s before a client claimed it (client mac)") {
+		t.Fatalf("old notification = %q", got)
+	}
+	if got := receipts[fmt.Sprint(recent)]; got != "delivered|omp-client:mac" {
+		t.Fatalf("recent notification = %q", got)
+	}
+	var inbox []messageTestResult
+	if err := json.Unmarshal(messageCLI(t, hubHome, "deimos", "inbox"), &inbox); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, message := range inbox {
+		found = found || message.ID == old
+	}
+	if !found {
+		t.Fatal("the retired message is no longer in the inbox")
+	}
+
+	// --max-age 0: the guard is off, and an old notification is delivered.
+	older := sendTestMessage(t, hubHome, "gm-omp-nag", "deimos", "Also old.")
+	backdateWake(t, hubHome, "deimos", older, 48*time.Hour)
+	unguarded := &fakeClientNotifier{found: true, delivered: true}
+	if err := clientDeliverOnce(context.Background(), client, unguarded, cfg, 0, &out); err != nil || len(unguarded.prompts) != 1 {
+		t.Fatalf("--max-age 0: %d prompts, %v", len(unguarded.prompts), err)
+	}
+}
+
+// backdateWake moves the created_at of message's wake row for role back by
+// age, in the column's own format.
+func backdateWake(t *testing.T, home, role string, message int64, age time.Duration) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	stamp := time.Now().UTC().Add(-age).Format("2006-01-02T15:04:05.000Z")
+	result, err := raw.Exec(`UPDATE wake_outbox SET created_at = ? WHERE target_role = ? AND source_id = ?`, stamp, role, fmt.Sprint(message))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		t.Fatalf("backdate message %d: %d rows", message, changed)
 	}
 }

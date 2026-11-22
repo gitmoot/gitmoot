@@ -278,3 +278,34 @@ WHERE lower(target_role) = ? AND state = 'pending' AND created_at < ?`,
 	})
 	return retired, kept, err
 }
+
+// SupersedePendingWakeRows finishes the given notifications of role as
+// superseded with detail, if they are still pending, and returns how many it
+// changed. The messages are untouched and stay readable in the inbox
+// (#2725: mail that waited past a client's max age is retired, not
+// delivered as new work).
+func (s *Store) SupersedePendingWakeRows(ctx context.Context, role string, ids []int64, detail string, now time.Time) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	stamp := now.UTC().Format(BlockedEpisodeTimeLayout)
+	args := []any{WakeOutboxStateSuperseded, strings.TrimSpace(detail), stamp, stamp, strings.ToLower(strings.TrimSpace(role))}
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	query := `UPDATE wake_outbox
+SET state = ?, coalesced_into = NULL, last_error = ?, finished_at = ?, updated_at = ?
+WHERE lower(target_role) = ? AND state = 'pending' AND id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",") + `)`
+	writeCtx, cancel := s.durableWriteContext(ctx, 1)
+	defer cancel()
+	var changed int64
+	err := retryNotificationWrite(writeCtx, func() error {
+		result, err := s.db.ExecContext(writeCtx, query, args...)
+		if err != nil {
+			return err
+		}
+		changed, err = result.RowsAffected()
+		return err
+	})
+	return changed, err
+}
