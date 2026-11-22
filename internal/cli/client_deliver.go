@@ -47,11 +47,12 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory")
 	once := fs.Bool("once", false, "deliver what is pending now, then exit")
 	interval := fs.Duration("interval", 10*time.Second, "how often to ask the hub for new mail")
+	maxAge := fs.Duration("max-age", defaultClientMaxAge, "retire, rather than deliver, mail that has waited longer than this (0 delivers all)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
 	}
-	if fs.NArg() != 0 || *interval < time.Second {
-		fmt.Fprintln(stderr, "client deliver: unexpected argument, or --interval below 1s")
+	if fs.NArg() != 0 || *interval < time.Second || *maxAge < 0 || (*maxAge > 0 && *maxAge < time.Second) {
+		fmt.Fprintln(stderr, "client deliver: unexpected argument, --interval below 1s, or --max-age neither 0 nor at least 1s")
 		return 2
 	}
 	client, cfg, ok, err := hubClientFor(*home)
@@ -71,7 +72,7 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 	for {
 		passCtx, cancel := context.WithTimeout(ctx, hubClientCallTimeout)
-		err := clientDeliverOnce(passCtx, client, notifier, cfg, stdout)
+		err := clientDeliverOnce(passCtx, client, notifier, cfg, *maxAge, stdout)
 		cancel()
 		if err != nil {
 			fmt.Fprintln(stderr, "client deliver:", err)
@@ -95,7 +96,7 @@ func printClientUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot client whoami [--role ROLE] [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot client deliver [--once] [--interval 10s] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot client deliver [--once] [--interval 10s] [--max-age 24h] [--home DIR]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "whoami shows this machine's certificate (fingerprint, expiry), the role it acts")
 	fmt.Fprintln(w, "as, its roles and the hub's allowed endpoint groups, and whether the hub")
@@ -108,14 +109,24 @@ func printClientUsage(w io.Writer) {
 	fmt.Fprintln(w, "and is never sent twice. The pane is never typed into.")
 }
 
+// defaultClientMaxAge keeps a client that was down for a long time from
+// pushing a day-old backlog into its agent as new work (#2725).
+const defaultClientMaxAge = 24 * time.Hour
+
 // clientDeliverOnce claims the role's pending mail and reports each outcome.
-func clientDeliverOnce(ctx context.Context, client *hubclient.Client, notifier clientNotifier, cfg config.ClientConfig, stdout io.Writer) error {
+// Mail that waited longer than maxAge is retired on the hub instead.
+func clientDeliverOnce(ctx context.Context, client *hubclient.Client, notifier clientNotifier, cfg config.ClientConfig, maxAge time.Duration, stdout io.Writer) error {
 	role := hubClientRole(cfg, "")
 	var claim struct {
 		Claimed []hubOMPClaimed `json:"claimed"`
+		Retired int64           `json:"retired"`
 	}
-	if err := client.Do(ctx, http.MethodPost, "/v1/notifications/omp/claim", role, struct{}{}, &claim); err != nil {
+	if err := client.Do(ctx, http.MethodPost, "/v1/notifications/omp/claim", role,
+		map[string]int64{"max_age_seconds": int64(maxAge / time.Second)}, &claim); err != nil {
 		return err
+	}
+	if claim.Retired > 0 {
+		fmt.Fprintf(stdout, "retired %d notifications that waited longer than %s (not delivered; still in gitmoot message inbox)\n", claim.Retired, maxAge)
 	}
 	if len(claim.Claimed) == 0 {
 		return nil

@@ -174,6 +174,15 @@ Each pass claims the role's pending mail on the hub, hands it to the add-on of
 | Refused (nothing reached omp) | Back to pending, with the add-on's reason |
 | Unknown | Left attempted for the hub's aged-attempt check; never resent |
 
+Mail that has waited longer than `--max-age` (24h by default) is not
+delivered. A client that was down for a long time therefore doesn't push a
+stale backlog into its agent as new work. The hub finishes such notifications
+as superseded ("not delivered: waited longer than D before a client claimed
+it") instead of claiming them, and the loop prints how many. The messages
+stay readable in `gitmoot message inbox`. `--max-age 0` delivers everything
+(#2725). A large backlog drains over a few passes, at most ten notifications
+per pass.
+
 The pane is never typed into. On the hub, these are the endpoints
 `POST /v1/notifications/omp/claim` and
 `POST /v1/notifications/omp/finish {"id", "attempt", "outcome": "delivered"|"deferred", "reason"}`.

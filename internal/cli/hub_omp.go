@@ -78,8 +78,17 @@ func (f *hubOMPInFlight) take(id int64) (db.WakeOutboxObligation, bool) {
 func registerHubOMPEndpoints(handle func(string, hubHandler), store *db.Store) {
 	inFlight := &hubOMPInFlight{}
 	handle("POST /v1/notifications/omp/claim", func(ctx context.Context, caller hub.Caller, _ config.OrgConfig, r *http.Request) (int, any, error) {
-		if err := decodeHubBody(r, &struct{}{}); err != nil {
+		// max_age_seconds > 0 retires mail that has waited longer than that
+		// instead of delivering it as new work (#2725); a client that sends
+		// none (0) gets every waiting notification, as before.
+		var input struct {
+			MaxAgeSeconds int64 `json:"max_age_seconds"`
+		}
+		if err := decodeHubBody(r, &input); err != nil {
 			return http.StatusBadRequest, nil, err
+		}
+		if input.MaxAgeSeconds < 0 {
+			return http.StatusBadRequest, nil, errors.New("max_age_seconds must not be negative")
 		}
 		now := turnHookNow()
 		// Attribution first: claimed rows leave pending and cannot be put back.
@@ -91,8 +100,16 @@ func registerHubOMPEndpoints(handle func(string, hubHandler), store *db.Store) {
 		if err != nil {
 			return http.StatusInternalServerError, nil, fmt.Errorf("list pending notifications: %w", err)
 		}
+		var retired int64
+		if input.MaxAgeSeconds > 0 {
+			maxAge := time.Duration(input.MaxAgeSeconds) * time.Second
+			candidates, retired, err = retireStaleCandidates(ctx, store, caller, candidates, maxAge, now)
+			if err != nil {
+				return http.StatusInternalServerError, nil, fmt.Errorf("retire stale notifications: %w", err)
+			}
+		}
 		if len(candidates) == 0 {
-			return http.StatusOK, map[string]any{"claimed": []hubOMPClaimed{}, "more": false, "warnings": hubWarnings(warnings)}, nil
+			return http.StatusOK, map[string]any{"claimed": []hubOMPClaimed{}, "retired": retired, "more": more, "warnings": hubWarnings(warnings)}, nil
 		}
 		ids := make([]int64, len(candidates))
 		for index, candidate := range candidates {
@@ -105,7 +122,7 @@ func registerHubOMPEndpoints(handle func(string, hubHandler), store *db.Store) {
 			return http.StatusInternalServerError, nil, fmt.Errorf("claim notifications: %w", err)
 		}
 		if !won {
-			return http.StatusOK, map[string]any{"claimed": []hubOMPClaimed{}, "more": true, "warnings": hubWarnings(warnings)}, nil
+			return http.StatusOK, map[string]any{"claimed": []hubOMPClaimed{}, "retired": retired, "more": true, "warnings": hubWarnings(warnings)}, nil
 		}
 		attempt := db.HubAttemptToken(now)
 		claimed := make([]hubOMPClaimed, len(candidates))
@@ -118,7 +135,7 @@ func registerHubOMPEndpoints(handle func(string, hubHandler), store *db.Store) {
 			rows[index] = candidate.row
 		}
 		inFlight.put(rows)
-		return http.StatusOK, map[string]any{"claimed": claimed, "more": more, "warnings": hubWarnings(warnings)}, nil
+		return http.StatusOK, map[string]any{"claimed": claimed, "retired": retired, "more": more, "warnings": hubWarnings(warnings)}, nil
 	})
 	handle("POST /v1/notifications/omp/finish", func(ctx context.Context, caller hub.Caller, _ config.OrgConfig, r *http.Request) (int, any, error) {
 		var input struct {
@@ -162,4 +179,25 @@ func registerHubOMPEndpoints(handle func(string, hubHandler), store *db.Store) {
 		}
 		return http.StatusOK, map[string]any{"id": input.ID, "outcome": input.Outcome}, nil
 	})
+}
+
+// retireStaleCandidates supersedes the candidates that have waited longer
+// than maxAge and returns the rest with the retired count. A row whose
+// creation time does not parse is kept: its age is unknown, and delivering
+// it is the behaviour without a guard.
+func retireStaleCandidates(ctx context.Context, store *db.Store, caller hub.Caller, candidates []inboxCandidate, maxAge time.Duration, now time.Time) ([]inboxCandidate, int64, error) {
+	cutoff := now.Add(-maxAge)
+	fresh := candidates[:0:0]
+	var stale []int64
+	for _, candidate := range candidates {
+		createdAt, err := time.Parse(time.RFC3339Nano, candidate.row.CreatedAt)
+		if err == nil && createdAt.Before(cutoff) {
+			stale = append(stale, candidate.row.ID)
+			continue
+		}
+		fresh = append(fresh, candidate)
+	}
+	detail := fmt.Sprintf("not delivered: waited longer than %s before a client claimed it (client %s); still in the inbox", maxAge, caller.Machine.Name)
+	retired, err := store.SupersedePendingWakeRows(ctx, caller.Role, stale, detail, now)
+	return fresh, retired, err
 }
