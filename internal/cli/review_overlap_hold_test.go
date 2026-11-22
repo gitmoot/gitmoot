@@ -91,14 +91,6 @@ func (h *overlapHoldHarness) enqueueRequest(request workflow.JobRequest) {
 	enqueueDaemonWorkerJob(h.t, h.store, request)
 }
 
-// setStoredHead records the pull request's current head as the PR watcher does.
-func (h *overlapHoldHarness) setStoredHead(repo string, pr int, head string) {
-	h.t.Helper()
-	if err := h.store.UpsertPullRequest(h.ctx, db.PullRequest{RepoFullName: repo, Number: int64(pr), HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, State: "open"}); err != nil {
-		h.t.Fatal(err)
-	}
-}
-
 // startRunning claims a queued review as the daemon does when it dispatches
 // one, leaving it running.
 func (h *overlapHoldHarness) startRunning(id string) {
@@ -144,12 +136,7 @@ func (h *overlapHoldHarness) filter(holds *reviewHoldLog, rootFilter string) map
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	return h.filterSnapshot(holds, queued, rootFilter)
-}
-
-func (h *overlapHoldHarness) filterSnapshot(holds *reviewHoldLog, queued []db.Job, rootFilter string) map[string]bool {
-	h.t.Helper()
-	kept, err := holdOverlappingReviews(h.ctx, h.store, holds, queued, "", rootFilter, true)
+	kept, err := holdOverlappingReviews(h.ctx, h.store, holds, nil, queued, "", rootFilter, true)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -229,107 +216,51 @@ func TestReviewHeldForRunningReviewDispatchesWithItsVerdict(t *testing.T) {
 	}
 }
 
-// Running A, stored head C, then head B queued, then head C queued: B is
-// superseded through the stale-head path, its dispatch-time worktree is marked
-// for reclaim, and C runs once A settles.
-func TestReviewHoldKeepsOnlyTheCurrentHeadHeldReview(t *testing.T) {
+// Held reviews of several heads all wait for the running review, then
+// dispatch one after another in queue order; none is cancelled, and the last
+// one's prior verdicts still carry the first review's finding.
+func TestReviewHoldDispatchesHeldHeadsInQueueOrder(t *testing.T) {
 	h := newOverlapHoldHarness(t)
 	h.enqueue("review-a", "owner/repo", 12, overlapHeadA)
 	h.startRunning("review-a")
-	h.setStoredHead("owner/repo", 12, overlapHeadC)
-	worktree := t.TempDir()
-	h.enqueueRequest(workflow.JobRequest{ID: "review-b", Repo: "owner/repo", PullRequest: 12, HeadSHA: overlapHeadB, WorktreePath: worktree, ReadOnlyWorktree: true, ReadOnlySeat: true})
+	h.enqueue("review-b", "owner/repo", 12, overlapHeadB)
 	h.enqueue("review-c", "owner/repo", 12, overlapHeadC)
 
 	h.pass()
-	if got := h.state("review-b"); got != string(workflow.JobCancelled) {
-		t.Fatalf("off-head held review-b state = %q, want cancelled (superseded)", got)
-	}
-	superseded := h.events("review-b", workflow.JobEventSupersededStaleHead)
-	if len(superseded) != 1 || !strings.Contains(superseded[0].Message, "review-c") || !strings.Contains(superseded[0].Message, "review-a") {
-		t.Fatalf("review-b supersede events = %+v, want one naming review-c and review-a", superseded)
-	}
-	if reclaim := h.events("review-b", "delegation_worktree_cleanup_skipped"); len(reclaim) != 1 || !strings.Contains(reclaim[0].Message, worktree) {
-		t.Fatalf("review-b reclaim markers = %+v, want one for its worktree %s", reclaim, worktree)
-	}
-	if got := h.state("review-a"); got != string(workflow.JobRunning) {
-		t.Fatalf("running review-a state = %q: a running review must not be superseded by the hold", got)
-	}
-	if got := h.state("review-c"); got != string(workflow.JobQueued) {
-		t.Fatalf("current-head held review-c state = %q, want queued", got)
-	}
-	if _, delivered := h.delivery("review-c"); delivered {
-		t.Fatal("review-c dispatched while review-a was running")
+	for _, id := range []string{"review-b", "review-c"} {
+		if _, delivered := h.delivery(id); delivered {
+			t.Fatalf("%s dispatched while review-a was running", id)
+		}
+		if got := h.state(id); got != string(workflow.JobQueued) {
+			t.Fatalf("held %s state = %q, want queued: the hold must not cancel", id, got)
+		}
 	}
 
 	h.settleWithFinding("review-a", "FINDING-A")
 	h.pass()
-	if _, delivered := h.delivery("review-c"); !delivered {
-		t.Fatal("review-c did not dispatch after review-a settled")
+	if _, delivered := h.delivery("review-b"); !delivered {
+		t.Fatal("review-b, first in queue, did not dispatch after review-a settled")
 	}
-	if _, delivered := h.delivery("review-b"); delivered {
-		t.Fatal("superseded review-b dispatched")
+	if _, delivered := h.delivery("review-c"); delivered {
+		t.Fatal("review-c dispatched alongside review-b, which was queued ahead of it")
+	}
+
+	h.pass()
+	got, delivered := h.delivery("review-c")
+	if !delivered {
+		t.Fatal("review-c did not dispatch after review-b settled")
+	}
+	if !strings.Contains(got.priorVerdicts, "FINDING-A") {
+		t.Fatalf("review-c prior verdicts lack review-a's finding:\n%s", got.priorVerdicts)
+	}
+	events := h.events("review-c", reviewHeldForRunningReviewEventKind)
+	if len(events) != 2 || !strings.Contains(events[0].Message, "review-a") || !strings.Contains(events[1].Message, "review-b") {
+		t.Fatalf("review-c hold events = %+v, want one naming review-a then one naming review-b", events)
 	}
 }
 
-// Queue order alone never cancels: with no stored head nothing is superseded,
-// and with the stored head at B, a later request for the older head C is the
-// one superseded while B survives.
-func TestReviewHoldNeverSupersedesTheCurrentHeadForQueueOrder(t *testing.T) {
-	h := newOverlapHoldHarness(t)
-	h.enqueue("review-a", "owner/repo", 12, overlapHeadA)
-	h.startRunning("review-a")
-	h.enqueue("review-b", "owner/repo", 12, overlapHeadB)
-	h.enqueue("review-c", "owner/repo", 12, overlapHeadC)
-
-	if kept := h.filter(nil, ""); kept["review-b"] || kept["review-c"] {
-		t.Fatalf("held reviews passed the filter: %v", kept)
-	}
-	for _, id := range []string{"review-b", "review-c"} {
-		if got := h.state(id); got != string(workflow.JobQueued) {
-			t.Fatalf("with no stored head %s state = %q, want queued", id, got)
-		}
-	}
-
-	h.setStoredHead("owner/repo", 12, overlapHeadB)
-	h.filter(nil, "")
-	if got := h.state("review-b"); got != string(workflow.JobQueued) {
-		t.Fatalf("current-head review-b state = %q, want queued: queue order cancelled the current head", got)
-	}
-	if got := h.state("review-c"); got != string(workflow.JobCancelled) {
-		t.Fatalf("off-head review-c state = %q, want cancelled", got)
-	}
-}
-
-// A review a worker claimed after the queue snapshot is never cancelled by a
-// decision made from that snapshot.
-func TestReviewHoldLeavesAJobClaimedAfterTheSnapshotRunning(t *testing.T) {
-	h := newOverlapHoldHarness(t)
-	h.enqueue("review-a", "owner/repo", 12, overlapHeadA)
-	h.startRunning("review-a")
-	h.setStoredHead("owner/repo", 12, overlapHeadC)
-	h.enqueue("review-b", "owner/repo", 12, overlapHeadB)
-	h.enqueue("review-c", "owner/repo", 12, overlapHeadC)
-
-	snapshot, err := h.store.ListQueuedJobs(h.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.startRunning("review-b")
-	kept := h.filterSnapshot(nil, snapshot, "")
-	if got := h.state("review-b"); got != string(workflow.JobRunning) {
-		t.Fatalf("review-b claimed after the snapshot is %q, want running", got)
-	}
-	if events := h.events("review-b", workflow.JobEventSupersededStaleHead); len(events) != 0 {
-		t.Fatalf("claimed review-b carries supersede events %+v", events)
-	}
-	if kept["review-b"] || kept["review-c"] {
-		t.Fatalf("filter let through %v; review-b is no longer queued and review-c is held", kept)
-	}
-}
-
-// Under daemon --session, a queued review outside the session neither holds
-// nor supersedes one inside it. A running review still holds across scopes.
+// Under daemon --session, a queued review outside the session does not hold
+// one inside it. A running review still holds across scopes.
 func TestReviewHoldIgnoresQueuedReviewsOutsideTheSession(t *testing.T) {
 	h := newOverlapHoldHarness(t)
 	h.enqueue("review-outside", "owner/repo", 12, overlapHeadA)
@@ -341,15 +272,8 @@ func TestReviewHoldIgnoresQueuedReviewsOutsideTheSession(t *testing.T) {
 
 	h.enqueue("review-running", "owner/repo", 12, overlapHeadC)
 	h.startRunning("review-running")
-	h.setStoredHead("owner/repo", 12, overlapHeadA)
 	if kept := h.filter(nil, "session-b"); kept["review-session"] {
 		t.Fatal("review-session passed while a review of the same PR was running")
-	}
-	if got := h.state("review-session"); got != string(workflow.JobQueued) {
-		t.Fatalf("review-session state = %q: a review outside the session superseded it", got)
-	}
-	if got := h.state("review-outside"); got != string(workflow.JobQueued) {
-		t.Fatalf("review-outside state = %q: the session pass touched a review outside it", got)
 	}
 }
 

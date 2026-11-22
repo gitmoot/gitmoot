@@ -989,9 +989,12 @@ func restorePreIsolationPayloadForDeferredJob(ctx context.Context, store *db.Sto
 // returns false so a bad write can strand nothing.
 func queuedJobBlockerHeld(job db.Job, now time.Time) bool {
 	payload, err := daemonJobPayload(job)
-	if err != nil {
-		return false
-	}
+	return err == nil && queuedPayloadBlockerHeld(payload, now)
+}
+
+// queuedPayloadBlockerHeld is queuedJobBlockerHeld for a caller that already
+// decoded the payload.
+func queuedPayloadBlockerHeld(payload workflow.JobPayload, now time.Time) bool {
 	raw := strings.TrimSpace(payload.BlockerRetryAt)
 	if raw == "" {
 		return false

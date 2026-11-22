@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -20,16 +18,11 @@ const reviewHeldForRunningReviewEventKind = "review_held_for_running_review"
 // reviewOverlapEntry is one review job of a pull request, as the overlap hold
 // sees it.
 type reviewOverlapEntry struct {
-	job     db.Job
-	head    string
-	purpose string
-	running bool
+	job  db.Job
+	head string
 	// holder is the review this queued entry waits on; nil means it may
 	// dispatch.
 	holder *reviewOverlapEntry
-	// removed: the entry left the queue during this pass (superseded here, or
-	// claimed by a worker since the snapshot) and must not be handed on.
-	removed bool
 }
 
 // reviewOverlapHeads keeps the earliest entries at two distinct heads, which is
@@ -61,33 +54,22 @@ func (h *reviewOverlapHeads) holderFor(head string) *reviewOverlapEntry {
 // reviewOverlapGroup is every review of one (repo, PR) the hold weighs: the
 // queued ones this pass may dispatch, in queue order, and the running ones.
 type reviewOverlapGroup struct {
-	repo        string
-	pullRequest int
-	queued      []*reviewOverlapEntry
-	running     reviewOverlapHeads
+	queued  []*reviewOverlapEntry
+	running reviewOverlapHeads
 }
 
-// assignHolders sets each remaining queued entry's holder in one pass: a
-// running review at another head first, else the earliest review queued ahead
-// of it at another head. It reports whether held entries sit at two or more
-// heads, the only case in which supersession has anything to decide.
-func (g *reviewOverlapGroup) assignHolders() (heldAtSeveralHeads bool) {
-	var ahead, held reviewOverlapHeads
+// assignHolders sets each queued entry's holder in one pass: a running review
+// at another head first, else the earliest review queued ahead of it at
+// another head.
+func (g *reviewOverlapGroup) assignHolders() {
+	var ahead reviewOverlapHeads
 	for _, entry := range g.queued {
-		entry.holder = nil
-		if entry.removed {
-			continue
-		}
 		entry.holder = g.running.holderFor(entry.head)
 		if entry.holder == nil {
 			entry.holder = ahead.holderFor(entry.head)
 		}
 		ahead.add(entry)
-		if entry.holder != nil {
-			held.add(entry)
-		}
 	}
-	return held.second != nil
 }
 
 // reviewOverlapKey is the (repo, pull request) a review belongs to. The repo
@@ -104,11 +86,7 @@ func reviewOverlapEntryFor(job db.Job, payload workflow.JobPayload) (key string,
 	if strings.TrimSpace(payload.Repo) == "" || payload.PullRequest <= 0 || head == "" {
 		return "", nil, false
 	}
-	return reviewOverlapKey(payload.Repo, payload.PullRequest), &reviewOverlapEntry{
-		job:     job,
-		head:    head,
-		purpose: db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview, payload.ReviewPart),
-	}, true
+	return reviewOverlapKey(payload.Repo, payload.PullRequest), &reviewOverlapEntry{job: job, head: head}, true
 }
 
 // holdOverlappingReviews removes from jobs (the queued list, in queue order)
@@ -121,31 +99,27 @@ func reviewOverlapEntryFor(job db.Job, payload workflow.JobPayload) (key string,
 // review's findings. The rule here:
 //
 //   - SCOPE: only queued reviews this pass may dispatch (its repo and --session
-//     filters) take part, so a review this daemon can never dispatch neither
-//     holds nor replaces one it can. Running engine reviews hold across scopes:
-//     they settle on their own.
+//     filters) take part, so a review this daemon can never dispatch never
+//     holds one it can. Running engine reviews hold across scopes: they settle
+//     on their own.
 //   - HOLD: a queued review of (repo, PR) at head h does not dispatch while a
 //     review of the same (repo, PR) at another head is running, or is queued
 //     ahead of it. Reviews of the same head never hold each other, so split
 //     parts and the request-level dedupe keep their behaviour. The held review
 //     dispatches on the first pass after the holder settles, and its list is
-//     rendered then, with the settled verdict in it.
-//   - CURRENT HEAD WINS: a held review is superseded only when its head is not
-//     the pull request's stored head AND a held review asking the same question
-//     (purpose, post-merge and part) waits at that stored head. Queue order
-//     alone never cancels anything: with the head unknown, or matching neither,
-//     the held reviews dispatch one after another. The supersession is
-//     conditional on the job still being queued at the observed generation, so
-//     a job a worker claimed since the snapshot is left running. A running
-//     review is never superseded here.
+//     rendered then, with the settled verdict in it. Held reviews of several
+//     heads dispatch one after another in queue order, each with the verdicts
+//     recorded so far.
+//   - NON-DESTRUCTIVE: the hold only filters. It never cancels a review: a
+//     review of a head the pull request has moved past is left to the PR
+//     watcher's stale-head supersession (Daemon.supersedeStaleReviewJobs).
 //   - VISIBLE: each held review gets one review_held_for_running_review event
 //     per holder, naming it. A held review is still queued, so the stalled-PR
 //     check counts it as a review in progress at its head.
 //
 // A held review takes no checkout or runtime lock, no remote reservation and no
 // spend. A local review keeps the exact-head worktree it was created with
-// before enqueue, as any queued review does while it waits for a worker slot;
-// a superseded one has that worktree reclaimed by the stale-head abort cleanup.
+// before enqueue, as any queued review does while it waits for a worker slot.
 //
 // The hold is bounded by its holder. A running holder is an engine-owned job
 // with its own delivery timeout, runtime lease and stale-running recovery, and
@@ -153,18 +127,19 @@ func reviewOverlapEntryFor(job db.Job, payload workflow.JobPayload) (key string,
 // queued holder is first in line and dispatches as soon as it can.
 //
 // act is false for read-only callers (the serialization preflight): they get
-// the same filtering without supersession, events or the hold log. Each queued
-// review is decoded once; the running reviews are read once per call, and only
-// when an in-scope queued review exists.
-func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewHoldLog, jobs []db.Job, repoFilter, rootFilter string, act bool) ([]db.Job, error) {
+// the same filtering without events or the hold log. Each queued review is
+// decoded through payloads, which the caller reuses afterwards, so the hold
+// adds no decode of a queued job; the running reviews are read once per call,
+// and only when an in-scope queued review exists.
+func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewHoldLog, payloads *queuedPayloadCache, jobs []db.Job, repoFilter, rootFilter string, act bool) ([]db.Job, error) {
 	groups := map[string]*reviewOverlapGroup{}
 	var order []string
 	for _, job := range jobs {
 		if job.Type != "review" {
 			continue
 		}
-		payload, err := daemonJobPayload(job)
-		if err != nil || !queuedPayloadMatchesRepo(payload, repoFilter) || !queuedPayloadMatchesSession(job.ID, payload, rootFilter) {
+		payload, err := payloads.decode(job)
+		if err != nil || !queuedPayloadMatchesRepo(payload, repoFilter) || !queuedDecodedJobMatchesSession(job.ID, payload, nil, rootFilter) {
 			continue
 		}
 		key, entry, ok := reviewOverlapEntryFor(job, payload)
@@ -173,7 +148,7 @@ func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewH
 		}
 		group := groups[key]
 		if group == nil {
-			group = &reviewOverlapGroup{repo: strings.TrimSpace(payload.Repo), pullRequest: payload.PullRequest}
+			group = &reviewOverlapGroup{}
 			groups[key] = group
 			order = append(order, key)
 		}
@@ -203,32 +178,21 @@ func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewH
 		if !ok || groups[key] == nil {
 			continue
 		}
-		entry.running = true
 		groups[key].running.add(entry)
 	}
 
-	dropped := map[string]bool{}
+	held := map[string]bool{}
 	for _, key := range order {
 		group := groups[key]
-		if group.assignHolders() && act {
-			changed, err := supersedeHeldOffHeadReviews(ctx, store, key, group)
-			if err != nil {
-				return nil, err
-			}
-			if changed {
-				group.assignHolders()
-			}
-		}
+		group.assignHolders()
 		for _, entry := range group.queued {
-			switch {
-			case entry.removed:
-				dropped[entry.job.ID] = true
-			case entry.holder != nil:
-				dropped[entry.job.ID] = true
-				if act {
-					if err := holds.record(ctx, store, entry, reviewOverlapHeldMessage(key, entry)); err != nil {
-						return nil, err
-					}
+			if entry.holder == nil {
+				continue
+			}
+			held[entry.job.ID] = true
+			if act {
+				if err := holds.record(ctx, store, entry, reviewOverlapHeldMessage(key, entry)); err != nil {
+					return nil, err
 				}
 			}
 		}
@@ -236,60 +200,16 @@ func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewH
 	if act {
 		holds.sweep(jobs, groups)
 	}
-	if len(dropped) == 0 {
+	if len(held) == 0 {
 		return jobs, nil
 	}
 	kept := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
-		if !dropped[job.ID] {
+		if !held[job.ID] {
 			kept = append(kept, job)
 		}
 	}
 	return kept, nil
-}
-
-// supersedeHeldOffHeadReviews supersedes each held review whose head is not the
-// pull request's stored head, when a held review of the same question waits at
-// that head. It reports whether any entry left the queue.
-func supersedeHeldOffHeadReviews(ctx context.Context, store *db.Store, key string, group *reviewOverlapGroup) (bool, error) {
-	stored, err := store.GetPullRequest(ctx, group.repo, int64(group.pullRequest))
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("read the stored head of %s for the overlap hold: %w", key, err)
-	}
-	current := strings.ToLower(strings.TrimSpace(stored.HeadSHA))
-	if current == "" {
-		return false, nil
-	}
-	winners := map[string]*reviewOverlapEntry{}
-	for _, entry := range group.queued {
-		if entry.holder != nil && entry.head == current && winners[entry.purpose] == nil {
-			winners[entry.purpose] = entry
-		}
-	}
-	changed := false
-	for _, entry := range group.queued {
-		winner := winners[entry.purpose]
-		if entry.holder == nil || entry.removed || winner == nil || entry.head == current {
-			continue
-		}
-		reason := fmt.Sprintf("review job superseded_stale_head: %s is at head %q and review %s waits at that head; this review at head %q was held behind review %s and will not dispatch",
-			key, current, winner.job.ID, entry.head, entry.holder.job.ID)
-		latest, transitioned, err := workflow.SupersedeQueuedStaleHeadJob(ctx, store, entry.job, reason)
-		if err != nil {
-			return false, fmt.Errorf("supersede held review %s: %w", entry.job.ID, err)
-		}
-		// Superseded, or claimed since the snapshot: either way it is no
-		// longer this pass's to dispatch. A claimed one now holds the others.
-		entry.removed = true
-		changed = true
-		if !transitioned && latest.State == string(workflow.JobRunning) {
-			group.running.add(&reviewOverlapEntry{job: latest, head: entry.head, purpose: entry.purpose, running: true})
-		}
-	}
-	return changed, nil
 }
 
 // reviewOverlapHeldMessage depends only on the held review and its holder
@@ -354,7 +274,7 @@ func (l *reviewHoldLog) sweep(queued []db.Job, groups map[string]*reviewOverlapG
 	}
 	for _, group := range groups {
 		for _, entry := range group.queued {
-			if entry.removed || entry.holder == nil {
+			if entry.holder == nil {
 				delete(l.held, entry.job.ID)
 			}
 		}

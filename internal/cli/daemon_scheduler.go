@@ -2901,10 +2901,12 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	// guard, the admission gate and worker.run, so a held review takes no
 	// checkout or runtime lock, no remote switch or reservation, and no spend.
 	// A local review keeps the exact-head worktree it was created with before
-	// enqueue, as any queued review does while it waits for a worker slot. Only
-	// the dispatch path supersedes or records events; the preflight count gets
-	// the same filtering read-only.
-	jobs, err = holdOverlappingReviews(ctx, worker.Store, worker.reviewHolds, jobs, repoFilter, rootFilter, forDispatch)
+	// enqueue, as any queued review does while it waits for a worker slot. The
+	// hold never cancels anything. Only the dispatch path records events; the
+	// preflight count gets the same filtering read-only. Its payload decodes
+	// are kept for the eligibility loop below, so it adds none.
+	payloads := newQueuedPayloadCache(len(jobs))
+	jobs, err = holdOverlappingReviews(ctx, worker.Store, worker.reviewHolds, payloads, jobs, repoFilter, rootFilter, forDispatch)
 	if err != nil {
 		return nil, err
 	}
@@ -2935,14 +2937,25 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	}
 	pending := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
-		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+		// One decode per job for every check below, reused from the overlap
+		// hold's decode when the payload is unchanged (it was decoded up to four
+		// times here before #2726).
+		payload, payloadErr := payloads.decode(job)
+		if strings.TrimSpace(repoFilter) != "" && (payloadErr != nil || !queuedPayloadMatchesRepo(payload, repoFilter)) {
+			continue
+		}
+		if !queuedDecodedJobMatchesSession(job.ID, payload, payloadErr, rootFilter) {
+			continue
+		}
+		if payloadErr != nil {
+			pending = append(pending, job)
 			continue
 		}
 		// Operational-blocker hold (#532): a job deferred behind a classified
 		// blocker is not eligible until its earliest-retry-at passes. Both
 		// schedulers (barrier and pool) funnel through this listing, so the hold
 		// is honored everywhere; jobs without the payload field are unaffected.
-		if queuedJobBlockerHeld(job, time.Now().UTC()) {
+		if queuedPayloadBlockerHeld(payload, time.Now().UTC()) {
 			continue
 		}
 		// Provider-declared role unavailability (#1136): queued work attributed to
@@ -2954,11 +2967,9 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		// a claude quota row held every queued job of the role, including codex and
 		// kimi work that had no wall. The agent lookup runs only for a job whose
 		// role is actually walled, so the common path stays the map lookup it was.
-		if payload, payloadErr := daemonJobPayload(job); payloadErr == nil {
-			if row, unavailable := unavailableRoles[strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))]; unavailable {
-				if orgRoleUnavailableRefusesRuntime(row, selectedJobDispatchRuntime(ctx, worker.Store, job, payload)) {
-					continue
-				}
+		if row, unavailable := unavailableRoles[strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))]; unavailable {
+			if orgRoleUnavailableRefusesRuntime(row, selectedJobDispatchRuntime(ctx, worker.Store, job, payload)) {
+				continue
 			}
 		}
 		pending = append(pending, job)
@@ -3797,14 +3808,49 @@ func queuedJobMatchesSession(job db.Job, rootFilter string) bool {
 		return true
 	}
 	payload, err := daemonJobPayload(job)
-	return err == nil && queuedPayloadMatchesSession(job.ID, payload, rootFilter)
+	return queuedDecodedJobMatchesSession(job.ID, payload, err, rootFilter)
 }
 
-// queuedPayloadMatchesSession is queuedJobMatchesSession for a caller that
-// already decoded the payload.
-func queuedPayloadMatchesSession(jobID string, payload workflow.JobPayload, rootFilter string) bool {
+// queuedDecodedJobMatchesSession is queuedJobMatchesSession for a caller that
+// already decoded the payload; decodeErr is that decode's error.
+func queuedDecodedJobMatchesSession(jobID string, payload workflow.JobPayload, decodeErr error, rootFilter string) bool {
 	rootFilter = strings.TrimSpace(rootFilter)
-	return rootFilter == "" || jobID == rootFilter || payload.RootJobID == rootFilter
+	if rootFilter == "" || jobID == rootFilter {
+		return true
+	}
+	return decodeErr == nil && payload.RootJobID == rootFilter
+}
+
+// queuedPayloadCache decodes each queued job's payload at most once in one
+// listPendingQueuedJobs call: the overlap hold and the eligibility loop share
+// it. An entry is reused only while the job's raw payload is the string it was
+// decoded from, so a step in between that rewrites a payload (the disk guard's
+// move of a review to remote) gets a fresh decode. A nil cache decodes every
+// time.
+type queuedPayloadCache struct {
+	entries map[string]queuedPayloadCacheEntry
+}
+
+type queuedPayloadCacheEntry struct {
+	raw     string
+	payload workflow.JobPayload
+	err     error
+}
+
+func newQueuedPayloadCache(size int) *queuedPayloadCache {
+	return &queuedPayloadCache{entries: make(map[string]queuedPayloadCacheEntry, size)}
+}
+
+func (c *queuedPayloadCache) decode(job db.Job) (workflow.JobPayload, error) {
+	if c == nil {
+		return daemonJobPayload(job)
+	}
+	if entry, ok := c.entries[job.ID]; ok && entry.raw == job.Payload {
+		return entry.payload, entry.err
+	}
+	payload, err := daemonJobPayload(job)
+	c.entries[job.ID] = queuedPayloadCacheEntry{raw: job.Payload, payload: payload, err: err}
+	return payload, err
 }
 
 func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) string {
