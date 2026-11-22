@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/mtlsca"
 )
@@ -751,7 +752,7 @@ func copyRedactedHeader(destination, source http.Header, secret string, extraSec
 func streamRedactedResponse(destination http.ResponseWriter, source io.Reader, secret string, extraSecrets ...string) error {
 	patterns := responseCredentialPatterns(secret, extraSecrets)
 	buffered := bufio.NewWriter(destination)
-	redactor := &credentialRedactingWriter{destination: buffered, patterns: patterns}
+	redactor := newCredentialRedactingWriter(buffered, patterns)
 	controller := http.NewResponseController(destination)
 	buffer := make([]byte, 32*1024)
 	for {
@@ -854,52 +855,144 @@ func percentEncodeAll(value []byte) string {
 
 func redactCredentialText(value string, patterns []credentialRedactionPattern) string {
 	var redacted strings.Builder
-	writer := &credentialRedactingWriter{destination: &redacted, patterns: patterns}
+	writer := newCredentialRedactingWriter(&redacted, patterns)
 	_, _ = writer.Write([]byte(value))
 	_ = writer.flush()
 	return redacted.String()
 }
 
+// credentialRedactingWriter replaces every pattern occurrence with
+// "[REDACTED]", carrying a possible partial match in pending across Write
+// calls. Output produced by one Write (or flush) reaches destination in a
+// single call at its end, so streamed responses still advance per chunk.
 type credentialRedactingWriter struct {
 	destination io.Writer
 	patterns    []credentialRedactionPattern
+	// startsMatch[b] reports whether patternPrefix holds for []byte{b}
+	// against some pattern. With nothing pending, any other byte can
+	// neither match nor begin a match, so it is copied through unscanned.
+	startsMatch [256]bool
 	pending     []byte
+	output      []byte
+}
+
+func newCredentialRedactingWriter(destination io.Writer, patterns []credentialRedactionPattern) *credentialRedactingWriter {
+	w := &credentialRedactingWriter{destination: destination, patterns: patterns}
+	for _, pattern := range patterns {
+		if len(pattern.value) == 0 {
+			continue
+		}
+		first := pattern.value[0]
+		switch {
+		case !pattern.asciiFold:
+			w.startsMatch[first] = true
+		case first < utf8.RuneSelf:
+			w.startsMatch[first] = true
+			if lower := first | 0x20; 'a' <= lower && lower <= 'z' {
+				w.startsMatch[first^0x20] = true
+			}
+		default:
+			// bytes.EqualFold decodes any lone byte >= 0x80 as
+			// utf8.RuneError, so all of them fold-equal this first byte.
+			for value := utf8.RuneSelf; value < len(w.startsMatch); value++ {
+				w.startsMatch[value] = true
+			}
+		}
+	}
+	return w
 }
 
 func (w *credentialRedactingWriter) Write(data []byte) (int, error) {
-	for _, value := range data {
-		w.pending = append(w.pending, value)
+	written := len(data)
+	for len(data) > 0 {
+		if len(w.pending) == 0 {
+			run := 0
+			for run < len(data) && !w.startsMatch[data[run]] {
+				run++
+			}
+			w.output = append(w.output, data[:run]...)
+			data = data[run:]
+			if len(data) == 0 {
+				break
+			}
+		}
+		w.pending = append(w.pending, data[0])
+		data = data[1:]
 		for len(w.pending) > 0 {
 			matchLength, couldGrow := w.match()
 			if matchLength > 0 && !couldGrow {
-				if _, err := io.WriteString(w.destination, "[REDACTED]"); err != nil {
-					return 0, err
-				}
-				w.pending = w.pending[matchLength:]
+				w.output = append(w.output, "[REDACTED]"...)
+				w.consume(matchLength)
 				continue
 			}
 			if couldGrow {
 				break
 			}
-			if _, err := w.destination.Write(w.pending[:1]); err != nil {
-				return 0, err
-			}
-			w.pending = w.pending[1:]
+			w.output = append(w.output, w.pending[0])
+			w.consume(1)
 		}
 	}
-	return len(data), nil
+	if err := w.emit(); err != nil {
+		return 0, err
+	}
+	return written, nil
 }
 
+// consume drops the first n pending bytes, reusing the pending buffer.
+func (w *credentialRedactingWriter) consume(n int) {
+	w.pending = w.pending[:copy(w.pending, w.pending[n:])]
+}
+
+// emit writes the buffered output to destination in one call.
+func (w *credentialRedactingWriter) emit() error {
+	if len(w.output) == 0 {
+		return nil
+	}
+	_, err := w.destination.Write(w.output)
+	w.output = w.output[:0]
+	return err
+}
+
+// match reports the longest pattern that the non-empty pending starts with
+// and whether pending is a proper prefix of some pattern.
 func (w *credentialRedactingWriter) match() (matchLength int, couldGrow bool) {
-	for _, pattern := range w.patterns {
-		if patternPrefix(pattern, w.pending) && len(w.pending) < len(pattern.value) {
-			couldGrow = true
+	first := w.pending[0]
+	if len(w.pending) == 1 && !w.startsMatch[first] {
+		return 0, false
+	}
+	for i := range w.patterns {
+		pattern := &w.patterns[i]
+		if len(pattern.value) == 0 || !patternMayStartWith(pattern, first) {
+			continue
 		}
-		if len(w.pending) >= len(pattern.value) && patternPrefix(pattern, w.pending[:len(pattern.value)]) && len(pattern.value) > matchLength {
+		if len(w.pending) < len(pattern.value) {
+			couldGrow = couldGrow || patternPrefix(*pattern, w.pending)
+		} else if len(pattern.value) > matchLength && patternPrefix(*pattern, w.pending[:len(pattern.value)]) {
 			matchLength = len(pattern.value)
 		}
 	}
 	return matchLength, couldGrow
+}
+
+// patternMayStartWith is false only when patternPrefix(pattern, prefix) is
+// false for every non-empty prefix beginning with first: the first bytes
+// differ and either the pattern is exact or both are ASCII bytes that do not
+// fold together. A non-ASCII byte may begin a rune that bytes.EqualFold folds
+// onto an ASCII letter (U+212A KELVIN SIGN onto k), so it is never ruled out
+// for a folded pattern.
+func patternMayStartWith(pattern *credentialRedactionPattern, first byte) bool {
+	want := pattern.value[0]
+	if want == first {
+		return true
+	}
+	if !pattern.asciiFold {
+		return false
+	}
+	if want|first >= utf8.RuneSelf {
+		return true
+	}
+	lower := want | 0x20
+	return lower == first|0x20 && 'a' <= lower && lower <= 'z'
 }
 
 func patternPrefix(pattern credentialRedactionPattern, prefix []byte) bool {
@@ -917,18 +1010,14 @@ func (w *credentialRedactingWriter) flush() error {
 	for len(w.pending) > 0 {
 		matchLength, _ := w.match()
 		if matchLength > 0 {
-			if _, err := io.WriteString(w.destination, "[REDACTED]"); err != nil {
-				return err
-			}
-			w.pending = w.pending[matchLength:]
+			w.output = append(w.output, "[REDACTED]"...)
+			w.consume(matchLength)
 			continue
 		}
-		if _, err := w.destination.Write(w.pending[:1]); err != nil {
-			return err
-		}
-		w.pending = w.pending[1:]
+		w.output = append(w.output, w.pending[0])
+		w.consume(1)
 	}
-	return nil
+	return w.emit()
 }
 
 func normalizedProxyPath(escaped string) (string, error) {

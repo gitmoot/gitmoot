@@ -437,7 +437,7 @@ func TestCredentialRedactorBoundsCarryAndRedactsSplitSecret(t *testing.T) {
 		}
 	}
 	var destination countingWriter
-	redactor := &credentialRedactingWriter{destination: &destination, patterns: patterns}
+	redactor := newCredentialRedactingWriter(&destination, patterns)
 	chunk := bytes.Repeat([]byte("ordinary-response-byte"), 2048)
 	for range 256 {
 		if _, err := redactor.Write(chunk); err != nil {
@@ -455,7 +455,7 @@ func TestCredentialRedactorBoundsCarryAndRedactsSplitSecret(t *testing.T) {
 		t.Fatalf("redactor progress=%v retained=%d bound=%d", destination.written > beforeBound, len(redactor.pending), maxPatternLength-1)
 	}
 	var splitOutput bytes.Buffer
-	splitRedactor := &credentialRedactingWriter{destination: &splitOutput, patterns: patterns}
+	splitRedactor := newCredentialRedactingWriter(&splitOutput, patterns)
 	if _, err := splitRedactor.Write([]byte("visible:" + testRealCredential[:19])); err != nil {
 		t.Fatal(err)
 	}
