@@ -660,7 +660,7 @@ func (s *Store) SumJobTokensByRoot(ctx context.Context, rootID string) (int, err
 // so the plan test (TestListQueuedJobsUsesQueuedIndex) can EXPLAIN QUERY PLAN the
 // PRODUCTION text rather than a hand-copied duplicate — a change to this query is then
 // what the test actually asserts a plan for.
-const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, lifecycle_generation
+const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, repo, pull_request, lifecycle_generation
 		FROM jobs WHERE state = 'queued' AND externally_driven = 0 ORDER BY created_at, rowid`
 
 // ListQueuedJobs returns the queued jobs in created_at (then rowid) order. The
@@ -678,6 +678,10 @@ const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, model, parent
 // directly running so they normally never reach the queue at all; this is the
 // belt-and-suspenders guard mirroring the reaper's exemption below. It is a residual
 // filter on top of the partial-index scan, so the query plan is unchanged.
+//
+// The denormalized repo and pull_request columns ride along so the review
+// overlap hold (#2726) can match a queued review to a running one without
+// decoding its payload.
 func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, listQueuedJobsSQL)
 	if err != nil {
@@ -688,7 +692,7 @@ func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.LifecycleGeneration); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.Repo, &job.PullRequest, &job.LifecycleGeneration); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -736,11 +740,11 @@ const listQueuedJobsForRepoSQL = `SELECT id, agent, type, state, payload, model,
 // lifecycle. Every settlement from this list must be anchored on the generation
 // returned here.
 //
-// It exists because ListQueuedJobs is HOME-WIDE and projects neither column, so a
-// repo-scoped caller had to decode every payload in the home just to discover whose
-// row it was — which meant one undecodable payload in ANY repo could fail EVERY
-// watched repo's poll, permanently, since that condition is not transient. Filtering
-// in SQL means a foreign row is never read at all.
+// It exists because ListQueuedJobs is HOME-WIDE: it once projected neither column,
+// so a repo-scoped caller had to decode every payload in the home just to discover
+// whose row it was — which meant one undecodable payload in ANY repo could fail
+// EVERY watched repo's poll, permanently, since that condition is not transient.
+// Filtering in SQL means a foreign row is never read at all.
 func (s *Store) ListQueuedJobsForRepo(ctx context.Context, repo string) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, listQueuedJobsForRepoSQL, strings.TrimSpace(repo))
 	if err != nil {

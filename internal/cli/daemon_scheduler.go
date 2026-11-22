@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -2869,8 +2870,19 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	if err != nil {
 		return nil, err
 	}
-	// queued is every queued job, for the overlap hold's log (see the end).
-	queued := jobs
+	// #2726: a review waits while another review of the same (repo, PR) at a
+	// different head is running, so its prior-verdict list, rendered at
+	// dispatch, has that review's verdict. Only running reviews hold, so the
+	// hold depends on nothing decided later, and it runs first: a held review is
+	// never routed to remote, counted against a routing cap or given a lane,
+	// and takes no checkout or runtime lock, no reservation and no spend. It
+	// cancels nothing. Only the dispatch path records events and prunes the hold
+	// log, on every call, before any early return below; the preflight count
+	// gets the same filtering read-only.
+	jobs, err = holdOverlappingReviews(ctx, worker.Store, worker.reviewHolds, jobs, repoFilter, rootFilter, forDispatch)
+	if err != nil {
+		return nil, err
+	}
 	// Both barrier and pool schedulers (including every continuous-pool re-query)
 	// pass through this exact forDispatch path immediately before selecting work.
 	// Returning an empty eligible set pauses dispatch without changing job state,
@@ -2921,9 +2933,6 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		unavailableRoles[row.Role] = row
 	}
 	pending := make([]db.Job, 0, len(jobs))
-	// reviewPayloads keeps the decode of each eligible review for the overlap
-	// hold below, its only other reader; nothing else is kept.
-	reviewPayloads := map[string]workflow.JobPayload{}
 	for _, job := range jobs {
 		// One decode per job for every check below (it was decoded up to four
 		// times here before #2726).
@@ -2960,23 +2969,8 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 			}
 		}
 		pending = append(pending, job)
-		if job.Type == "review" {
-			reviewPayloads[job.ID] = payload
-		}
 	}
-	// #2726: a review waits for another review of the same (repo, PR) that is
-	// running, or that is eligible in this same pass and queued ahead of it, so
-	// its prior-verdict list, rendered at dispatch, carries the verdicts recorded
-	// by then. It runs on the final eligible set, after the drain check, the disk
-	// guard, janitor admission and the checks above, so a queued review that
-	// cannot dispatch now never holds one that can. A held review takes no
-	// checkout or runtime lock, no remote reservation and no spend (the disk
-	// guard may already have routed it to remote, a payload change only). A
-	// local review keeps the exact-head worktree it was created with before
-	// enqueue, as any queued review does while it waits for a worker slot. The
-	// hold cancels nothing. Only the dispatch path records events; the
-	// preflight count gets the same filtering read-only.
-	return holdOverlappingReviews(ctx, worker.Store, worker.reviewHolds, queued, pending, reviewPayloads, forDispatch)
+	return pending, nil
 }
 
 // runQueuedJobsForRepoPool is the opt-in (--scheduler=pool) continuous scheduler
@@ -3106,6 +3100,10 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 		remote bool
 	}
 	inflightCheckouts := map[string]bool{}
+	// inflightJobs is every job this pass dispatched and has not yet reaped; a
+	// review among them that is still queued (not yet claimed) seeds the
+	// selector's one-head-per-pull-request rule (#2726).
+	inflightJobs := map[string]bool{}
 	inflightRuntimes := map[string]bool{}
 	// running is this pass's per-repo HOST count, the budget input (#2470).
 	// inflight is every job this pass admitted on either lane and has not yet
@@ -3152,6 +3150,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 
 	reap := func(f finished) {
 		delete(inflightCheckouts, f.checkoutKey)
+		delete(inflightJobs, f.jobID)
 		if f.runtimeKey != "" {
 			delete(inflightRuntimes, f.runtimeKey)
 		}
@@ -3285,6 +3284,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 				// busy-excluded the loop reaches dispatched==0 && running==0 and
 				// returns, so "busy must not count as progress" holds structurally.
 				pending = excludeBouncedBusy(ctx, worker, pending, bouncedBusy, bouncedBusyRuntimes, runtimeKeyMemo)
+				dispatchedReviews := dispatchedReviewHeads(pending, func(jobID string) bool { return inflightJobs[jobID] || tracker.inflightJob(jobID) })
 				// Union in the supervisor tracker's in-flight keys (#562): a tracked
 				// non-pool job (e.g. dispatched before a warm scheduler flip) must
 				// block same-key pool dispatch exactly like a pool-local one. Jobs
@@ -3304,7 +3304,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					seedCheckouts = unionStringSets(inflightCheckouts, trackerCheckouts)
 					seedRuntimes = unionStringSets(inflightRuntimes, trackerRuntimes)
 				}
-				queued, remaining := selectRunnableByLane(ctx, worker.Store, pending, localBudget, remoteBudget, laneOn, seedCheckouts, seedRuntimes)
+				queued, remaining := selectRunnableByLane(ctx, worker.Store, pending, localBudget, remoteBudget, laneOn, seedCheckouts, seedRuntimes, dispatchedReviews)
 				for _, job := range queued {
 					job := job
 					// Host-global admission gate (#365): reserve a session slot + RAM
@@ -3330,6 +3330,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					}
 					deliveryCtx := tracker.trackedJobContext(job.ID, ctx)
 					inflightCheckouts[checkoutKey] = true
+					inflightJobs[job.ID] = true
 					if runtimeKey != "" {
 						inflightRuntimes[runtimeKey] = true
 					}
@@ -3466,6 +3467,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					if iso.runtimeKey != "" {
 						inflightRuntimes[iso.runtimeKey] = true
 					}
+					inflightJobs[iso.job.ID] = true
 					// #739: make the reactive isolation observable on SUCCESS too (it was
 					// silent both ways). Emitted only past the host-cap/double-dispatch gate
 					// above, so the event means the job is truly dispatched in its own
@@ -3657,18 +3659,23 @@ type queuedJobResourceSelector struct {
 	limit     int
 	checkouts map[string]bool
 	runtimes  map[string]bool
+	// reviews maps a pull request (reviewOverlapKey) to the head of the review
+	// of it this selection admitted (#2726).
+	reviews map[string]string
 }
 
 func selectRunnableQueuedJobs(ctx context.Context, store *db.Store, pending []db.Job, limit int) ([]db.Job, []db.Job) {
-	return selectRunnableQueuedJobsSeeded(ctx, store, pending, limit, nil, nil)
+	return selectRunnableQueuedJobsSeeded(ctx, store, pending, limit, nil, nil, nil)
 }
 
 // selectRunnableQueuedJobsSeeded is selectRunnableQueuedJobs with the
 // checkout/runtime resource sets pre-seeded from already-running jobs. The
 // barrier path passes nil seeds (empty, == the original behavior); the pool path
 // (#394) seeds the live in-flight keys so a job whose checkout key is already
-// held by a running job is not selected. The seed maps are copied, never mutated.
-func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pending []db.Job, limit int, seedCheckouts map[string]bool, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
+// held by a running job is not selected. seedReviews carries the review heads
+// an earlier selection of the same pass admitted (the local lane, for the
+// remote one). The seed maps are copied, never mutated.
+func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pending []db.Job, limit int, seedCheckouts map[string]bool, seedRuntimes map[string]bool, seedReviews map[string]string) ([]db.Job, []db.Job) {
 	if limit <= 0 {
 		// A FOURTH DECLINE POINT, outside selects and not in the issue's list: with
 		// no slots every queued job is declined and nothing recorded why. A repo
@@ -3682,7 +3689,9 @@ func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pendin
 		limit:     limit,
 		checkouts: copyStringSet(seedCheckouts),
 		runtimes:  copyStringSet(seedRuntimes),
+		reviews:   make(map[string]string, len(seedReviews)),
 	}
+	maps.Copy(selector.reviews, seedReviews)
 	queued := make([]db.Job, 0, min(limit, len(pending)))
 	remaining := make([]db.Job, 0, len(pending))
 	for _, job := range pending {
@@ -3769,9 +3778,23 @@ func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store,
 	if runtimeKey != "" && s.runtimes[runtimeKey] {
 		return false, "runtime", fmt.Sprintf("runtime already taken this pass: runtime=%s", runtimeKey)
 	}
+	// #2726: reviews of one pull request at different heads never start in the
+	// same selection. The overlap hold only sees running reviews, so two
+	// waiting heads released together by their holder would otherwise start
+	// side by side, and the later one would miss the earlier one's verdict. The
+	// first admitted one runs, and holds the rest once it is running.
+	reviewKey, reviewHead, isReview := queuedJobReviewOverlap(job)
+	if isReview {
+		if head, taken := s.reviews[reviewKey]; taken && head != reviewHead {
+			return false, "review_overlap", fmt.Sprintf("a review of %s at head %s was selected this pass; this one at head %s waits for its verdict", reviewKey, shortReviewHead(head), shortReviewHead(reviewHead))
+		}
+	}
 	s.checkouts[checkoutKey] = true
 	if runtimeKey != "" {
 		s.runtimes[runtimeKey] = true
+	}
+	if isReview {
+		s.reviews[reviewKey] = reviewHead
 	}
 	return true, "", ""
 }

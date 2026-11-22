@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"sort"
 	"strings"
@@ -507,11 +508,13 @@ func laneBudgets(repoLocalSlots, hostCap int, tracker *inflightJobTracker) (loca
 // against the remote budget, each in FIFO order, so a local backlog on a full
 // host never consumes slots a remote job could use, and vice versa. The remote
 // pass is seeded with the keys the local pass just selected so the two never
-// pick jobs that share a checkout or runtime session. With the lane off this is
-// exactly the single selection used before #2470.
-func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job, local, remote int, laneOn bool, seedCheckouts, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
+// pick jobs that share a checkout or runtime session, or reviews of one pull
+// request at different heads (#2726). seedReviews holds the review heads
+// already dispatched but not yet claimed. With the lane off this is exactly the
+// single selection used before #2470.
+func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job, local, remote int, laneOn bool, seedCheckouts, seedRuntimes map[string]bool, seedReviews map[string]string) ([]db.Job, []db.Job) {
 	if !laneOn {
-		return selectRunnableQueuedJobsSeeded(ctx, store, pending, local, seedCheckouts, seedRuntimes)
+		return selectRunnableQueuedJobsSeeded(ctx, store, pending, local, seedCheckouts, seedRuntimes, seedReviews)
 	}
 	var localJobs, remoteJobs []db.Job
 	for _, job := range pending {
@@ -521,12 +524,16 @@ func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job
 			localJobs = append(localJobs, job)
 		}
 	}
-	queued, remaining := selectRunnableQueuedJobsSeeded(ctx, store, localJobs, local, seedCheckouts, seedRuntimes)
+	queued, remaining := selectRunnableQueuedJobsSeeded(ctx, store, localJobs, local, seedCheckouts, seedRuntimes, seedReviews)
 	if len(remoteJobs) == 0 {
 		return queued, remaining
 	}
 	checkouts := copyStringSet(seedCheckouts)
 	runtimes := copyStringSet(seedRuntimes)
+	reviews := maps.Clone(seedReviews)
+	if reviews == nil {
+		reviews = map[string]string{}
+	}
 	for _, job := range queued {
 		if key := queuedJobCheckoutKey(ctx, store, job); key != "" {
 			checkouts[key] = true
@@ -534,8 +541,11 @@ func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job
 		if key := queuedJobRuntimeResourceKey(ctx, store, job); key != "" {
 			runtimes[key] = true
 		}
+		if key, head, ok := queuedJobReviewOverlap(job); ok {
+			reviews[key] = head
+		}
 	}
-	remoteQueued, remoteRemaining := selectRunnableQueuedJobsSeeded(ctx, store, remoteJobs, remote, checkouts, runtimes)
+	remoteQueued, remoteRemaining := selectRunnableQueuedJobsSeeded(ctx, store, remoteJobs, remote, checkouts, runtimes, reviews)
 	return append(queued, remoteQueued...), append(remaining, remoteRemaining...)
 }
 
@@ -1041,7 +1051,9 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 	}
 	// Drop jobs this process is already running: a freshly dispatched job stays
 	// 'queued' in the DB until engine.RunJob claims it, and that window must not
-	// double-dispatch it.
+	// double-dispatch it. A review in that window holds the other heads of its
+	// pull request in the selection below, as it will once running (#2726).
+	dispatchedReviews := dispatchedReviewHeads(pending, tracker.inflightJob)
 	eligible := pending[:0]
 	for _, job := range pending {
 		if !tracker.inflightJob(job.ID) {
@@ -1058,7 +1070,7 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 		return tracker.takeErr(repoFilter)
 	}
 	seedCheckouts, seedRuntimes := tracker.seeds()
-	queued, remaining := selectRunnableByLane(ctx, worker.Store, eligible, localBudget, remoteBudget, laneOn, seedCheckouts, seedRuntimes)
+	queued, remaining := selectRunnableByLane(ctx, worker.Store, eligible, localBudget, remoteBudget, laneOn, seedCheckouts, seedRuntimes, dispatchedReviews)
 	explainHeldBackJobs(ctx, worker, tracker, remaining)
 	for _, job := range queued {
 		job := job

@@ -76,7 +76,7 @@ func (a overlapRecordingAdapter) Deliver(ctx context.Context, _ runtime.Agent, j
 	a.h.mu.Lock()
 	a.h.delivered = append(a.h.delivered, overlapDelivery{jobID: job.ID, priorVerdicts: string(body)})
 	a.h.mu.Unlock()
-	return runtime.Result{Decision: "approved", Summary: "ok"}, nil
+	return runtime.Result{Raw: `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[]}}`}, nil
 }
 
 func (h *overlapHoldHarness) enqueue(id, repo string, pr int, head string) {
@@ -214,9 +214,11 @@ func TestReviewHeldForRunningReviewDispatchesWithItsVerdict(t *testing.T) {
 	}
 }
 
-// Held reviews of several heads all wait for the running review, then
-// dispatch one after another in queue order; none is cancelled, and the last
-// one's prior verdicts still carry the first review's finding.
+// Reviews of several heads held by one running review stay queued. Once it
+// ends the scheduler starts one head at a time: a selection admits one head per
+// pull request, and a review dispatched but not yet claimed holds the other
+// heads in the selector. So the later head's prior verdicts carry both earlier
+// reviews' verdicts.
 func TestReviewHoldDispatchesHeldHeadsInQueueOrder(t *testing.T) {
 	h := newOverlapHoldHarness(t)
 	h.enqueue("review-a", "owner/repo", 12, overlapHeadA)
@@ -235,30 +237,32 @@ func TestReviewHoldDispatchesHeldHeadsInQueueOrder(t *testing.T) {
 	}
 
 	h.settleWithFinding("review-a", "FINDING-A")
-	h.pass()
-	if _, delivered := h.delivery("review-b"); !delivered {
-		t.Fatal("review-b, first in queue, did not dispatch after review-a settled")
+	pending, err := listPendingQueuedJobs(h.ctx, h.worker, "", "", false)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, delivered := h.delivery("review-c"); delivered {
-		t.Fatal("review-c dispatched alongside review-b, which was queued ahead of it")
+	queued, remaining := selectRunnableQueuedJobs(h.ctx, h.store, pending, 4)
+	if len(queued) != 1 || queued[0].ID != "review-b" || len(remaining) != 1 || remaining[0].ID != "review-c" {
+		t.Fatalf("selection = %v, remaining = %v; want review-b alone, one head per pull request", queued, remaining)
+	}
+	dispatched := dispatchedReviewHeads(pending, func(jobID string) bool { return jobID == "review-b" })
+	if again, _ := selectRunnableByLane(h.ctx, h.store, remaining, 4, 0, false, nil, nil, dispatched); len(again) != 0 {
+		t.Fatalf("selected %v while review-b was dispatched and not yet claimed", again)
 	}
 
 	h.pass()
-	got, delivered := h.delivery("review-c")
-	if !delivered {
-		t.Fatal("review-c did not dispatch after review-b settled")
+	c, delivered := h.delivery("review-c")
+	if _, deliveredB := h.delivery("review-b"); !deliveredB || !delivered {
+		t.Fatalf("after review-a settled: review-b delivered=%v review-c delivered=%v, want both", deliveredB, delivered)
 	}
-	if !strings.Contains(got.priorVerdicts, "FINDING-A") {
-		t.Fatalf("review-c prior verdicts lack review-a's finding:\n%s", got.priorVerdicts)
-	}
-	events := h.events("review-c", reviewHeldForRunningReviewEventKind)
-	if len(events) != 2 || !strings.Contains(events[0].Message, "review-a") || !strings.Contains(events[1].Message, "review-b") {
-		t.Fatalf("review-c hold events = %+v, want one naming review-a then one naming review-b", events)
+	if !strings.Contains(c.priorVerdicts, "FINDING-A") || !strings.Contains(c.priorVerdicts, `"job_id": "review-b"`) {
+		t.Fatalf("review-c prior verdicts lack review-a's finding or review-b's verdict (review-b is %s):\n%s", h.state("review-b"), c.priorVerdicts)
 	}
 }
 
-// Under daemon --session, a queued review outside the session does not hold
-// one inside it. A running review still holds across scopes.
+// Under daemon --session, a queued review outside the session never holds one
+// inside it, and a running review holds across scopes. The pass does not touch
+// a held review outside its scope.
 func TestReviewHoldIgnoresQueuedReviewsOutsideTheSession(t *testing.T) {
 	h := newOverlapHoldHarness(t)
 	h.enqueue("review-outside", "owner/repo", 12, overlapHeadA)
@@ -272,6 +276,9 @@ func TestReviewHoldIgnoresQueuedReviewsOutsideTheSession(t *testing.T) {
 	h.startRunning("review-running")
 	if kept := h.filter(nil, "session-b"); kept["review-session"] {
 		t.Fatal("review-session passed while a review of the same PR was running")
+	}
+	if events := h.events("review-outside", reviewHeldForRunningReviewEventKind); len(events) != 0 {
+		t.Fatalf("a session-filtered pass recorded hold events on review-outside: %+v", events)
 	}
 }
 
@@ -300,19 +307,19 @@ func TestReviewHoldIsScopedToTheSamePullRequestOfTheSameRepo(t *testing.T) {
 	}
 }
 
-// One event per (held review, holder): the holder moving from queued to
-// running writes no second event, and the scheduler's hold log forgets the
-// hold once it ends.
+// One event per (held review, holder), deduped by the store even without the
+// scheduler's hold log. The log forgets a hold once it ends, and every
+// dispatch listing prunes it, an empty queue included.
 func TestReviewHoldEventIsKeyedOnHeldAndHolderIdentity(t *testing.T) {
 	h := newOverlapHoldHarness(t)
 	h.enqueue("review-first", "owner/repo", 12, overlapHeadA)
+	h.startRunning("review-first")
 	h.enqueue("review-held", "owner/repo", 12, overlapHeadB)
 	holds := newReviewHoldLog()
 
 	// No hold log on the first two passes: the store alone must dedup on the
 	// identity, as it does after a daemon restart.
 	h.filter(nil, "")
-	h.startRunning("review-first")
 	h.filter(nil, "")
 	if events := h.events("review-held", reviewHeldForRunningReviewEventKind); len(events) != 1 {
 		t.Fatalf("hold events = %+v, want one for the one holder", events)
@@ -328,6 +335,22 @@ func TestReviewHoldEventIsKeyedOnHeldAndHolderIdentity(t *testing.T) {
 	}
 	if len(holds.held) != 0 {
 		t.Fatalf("hold log kept %v after the hold ended", holds.held)
+	}
+
+	h.enqueue("review-second", "owner/repo", 12, overlapHeadC)
+	h.startRunning("review-second")
+	h.filter(holds, "")
+	if got := holds.held["review-held"]; got != "review-second" {
+		t.Fatalf("hold log entry = %q, want review-second", got)
+	}
+	if moved, err := h.store.TransitionJobState(h.ctx, "review-held", string(workflow.JobQueued), string(workflow.JobCancelled)); err != nil || !moved {
+		t.Fatalf("cancel review-held: moved=%v err=%v", moved, err)
+	}
+	if kept := h.filter(holds, ""); len(kept) != 0 {
+		t.Fatalf("listing an empty queue let through %v", kept)
+	}
+	if len(holds.held) != 0 {
+		t.Fatalf("hold log kept %v after its job left an otherwise empty queue", holds.held)
 	}
 }
 
@@ -356,55 +379,5 @@ func TestReviewHeldEventNamesHolderAndIsNotStalled(t *testing.T) {
 	facts.ReviewRunning, facts.Verdict, facts.VerdictAt = review.running, review.verdict, review.verdictAt
 	if stall, stalled := classifyStalledPR(facts, config.DefaultPRStalledPolicy(), stallNow); stalled {
 		t.Fatalf("PR with a held review at its head classified stalled: %+v", stall)
-	}
-}
-
-// Only a queued review eligible in the same pass holds another. In the disk
-// guard's review warning band, a pinned-local review B of an older head cannot
-// dispatch, so once the running review A settles it must not hold C, a review
-// of the current head that the guard routes to remote. When the disk recovers
-// and B can dispatch, B holds C and goes first.
-func TestReviewHoldCountsOnlyQueuedHoldersEligibleThisPass(t *testing.T) {
-	ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
-	queueDiskGuardJob(t, ctx, store, "review-a", "rev-omp", "review", `,"head_sha":"`+overlapHeadA+`"`)
-	if claimed, err := store.ClaimRunningJob(ctx, "review-a", string(workflow.JobQueued), string(workflow.JobRunning), db.JobEvent{Kind: string(workflow.JobRunning)}, 1, "boot"); err != nil || !claimed {
-		t.Fatalf("claim review-a: claimed=%v err=%v", claimed, err)
-	}
-	queueDiskGuardJob(t, ctx, store, "review-b", "rev-omp", "review", `,"head_sha":"`+overlapHeadB+`","exec_backend":"local"`)
-	queueDiskGuardJob(t, ctx, store, "review-c", "rev-omp", "review", `,"head_sha":"`+overlapHeadC+`"`)
-
-	if got := strings.Join(pendingIDs(t, ctx, worker), ","); got != "" {
-		t.Fatalf("pending while review-a runs = %q, want none", got)
-	}
-	if b := storedBackend(t, ctx, store, "review-c"); b != "remote" {
-		t.Fatalf("review-c backend = %q, want remote (routed by the warning band)", b)
-	}
-	if moved, err := store.TransitionJobState(ctx, "review-a", string(workflow.JobRunning), string(workflow.JobSucceeded)); err != nil || !moved {
-		t.Fatalf("settle review-a: moved=%v err=%v", moved, err)
-	}
-	for range 2 {
-		if got := strings.Join(pendingIDs(t, ctx, worker), ","); got != "review-c" {
-			t.Fatalf("warning-band pending after review-a settled = %q, want review-c: review-b cannot dispatch, so it must not hold it", got)
-		}
-	}
-
-	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
-		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 50 << 30}, nil
-	})
-	if got := strings.Join(pendingIDs(t, ctx, worker), ","); got != "review-b" {
-		t.Fatalf("healthy-disk pending = %q, want review-b alone: an eligible review-b queued ahead holds review-c", got)
-	}
-	events, err := store.ListJobEvents(ctx, "review-c")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var holders []string
-	for _, event := range events {
-		if event.Kind == reviewHeldForRunningReviewEventKind {
-			holders = append(holders, event.Message)
-		}
-	}
-	if len(holders) != 2 || !strings.Contains(holders[0], "review-a") || !strings.Contains(holders[1], "review-b") {
-		t.Fatalf("review-c hold events = %q, want one naming review-a then one naming review-b", holders)
 	}
 }
