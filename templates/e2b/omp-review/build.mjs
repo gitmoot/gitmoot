@@ -41,6 +41,13 @@ const minFreeDiskMb =
     ? undefined
     : positiveIntegerEnv("E2B_MIN_FREE_DISK_MB", 0);
 
+// requestTimeoutMs for each API call the build makes (#2713). With the SDK's
+// default retries it bounds how long a rate-limited call (429 + Retry-After)
+// keeps waiting and retrying; it does not cut one slow response short. The
+// SDK's 60 s default made two builds give up while E2B was slow to accept them
+// on 2026-11-22; 300 s let the same build through.
+const requestTimeoutMs = positiveIntegerEnv("E2B_REQUEST_TIMEOUT_MS", 300_000);
+
 // The template directory defaults to this one (omp-review). Toolchain
 // templates pass their own directory, e.g. `npm run build -- ../omp-review-rust`.
 const templateDir = process.argv[2] ? resolve(process.argv[2]) : import.meta.dirname;
@@ -48,6 +55,7 @@ const dockerfile = resolve(templateDir, "Dockerfile");
 const template = Template().fromDockerfile(dockerfile);
 const build = await Template.build(template, name, {
   apiKey,
+  requestTimeoutMs,
   cpuCount,
   memoryMB,
   ...(minFreeDiskMb === undefined ? {} : { minFreeDiskMb }),

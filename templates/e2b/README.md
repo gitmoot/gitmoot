@@ -11,7 +11,7 @@ credential. Root is used only while the image is built.
 | --- | --- | --- | --- | --- |
 | `omp-review` | `gitmoot-omp-go126-2c4g-v1` | 2 vCPU / 4 GiB | Go 1.26.4 | Gitmoot `go.mod` |
 | `omp-review-swift` | `gitmoot-omp-review-swift-v1` | 4 vCPU / 8 GiB | Swift 6.1.3 (Debian 12 build), fish, zsh, tcsh, csh, GNU awk | herdrup CI (`container: swift:6.1`, login-shell tests); keephair harness |
-| `omp-review-rust` | `gitmoot-omp-review-rust-v1` | 4 vCPU / 8 GiB | Rust 1.96.1 + rustfmt, clippy; Zig 0.16.0; just 1.58.0; cargo-nextest 0.9.146; Bun 1.3.14; git 2.56.0 | herdr `rust-toolchain.toml` and CI |
+| `omp-review-rust` | `gitmoot-omp-review-rust-v2` | 4 vCPU / 8 GiB | Rust 1.96.1 + rustfmt, clippy; Zig 0.16.0; just 1.58.0; cargo-nextest 0.9.146; Bun 1.3.14 (with `bunx`); git 2.56.0 | herdr `rust-toolchain.toml` and CI; omp-sandbox CI (`bunx tsc`) |
 | `omp-review-node` | `gitmoot-omp-review-node-v1` | 4 vCPU / 8 GiB | Node 20.20.2, pnpm 10.13.1, Playwright 1.60.0 Chromium, ffmpeg, uv 0.12.23 | joltra CI (`node-version: 20`), `packageManager`, `pnpm-lock.yaml` |
 | `omp-review-flutter` | `gitmoot-omp-review-flutter-v1` | 2 vCPU / 4 GiB | Flutter 3.41.9 (Dart and test artifacts precached) | among-friends and numbra `.mise.toml` |
 
@@ -53,7 +53,7 @@ export E2B_API_KEY="$(cat /path/to/e2b-api-key)"
 E2B_TEMPLATE_NAME=gitmoot-omp-review-swift-v1 \
   E2B_CPU_COUNT=4 E2B_MEMORY_MB=8192 E2B_MIN_FREE_DISK_MB=8192 \
   npm run build -- ../omp-review-swift
-E2B_TEMPLATE_NAME=gitmoot-omp-review-rust-v1 \
+E2B_TEMPLATE_NAME=gitmoot-omp-review-rust-v2 \
   E2B_CPU_COUNT=4 E2B_MEMORY_MB=8192 E2B_MIN_FREE_DISK_MB=20480 \
   npm run build -- ../omp-review-rust
 E2B_TEMPLATE_NAME=gitmoot-omp-review-node-v1 \
@@ -73,6 +73,13 @@ OOM-killed herdrup's test process (3.8 GB resident, in
 `RecoveryExecutorTests`) and joltra's Chromium launch exceeded its 10 s hook
 timeout; both pass at 4 vCPU / 8 GiB. Rust uses the same size for
 herdr's ~4,700-test build. Flutter passes at 2 vCPU / 4 GiB.
+
+`E2B_REQUEST_TIMEOUT_MS` (optional, default 300000) is the e2b SDK's
+`requestTimeoutMs` for each API call the build makes. With the SDK's default
+retries it bounds how long a rate-limited call (HTTP 429 with `Retry-After`)
+keeps waiting and retrying; it does not cut one slow response short. The SDK's
+own 60 s default made two builds of `gitmoot-omp-review-rust-v2` give up while
+E2B was slow to accept them; 300 s let the same build through.
 
 The command prints the template ID and build ID; record both with the chosen
 resources before pointing any configuration at the new name. Never put an API
@@ -116,8 +123,8 @@ output streams to stderr.
 ```sh
 git clone --depth 1 https://github.com/jerryfane/herdr.git /tmp/herdr
 tar -C /tmp -czf /tmp/herdr.tar.gz herdr
-E2B_TEMPLATE_NAME=gitmoot-omp-review-rust-v1 VERIFY_SOURCE=/tmp/herdr.tar.gz \
-  VERIFY_COMMAND='cargo fmt --check && just ci-tests "all()"' \
+E2B_TEMPLATE_NAME=gitmoot-omp-review-rust-v2 VERIFY_SOURCE=/tmp/herdr.tar.gz \
+  VERIFY_COMMAND='bunx --version && cargo fmt --check && just ci-tests "all()"' \
   VERIFY_TIMEOUT_MINUTES=50 node verify.mjs
 ```
 
@@ -130,7 +137,7 @@ The canary checks per template:
 | --- | --- | --- |
 | swift | jerryfane/herdrup | `swift build && swift test` |
 | swift | themartianapp/keephair | `export LANG=C.UTF-8; cd ios/Scripts/typecheck-harness && ./run.sh` |
-| rust | jerryfane/herdr | `cargo fmt --check && just ci-tests "all()"` |
+| rust | jerryfane/herdr | `bunx --version && cargo fmt --check && just ci-tests "all()"` |
 | node | jerryfane/joltra | `pnpm install --frozen-lockfile && pnpm --filter @joltra/shared build && pnpm --filter @joltra/mcp-widget build && pnpm --filter @joltra/mcp build && pnpm test` |
 | flutter | themartianapp/among-friends, jerryfane/numbra | `cd apps/mobile && flutter pub get && flutter test` |
 
