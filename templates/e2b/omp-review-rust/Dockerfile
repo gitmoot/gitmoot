@@ -95,7 +95,11 @@ RUN set -eux; \
     echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum --check --strict; \
     unzip -j -d /usr/local/bin /tmp/bun.zip bun-linux-x64/bun; \
     rm /tmp/bun.zip; \
-    chmod 0755 /usr/local/bin/just /usr/local/bin/cargo-nextest /usr/local/bin/bun
+    chmod 0755 /usr/local/bin/just /usr/local/bin/cargo-nextest /usr/local/bin/bun; \
+    # bunx is bun itself: bun picks its mode from argv[0], and Bun's own
+    # installer ships bunx as this same link. omp-sandbox's CI runs `bunx tsc`
+    # (#2713).
+    ln -s bun /usr/local/bin/bunx
 
 # Envd runs review commands as UID/GID 1000 (user). Same credential-free
 # runtime directories as ../omp-review; Gitmoot uploads the OMP binary and the
@@ -108,7 +112,7 @@ RUN /usr/bin/install -d -o 1000 -g 1000 -m 0700 \
 
 RUN /usr/local/bin/zig version
 RUN /usr/local/bin/just --version && /usr/local/bin/cargo-nextest nextest --version
-RUN /usr/local/bin/bun --version
+RUN /usr/local/bin/bun --version && /usr/local/bin/bunx --version
 RUN /usr/bin/git --version
 RUN /usr/bin/gcc --version
 RUN /usr/local/bin/python3 --version

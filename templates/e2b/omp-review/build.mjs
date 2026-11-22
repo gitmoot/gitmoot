@@ -41,6 +41,11 @@ const minFreeDiskMb =
     ? undefined
     : positiveIntegerEnv("E2B_MIN_FREE_DISK_MB", 0);
 
+// The SDK aborts each API request after 60 s. E2B's build request (POST
+// /v3/templates) took longer than that twice on 2026-11-22 while the rest of
+// the API answered in 0.2 s; the same build then finished with 300 s (#2713).
+const requestTimeoutMs = positiveIntegerEnv("E2B_REQUEST_TIMEOUT_MS", 300_000);
+
 // The template directory defaults to this one (omp-review). Toolchain
 // templates pass their own directory, e.g. `npm run build -- ../omp-review-rust`.
 const templateDir = process.argv[2] ? resolve(process.argv[2]) : import.meta.dirname;
@@ -48,6 +53,7 @@ const dockerfile = resolve(templateDir, "Dockerfile");
 const template = Template().fromDockerfile(dockerfile);
 const build = await Template.build(template, name, {
   apiKey,
+  requestTimeoutMs,
   cpuCount,
   memoryMB,
   ...(minFreeDiskMb === undefined ? {} : { minFreeDiskMb }),
