@@ -93,7 +93,8 @@ type workspaceError struct {
 	Message string `json:"message"`
 	// FailedCheck, ExitCode and OutputTail are set for requirements_unmet:
 	// the require command that failed, its exit status (124 on timeout) and
-	// the redacted last workspaceRequireTailBytes of its combined output.
+	// at most workspaceRequireTailBytes of its redacted output, stdout's last
+	// lines then stderr's (workspaceRequireReport).
 	FailedCheck string  `json:"failed_check,omitempty"`
 	ExitCode    *int    `json:"exit_code,omitempty"`
 	OutputTail  *string `json:"output_tail,omitempty"`
@@ -610,9 +611,9 @@ func readWorkspaceOpenRecord(paths config.Paths, id string) (workspaceOpenRecord
 }
 
 // Require checks (#2704). Each command gets workspaceRequireTimeout (a
-// variable only so the offline tests can shorten it); a failure reports the
-// last workspaceRequireTailBytes of the command's combined output, redacted
-// (workspaceRequireTail).
+// variable only so the offline tests can shorten it); a failure reports at
+// most workspaceRequireTailBytes of the command's output, each stream captured
+// and redacted on its own, then joined by workspaceRequireReport.
 var workspaceRequireTimeout = 60 * time.Second
 
 const (
