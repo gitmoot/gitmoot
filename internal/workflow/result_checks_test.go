@@ -438,6 +438,12 @@ func TestNeverAsAFlagValueIsNotADenial(t *testing.T) {
 		// #2731 review probes: an outcome arrow missing one space.
 		{"quoted diagnostic after an arrow missing its left space", "pytest tests/test_cli.py-> option --capture 'not recognized'", false},
 		{"quoted diagnostic after an arrow missing its right space", "pytest tests/test_cli.py ->option --capture 'not recognized'", false},
+		// #2731 round 4 probes: "never" glued to an arrow or punctuation is
+		// not the flag's value, even though the arrow cut would leave it bare.
+		{"never glued to an em dash", "git -C internal/workflow diff --color never—runner refused to start it", false},
+		{"never glued to an arrow", "git -C internal/workflow diff --color never->approval required", false},
+		{"never glued to a full stop", "go test ./internal/workflow --color never. sandbox refused it", false},
+		{"assigned never glued to an em dash", "go test ./internal/workflow --color=never—x", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

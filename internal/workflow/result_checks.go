@@ -829,23 +829,32 @@ var outputArrows = []string{"->", "=>", "→", "—"}
 
 // neverFlagValues returns the spans of every "never" that is the immediate
 // value of a flag in neverValueFlags, before the earliest output arrow.
+//
+// Tokens are read from the WHOLE entry, and only then compared with the cut.
+// Cutting first would turn "--color never->approval required" into a clean
+// "never" token; read whole, "never->approval" is not the value "never".
+// So the exempt "never" must be followed by whitespace or the end of the
+// entry, and must end before the earliest arrow.
 func neverFlagValues(text string) []textSpan {
-	command := text
+	cut := len(text)
 	for _, arrow := range outputArrows {
-		if i := strings.Index(command, arrow); i >= 0 {
-			command = command[:i]
+		if i := strings.Index(text, arrow); i >= 0 && i < cut {
+			cut = i
 		}
 	}
 	var spans []textSpan
 	previous := ""
-	for start := 0; start < len(command); {
-		end := strings.IndexByte(command[start:], ' ')
+	for start := 0; start < cut; {
+		end := strings.IndexByte(text[start:], ' ')
 		if end < 0 {
-			end = len(command)
+			end = len(text)
 		} else {
 			end += start
 		}
-		token := command[start:end]
+		if end > cut {
+			break
+		}
+		token := text[start:end]
 		if flag, value, assigned := strings.Cut(token, "="); assigned {
 			if value == "never" && slices.Contains(neverValueFlags, flag) {
 				spans = append(spans, textSpan{start: end - len("never"), end: end})
