@@ -2899,10 +2899,12 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	// running or queued ahead of it, so its prior-verdict list, rendered at
 	// dispatch, carries that review's verdict. It runs here, before the disk
 	// guard, the admission gate and worker.run, so a held review takes no
-	// resource: no remote switch or reservation, no worktree, no checkout or
-	// runtime lock. Only the dispatch path supersedes or records events; the
-	// preflight count gets the same filtering read-only.
-	jobs, err = holdOverlappingReviews(ctx, worker.Store, jobs, repoFilter, rootFilter, forDispatch)
+	// checkout or runtime lock, no remote switch or reservation, and no spend.
+	// A local review keeps the exact-head worktree it was created with before
+	// enqueue, as any queued review does while it waits for a worker slot. Only
+	// the dispatch path supersedes or records events; the preflight count gets
+	// the same filtering read-only.
+	jobs, err = holdOverlappingReviews(ctx, worker.Store, worker.reviewHolds, jobs, repoFilter, rootFilter, forDispatch)
 	if err != nil {
 		return nil, err
 	}
@@ -3775,7 +3777,14 @@ func queuedJobMatchesRepo(job db.Job, repoFilter string) bool {
 		return true
 	}
 	payload, err := daemonJobPayload(job)
-	return err == nil && payload.Repo == repoFilter
+	return err == nil && queuedPayloadMatchesRepo(payload, repoFilter)
+}
+
+// queuedPayloadMatchesRepo is queuedJobMatchesRepo for a caller that already
+// decoded the payload.
+func queuedPayloadMatchesRepo(payload workflow.JobPayload, repoFilter string) bool {
+	repoFilter = strings.TrimSpace(repoFilter)
+	return repoFilter == "" || payload.Repo == repoFilter
 }
 
 // queuedJobMatchesSession reports whether a job is in scope for the daemon's
@@ -3784,14 +3793,18 @@ func queuedJobMatchesRepo(job db.Job, repoFilter string) bool {
 // (job.ID == rootFilter) or carries that id as payload.RootJobID.
 func queuedJobMatchesSession(job db.Job, rootFilter string) bool {
 	rootFilter = strings.TrimSpace(rootFilter)
-	if rootFilter == "" {
-		return true
-	}
-	if job.ID == rootFilter {
+	if rootFilter == "" || job.ID == rootFilter {
 		return true
 	}
 	payload, err := daemonJobPayload(job)
-	return err == nil && payload.RootJobID == rootFilter
+	return err == nil && queuedPayloadMatchesSession(job.ID, payload, rootFilter)
+}
+
+// queuedPayloadMatchesSession is queuedJobMatchesSession for a caller that
+// already decoded the payload.
+func queuedPayloadMatchesSession(jobID string, payload workflow.JobPayload, rootFilter string) bool {
+	rootFilter = strings.TrimSpace(rootFilter)
+	return rootFilter == "" || jobID == rootFilter || payload.RootJobID == rootFilter
 }
 
 func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) string {

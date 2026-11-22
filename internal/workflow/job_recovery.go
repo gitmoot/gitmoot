@@ -547,10 +547,7 @@ func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, r
 	default:
 		return job, false, nil
 	}
-	reason = strings.TrimSpace(reason)
-	if reason == "" {
-		reason = "review job superseded by newer pull request head"
-	}
+	reason = staleHeadSupersedeReason(reason)
 	if job.State == string(JobRunning) && !strings.HasPrefix(reason, "cancel requested from running") {
 		reason = "cancel requested from running: " + reason
 	}
@@ -569,9 +566,58 @@ func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, r
 		}
 		return latest, false, nil
 	}
-	// Defensive symmetry with CancelJob: a superseded job that carried a #739
-	// dispatch-time read-only worktree must not leak it (no-op for the review jobs
-	// this path targets today, which run in a per-PR task worktree, not a #739 seat).
+	return finishStaleHeadSupersede(ctx, store, job)
+}
+
+// SupersedeQueuedStaleHeadJob supersedes a review the caller OBSERVED queued,
+// and only if it is still queued at the observed lifecycle generation when the
+// state is written. A job claimed (or retried) since the observation is left
+// alone and returned as it now is. It writes the same superseded_stale_head
+// event and runs the same abort cleanup as SupersedeStaleHeadJob, which instead
+// re-reads the job and also cancels a running one.
+//
+// The review overlap hold (#2726) uses it: it decides from a queue snapshot, and
+// a worker may claim one of those jobs before the decision lands.
+func SupersedeQueuedStaleHeadJob(ctx context.Context, store *db.Store, observed db.Job, reason string) (db.Job, bool, error) {
+	if store == nil {
+		return db.Job{}, false, fmt.Errorf("store is required")
+	}
+	if strings.TrimSpace(observed.ID) == "" {
+		return db.Job{}, false, fmt.Errorf("observed job id is required")
+	}
+	if observed.State != string(JobQueued) {
+		return observed, false, nil
+	}
+	transitioned, err := store.TransitionJobStateWithEventAtGeneration(ctx, observed.ID, string(JobQueued), observed.LifecycleGeneration, string(JobCancelled), db.JobEvent{
+		JobID:   observed.ID,
+		Kind:    JobEventSupersededStaleHead,
+		Message: staleHeadSupersedeReason(reason),
+	})
+	if err != nil {
+		return db.Job{}, false, err
+	}
+	if !transitioned {
+		latest, getErr := store.GetJob(ctx, observed.ID)
+		if getErr != nil {
+			return db.Job{}, false, getErr
+		}
+		return latest, false, nil
+	}
+	return finishStaleHeadSupersede(ctx, store, observed)
+}
+
+func staleHeadSupersedeReason(reason string) string {
+	if reason = strings.TrimSpace(reason); reason != "" {
+		return reason
+	}
+	return "review job superseded by newer pull request head"
+}
+
+// finishStaleHeadSupersede runs the abort cleanup a stale-head supersession
+// owes, with CancelJob's symmetry: a review created by the router carries the
+// exact-head read-only worktree allocated before enqueue (#739), and an abort
+// skips its terminal cleanup, so it is marked for the daemon's reclaim pass.
+func finishStaleHeadSupersede(ctx context.Context, store *db.Store, job db.Job) (db.Job, bool, error) {
 	if payload, perr := DecodeJobPayload(job); perr == nil {
 		recordReadOnlyWorktreeReclaimOnAbort(ctx, store, job, payload)
 	}

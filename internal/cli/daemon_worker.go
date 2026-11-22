@@ -111,6 +111,12 @@ type jobWorker struct {
 	// it is a shared pointer across all per-repo dispatch passes so the cap is
 	// process-global (host-global for the normal single-daemon deployment).
 	Admission *admissionBudget
+	// reviewHolds remembers the review overlap holds (#2726) this worker's
+	// scheduler has already recorded, so a held review costs one event write and
+	// not one per pass. It is a shared pointer, like Admission, so every per-repo
+	// pass of one daemon sees the same record. nil (a hand-built test worker)
+	// only means each pass asks the store, which dedups the event itself.
+	reviewHolds *reviewHoldLog
 	// EventSinkOverride lets a test inject a recording events.Sink (#446). When
 	// nil (production), eventSink() resolves the shared event-rule sink.
 	EventSinkOverride events.Sink
@@ -179,7 +185,7 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	// replaced, and it is the same argument that chose a file sentinel over a
 	// store row - a guard must not depend on the thing it is protecting.
 	// Owner-ruled (#2096 round 3): resolve at start or degrade non-fatally.
-	worker := jobWorker{Store: store, Stdout: serializeWrites(stdout), ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
+	worker := jobWorker{Store: store, Stdout: serializeWrites(stdout), ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit, reviewHolds: newReviewHoldLog()}
 	if sentinel, err := daemonDrainSentinelPath(configHome); err != nil {
 		// NON-FATAL AND ANNOUNCED. A daemon that cannot resolve its own home is
 		// already broken, but refusing all dispatch here would be the larger

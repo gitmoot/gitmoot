@@ -70,12 +70,16 @@ status` shows that it is running.
    (same repository and number) is running or queued ahead of it. It
    dispatches once that one ends, so its frozen prior-verdict list includes
    that verdict and can answer its findings. `gitmoot run show <run-id>`
-   shows `review_held_for_running_review` naming the review it waits on. If
-   you push again while it waits, only the newest head's request is kept:
-   older waiting requests for the same question end as `superseded_stale_head`.
-   The running review is never cut short by this, and the wait ends when it
-   does, at the latest at its own timeout. Reviews of the same head, and
-   reviews of other pull requests, never wait on each other.
+   shows `review_held_for_running_review` naming the review it waits on. While
+   it waits it holds no lock and spends nothing; a local review keeps the
+   worktree it was created with. If you push again while it waits, and a
+   waiting request for the same question is at the pull request's current
+   head, the waiting requests for older heads end as `superseded_stale_head`;
+   with the current head unknown they dispatch one after another. The running
+   review is never cut short by this, and the wait ends when it does, at the
+   latest at its own timeout. Reviews of the same head, reviews of other pull
+   requests, and, under `daemon --session`, queued reviews outside the session
+   never wait on each other.
 5. On `approved` at the current head with green CI, the gate merges (when
    automatic merge is on) or a `/gitmoot merge` comment asks it to (when it is
    off, and your role's `merge_rule` is `self`). If it holds, the reason names

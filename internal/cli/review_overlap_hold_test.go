@@ -50,9 +50,9 @@ func newOverlapHoldHarness(t *testing.T) *overlapHoldHarness {
 	h := &overlapHoldHarness{t: t, ctx: context.Background(), store: store, home: home, checkedOut: map[string]bool{}}
 	worker := blockerE2EWorker(store, home, checkout)
 	validate := worker.CheckoutValidator
-	// The checkout validator is the first per-job resource step of worker.run
-	// (worktree, checkout lock and remote admission all follow it), so a job it
-	// never sees took none of them.
+	// The checkout validator is the first per-job step of worker.run; the
+	// checkout lock, runtime lock and remote admission all follow it, so a job
+	// it never sees took none of them.
 	worker.CheckoutValidator = func(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent) (string, error) {
 		h.mu.Lock()
 		h.checkedOut[job.ID] = true
@@ -81,10 +81,22 @@ func (a overlapRecordingAdapter) Deliver(ctx context.Context, _ runtime.Agent, j
 
 func (h *overlapHoldHarness) enqueue(id, repo string, pr int, head string) {
 	h.t.Helper()
-	enqueueDaemonWorkerJob(h.t, h.store, workflow.JobRequest{
-		ID: id, Agent: "reviewer-" + strings.Split(repo, "/")[0], Action: "review", Repo: repo,
-		Branch: "feature", PullRequest: pr, HeadSHA: head, ReviewPurpose: "code",
-	})
+	h.enqueueRequest(workflow.JobRequest{ID: id, Repo: repo, PullRequest: pr, HeadSHA: head})
+}
+
+func (h *overlapHoldHarness) enqueueRequest(request workflow.JobRequest) {
+	h.t.Helper()
+	request.Agent = "reviewer-" + strings.Split(request.Repo, "/")[0]
+	request.Action, request.Branch, request.ReviewPurpose = "review", "feature", "code"
+	enqueueDaemonWorkerJob(h.t, h.store, request)
+}
+
+// setStoredHead records the pull request's current head as the PR watcher does.
+func (h *overlapHoldHarness) setStoredHead(repo string, pr int, head string) {
+	h.t.Helper()
+	if err := h.store.UpsertPullRequest(h.ctx, db.PullRequest{RepoFullName: repo, Number: int64(pr), HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, State: "open"}); err != nil {
+		h.t.Fatal(err)
+	}
 }
 
 // startRunning claims a queued review as the daemon does when it dispatches
@@ -122,6 +134,30 @@ func (h *overlapHoldHarness) pass() {
 	if err := runQueuedJobsForRepo(h.ctx, h.worker, 4, "", ""); err != nil {
 		h.t.Fatalf("dispatch pass: %v", err)
 	}
+}
+
+// filter runs the hold alone over a fresh queue snapshot, as the dispatch
+// listing does, and returns the ids it lets through.
+func (h *overlapHoldHarness) filter(holds *reviewHoldLog, rootFilter string) map[string]bool {
+	h.t.Helper()
+	queued, err := h.store.ListQueuedJobs(h.ctx)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return h.filterSnapshot(holds, queued, rootFilter)
+}
+
+func (h *overlapHoldHarness) filterSnapshot(holds *reviewHoldLog, queued []db.Job, rootFilter string) map[string]bool {
+	h.t.Helper()
+	kept, err := holdOverlappingReviews(h.ctx, h.store, holds, queued, "", rootFilter, true)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, job := range kept {
+		ids[job.ID] = true
+	}
+	return ids
 }
 
 func (h *overlapHoldHarness) delivery(id string) (overlapDelivery, bool) {
@@ -163,8 +199,8 @@ var (
 )
 
 // A review of a new head requested while a review of the same PR runs is not
-// claimed, takes no resources, and dispatches after the first settles, with
-// the first review's finding in its prior-verdict list (#2726).
+// claimed, takes no lock, and dispatches after the first settles, with the
+// first review's finding in its prior-verdict list (#2726).
 func TestReviewHeldForRunningReviewDispatchesWithItsVerdict(t *testing.T) {
 	h := newOverlapHoldHarness(t)
 	h.enqueue("review-1", "owner/repo", 12, overlapHeadA)
@@ -179,7 +215,7 @@ func TestReviewHeldForRunningReviewDispatchesWithItsVerdict(t *testing.T) {
 		t.Fatalf("held review-2 state = %q, want queued", got)
 	}
 	if h.checkedOut["review-2"] {
-		t.Fatal("held review-2 reached checkout validation: a held review must take no resources")
+		t.Fatal("held review-2 reached checkout validation: a held review must take no lock")
 	}
 
 	h.settleWithFinding("review-1", "PRIOR-FINDING-2726")
@@ -193,28 +229,34 @@ func TestReviewHeldForRunningReviewDispatchesWithItsVerdict(t *testing.T) {
 	}
 }
 
-// Running A, then head B queued, then head C queued: B is superseded through
-// the stale-head path and C runs once A settles.
-func TestReviewHoldKeepsOnlyTheNewestHeldHead(t *testing.T) {
+// Running A, stored head C, then head B queued, then head C queued: B is
+// superseded through the stale-head path, its dispatch-time worktree is marked
+// for reclaim, and C runs once A settles.
+func TestReviewHoldKeepsOnlyTheCurrentHeadHeldReview(t *testing.T) {
 	h := newOverlapHoldHarness(t)
 	h.enqueue("review-a", "owner/repo", 12, overlapHeadA)
 	h.startRunning("review-a")
-	h.enqueue("review-b", "owner/repo", 12, overlapHeadB)
+	h.setStoredHead("owner/repo", 12, overlapHeadC)
+	worktree := t.TempDir()
+	h.enqueueRequest(workflow.JobRequest{ID: "review-b", Repo: "owner/repo", PullRequest: 12, HeadSHA: overlapHeadB, WorktreePath: worktree, ReadOnlyWorktree: true, ReadOnlySeat: true})
 	h.enqueue("review-c", "owner/repo", 12, overlapHeadC)
 
 	h.pass()
 	if got := h.state("review-b"); got != string(workflow.JobCancelled) {
-		t.Fatalf("older held review-b state = %q, want cancelled (superseded)", got)
+		t.Fatalf("off-head held review-b state = %q, want cancelled (superseded)", got)
 	}
 	superseded := h.events("review-b", workflow.JobEventSupersededStaleHead)
 	if len(superseded) != 1 || !strings.Contains(superseded[0].Message, "review-c") || !strings.Contains(superseded[0].Message, "review-a") {
 		t.Fatalf("review-b supersede events = %+v, want one naming review-c and review-a", superseded)
 	}
+	if reclaim := h.events("review-b", "delegation_worktree_cleanup_skipped"); len(reclaim) != 1 || !strings.Contains(reclaim[0].Message, worktree) {
+		t.Fatalf("review-b reclaim markers = %+v, want one for its worktree %s", reclaim, worktree)
+	}
 	if got := h.state("review-a"); got != string(workflow.JobRunning) {
 		t.Fatalf("running review-a state = %q: a running review must not be superseded by the hold", got)
 	}
 	if got := h.state("review-c"); got != string(workflow.JobQueued) {
-		t.Fatalf("newest held review-c state = %q, want queued", got)
+		t.Fatalf("current-head held review-c state = %q, want queued", got)
 	}
 	if _, delivered := h.delivery("review-c"); delivered {
 		t.Fatal("review-c dispatched while review-a was running")
@@ -227,6 +269,87 @@ func TestReviewHoldKeepsOnlyTheNewestHeldHead(t *testing.T) {
 	}
 	if _, delivered := h.delivery("review-b"); delivered {
 		t.Fatal("superseded review-b dispatched")
+	}
+}
+
+// Queue order alone never cancels: with no stored head nothing is superseded,
+// and with the stored head at B, a later request for the older head C is the
+// one superseded while B survives.
+func TestReviewHoldNeverSupersedesTheCurrentHeadForQueueOrder(t *testing.T) {
+	h := newOverlapHoldHarness(t)
+	h.enqueue("review-a", "owner/repo", 12, overlapHeadA)
+	h.startRunning("review-a")
+	h.enqueue("review-b", "owner/repo", 12, overlapHeadB)
+	h.enqueue("review-c", "owner/repo", 12, overlapHeadC)
+
+	if kept := h.filter(nil, ""); kept["review-b"] || kept["review-c"] {
+		t.Fatalf("held reviews passed the filter: %v", kept)
+	}
+	for _, id := range []string{"review-b", "review-c"} {
+		if got := h.state(id); got != string(workflow.JobQueued) {
+			t.Fatalf("with no stored head %s state = %q, want queued", id, got)
+		}
+	}
+
+	h.setStoredHead("owner/repo", 12, overlapHeadB)
+	h.filter(nil, "")
+	if got := h.state("review-b"); got != string(workflow.JobQueued) {
+		t.Fatalf("current-head review-b state = %q, want queued: queue order cancelled the current head", got)
+	}
+	if got := h.state("review-c"); got != string(workflow.JobCancelled) {
+		t.Fatalf("off-head review-c state = %q, want cancelled", got)
+	}
+}
+
+// A review a worker claimed after the queue snapshot is never cancelled by a
+// decision made from that snapshot.
+func TestReviewHoldLeavesAJobClaimedAfterTheSnapshotRunning(t *testing.T) {
+	h := newOverlapHoldHarness(t)
+	h.enqueue("review-a", "owner/repo", 12, overlapHeadA)
+	h.startRunning("review-a")
+	h.setStoredHead("owner/repo", 12, overlapHeadC)
+	h.enqueue("review-b", "owner/repo", 12, overlapHeadB)
+	h.enqueue("review-c", "owner/repo", 12, overlapHeadC)
+
+	snapshot, err := h.store.ListQueuedJobs(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.startRunning("review-b")
+	kept := h.filterSnapshot(nil, snapshot, "")
+	if got := h.state("review-b"); got != string(workflow.JobRunning) {
+		t.Fatalf("review-b claimed after the snapshot is %q, want running", got)
+	}
+	if events := h.events("review-b", workflow.JobEventSupersededStaleHead); len(events) != 0 {
+		t.Fatalf("claimed review-b carries supersede events %+v", events)
+	}
+	if kept["review-b"] || kept["review-c"] {
+		t.Fatalf("filter let through %v; review-b is no longer queued and review-c is held", kept)
+	}
+}
+
+// Under daemon --session, a queued review outside the session neither holds
+// nor supersedes one inside it. A running review still holds across scopes.
+func TestReviewHoldIgnoresQueuedReviewsOutsideTheSession(t *testing.T) {
+	h := newOverlapHoldHarness(t)
+	h.enqueue("review-outside", "owner/repo", 12, overlapHeadA)
+	h.enqueueRequest(workflow.JobRequest{ID: "review-session", Repo: "owner/repo", PullRequest: 12, HeadSHA: overlapHeadB, RootJobID: "session-b"})
+
+	if kept := h.filter(nil, "session-b"); !kept["review-session"] {
+		t.Fatalf("filter kept %v: review-session was held by a review outside its session", kept)
+	}
+
+	h.enqueue("review-running", "owner/repo", 12, overlapHeadC)
+	h.startRunning("review-running")
+	h.setStoredHead("owner/repo", 12, overlapHeadA)
+	if kept := h.filter(nil, "session-b"); kept["review-session"] {
+		t.Fatal("review-session passed while a review of the same PR was running")
+	}
+	if got := h.state("review-session"); got != string(workflow.JobQueued) {
+		t.Fatalf("review-session state = %q: a review outside the session superseded it", got)
+	}
+	if got := h.state("review-outside"); got != string(workflow.JobQueued) {
+		t.Fatalf("review-outside state = %q: the session pass touched a review outside it", got)
 	}
 }
 
@@ -255,7 +378,38 @@ func TestReviewHoldIsScopedToTheSamePullRequestOfTheSameRepo(t *testing.T) {
 	}
 }
 
-// The held review carries one event naming the running review, and the
+// One event per (held review, holder): the holder moving from queued to
+// running writes no second event, and the scheduler's hold log forgets the
+// hold once it ends.
+func TestReviewHoldEventIsKeyedOnHeldAndHolderIdentity(t *testing.T) {
+	h := newOverlapHoldHarness(t)
+	h.enqueue("review-first", "owner/repo", 12, overlapHeadA)
+	h.enqueue("review-held", "owner/repo", 12, overlapHeadB)
+	holds := newReviewHoldLog()
+
+	// No hold log on the first two passes: the store alone must dedup on the
+	// identity, as it does after a daemon restart.
+	h.filter(nil, "")
+	h.startRunning("review-first")
+	h.filter(nil, "")
+	if events := h.events("review-held", reviewHeldForRunningReviewEventKind); len(events) != 1 {
+		t.Fatalf("hold events = %+v, want one for the one holder", events)
+	}
+	h.filter(holds, "")
+	if got := holds.held["review-held"]; got != "review-first" {
+		t.Fatalf("hold log entry = %q, want review-first", got)
+	}
+
+	h.settleWithFinding("review-first", "FINDING-FIRST")
+	if kept := h.filter(holds, ""); !kept["review-held"] {
+		t.Fatal("review-held still held after its holder settled")
+	}
+	if len(holds.held) != 0 {
+		t.Fatalf("hold log kept %v after the hold ended", holds.held)
+	}
+}
+
+// The held review carries an event naming the running review, and the
 // stalled-PR check counts it as a review in progress at its head.
 func TestReviewHeldEventNamesHolderAndIsNotStalled(t *testing.T) {
 	h := newOverlapHoldHarness(t)
@@ -266,7 +420,7 @@ func TestReviewHeldEventNamesHolderAndIsNotStalled(t *testing.T) {
 	h.pass()
 	h.pass()
 	events := h.events("review-held", reviewHeldForRunningReviewEventKind)
-	if len(events) != 1 || !strings.Contains(events[0].Message, "review-running") || !strings.Contains(events[0].Message, "running") {
+	if len(events) != 1 || !strings.Contains(events[0].Message, "review-running") {
 		t.Fatalf("hold events = %+v, want exactly one naming review-running", events)
 	}
 
