@@ -145,4 +145,27 @@ func TestRemoteReviewFetchesExactSourceWithoutHostCheckout(t *testing.T) {
 	if got := strings.TrimSpace(result.Stdout); got != head {
 		t.Fatalf("runtime saw head %s, want %s", got, head)
 	}
+
+	// #2736: a failed preparation carries the failing step and git's own error
+	// through the real envd path, without leaking the source credentials.
+	failing, err := backend.Provision(ctx, execbackend.JobScope{JobID: "source-review-missing-base", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Destroy(ctx, failing)
+	materials.RemoteReview.BaseRef = "no-such-branch"
+	err = backend.SyncIn(ctx, failing, materials)
+	if err == nil {
+		t.Fatal("source preparation succeeded with a missing base branch")
+	}
+	for _, want := range []string{"prepare exact remote review source", "step fetch-head-and-base-ref failed", "no-such-branch"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("preparation error %q lacks %q", err, want)
+		}
+	}
+	for _, secret := range []string{upstreamSecret, material.Capability, material.Placeholder} {
+		if secret != "" && strings.Contains(err.Error(), secret) {
+			t.Fatalf("preparation error leaks source credential material: %q", err)
+		}
+	}
 }
