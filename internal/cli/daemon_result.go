@@ -735,7 +735,15 @@ func jobResultDiagnostic(cause error) string {
 	return cause.Error()
 }
 
+// daemonJobPayloadObserver is a test hook fired on every payload decode. nil in
+// production. It makes the scheduler's per-pass decode count (#2735), which a
+// profile shows only as CPU share, a number a test can assert.
+var daemonJobPayloadObserver func()
+
 func daemonJobPayload(job db.Job) (workflow.JobPayload, error) {
+	if daemonJobPayloadObserver != nil {
+		daemonJobPayloadObserver()
+	}
 	var payload workflow.JobPayload
 	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
 		return workflow.JobPayload{}, fmt.Errorf("parse job payload %q: %w", job.ID, err)

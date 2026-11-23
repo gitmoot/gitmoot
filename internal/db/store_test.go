@@ -2582,7 +2582,7 @@ func TestListQueuedJobsUsesQueuedIndex(t *testing.T) {
 		}
 	}
 
-	plan := explainQueryPlan(t, store, listQueuedJobsSQL)
+	plan := explainQueryPlan(t, store, listQueuedJobsSQL, "", "", "", "", "")
 	if !strings.Contains(plan, "USING INDEX idx_jobs_queued_created") {
 		t.Fatalf("ListQueuedJobs plan does not use idx_jobs_queued_created:\n%s", plan)
 	}
@@ -2605,6 +2605,67 @@ func TestListQueuedJobsUsesQueuedIndex(t *testing.T) {
 		if job.State != "queued" {
 			t.Fatalf("job[%d].State = %q, want queued only", i, job.State)
 		}
+	}
+}
+
+// TestListQueuedJobsInScopeReadsTheQueuedIndex pins the per-repo dispatch
+// listing (#2735): with a repo and a session root bound it reads the queued
+// partial index in created_at order (no sort, no automatic index), returns the
+// repo's rows, a session's root and members, and keeps a row whose repo or
+// root_id column is empty for the caller to settle.
+func TestListQueuedJobsInScopeReadsTheQueuedIndex(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	seed := []Job{
+		{ID: "a1", State: "queued", Payload: `{"repo":"owner/a"}`},
+		{ID: "b1", State: "queued", Payload: `{"repo":"owner/b"}`},
+		{ID: "a-upper", State: "queued", Payload: `{"repo":"Owner/A"}`},
+		{ID: "a-child", State: "queued", Payload: `{"repo":"owner/a","root_job_id":"a1"}`},
+		{ID: "a-legacy", State: "queued", Payload: `{"repo":"owner/a"}`},
+		{ID: "a-running", State: "running", Payload: `{"repo":"owner/a"}`},
+	}
+	for _, job := range seed {
+		job.Agent, job.Type = "a", "ask"
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", job.ID, err)
+		}
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET repo = '', root_id = '' WHERE id = 'a-legacy'`); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]any{{"owner/a", "owner/a", "", "", ""}, {"owner/a", "owner/a", "a1", "a1", "a1"}} {
+		plan := explainQueryPlan(t, store, listQueuedJobsSQL, args...)
+		if !strings.Contains(plan, "USING INDEX idx_jobs_queued_created") || strings.Contains(plan, "TEMP B-TREE") || strings.Contains(plan, "AUTOMATIC") {
+			t.Fatalf("scoped queued listing plan with %v does not read the queued index in order:\n%s", args, plan)
+		}
+	}
+	ids := func(repo, root string) string {
+		t.Helper()
+		jobs, err := store.ListQueuedJobsInScope(ctx, repo, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, job := range jobs {
+			out = append(out, job.ID)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := ids(" owner/a ", ""); got != "a1,a-child,a-legacy" {
+		t.Fatalf("repo owner/a = %s, want a1,a-child,a-legacy (exact repo, plus the row whose column is empty)", got)
+	}
+	if got := ids("owner/a", "a1"); got != "a1,a-child,a-legacy" {
+		t.Fatalf("repo owner/a, root a1 = %s, want the root, its member, and the row whose columns are empty", got)
+	}
+	if got := ids("", "a-child"); got != "a-child,a-legacy" {
+		t.Fatalf("root a-child = %s, want the job itself and the row whose root_id is empty", got)
+	}
+	if got := ids("", ""); got != "a1,b1,a-upper,a-child,a-legacy" {
+		t.Fatalf("unscoped = %s, want every queued row", got)
 	}
 }
 

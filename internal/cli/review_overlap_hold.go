@@ -213,7 +213,7 @@ func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewH
 	}
 	if len(queuedKeys) == 0 && !unprojected {
 		if act {
-			holds.sweep(jobs, nil)
+			holds.sweep(jobs, nil, repoFilter, rootFilter)
 		}
 		return jobs, nil
 	}
@@ -277,13 +277,13 @@ func holdOverlappingReviews(ctx context.Context, store *db.Store, holds *reviewH
 		}
 		anyHeld = true
 		if act {
-			if err := holds.record(ctx, store, job.ID, holder.job.ID, reviewOverlapHeldMessage(key, entry.head, holder)); err != nil {
+			if err := holds.record(ctx, store, job.ID, holder.job.ID, payload, reviewOverlapHeldMessage(key, entry.head, holder)); err != nil {
 				return nil, err
 			}
 		}
 	}
 	if act {
-		holds.sweep(jobs, held)
+		holds.sweep(jobs, held, repoFilter, rootFilter)
 	}
 	if !anyHeld {
 		return jobs, nil
@@ -306,24 +306,28 @@ func reviewOverlapHeldMessage(key, head string, holder *reviewOverlapEntry) stri
 }
 
 // reviewHoldLog is one scheduler's record of the holds it has written: held job
-// id to holder job id. It saves an event write per pass for a hold already
-// recorded; the store's dedupe (on a message that is a function of the same
-// identity) stays the source of truth across restarts. Every dispatch listing
-// prunes it, so it never outgrows the queue. A nil log records every pass and
-// remembers nothing.
+// id to holder job id, with the held job's repo and session root. It saves an
+// event write per pass for a hold already recorded; the store's dedupe (on a
+// message that is a function of the same identity) stays the source of truth
+// across restarts. Every dispatch listing prunes the holds in its scope, so it
+// never outgrows the queue. A nil log records every pass and remembers nothing.
 type reviewHoldLog struct {
 	mu   sync.Mutex
-	held map[string]string
+	held map[string]reviewHoldLogEntry
+}
+
+type reviewHoldLogEntry struct {
+	holder, repo, root string
 }
 
 func newReviewHoldLog() *reviewHoldLog {
-	return &reviewHoldLog{held: map[string]string{}}
+	return &reviewHoldLog{held: map[string]reviewHoldLogEntry{}}
 }
 
-func (l *reviewHoldLog) record(ctx context.Context, store *db.Store, heldID, holderID, message string) error {
+func (l *reviewHoldLog) record(ctx context.Context, store *db.Store, heldID, holderID string, payload workflow.JobPayload, message string) error {
 	if l != nil {
 		l.mu.Lock()
-		recorded := l.held[heldID] == holderID
+		recorded := l.held[heldID].holder == holderID
 		l.mu.Unlock()
 		if recorded {
 			return nil
@@ -334,17 +338,18 @@ func (l *reviewHoldLog) record(ctx context.Context, store *db.Store, heldID, hol
 	}
 	if l != nil {
 		l.mu.Lock()
-		l.held[heldID] = holderID
+		l.held[heldID] = reviewHoldLogEntry{holder: holderID, repo: payload.Repo, root: payload.RootJobID}
 		l.mu.Unlock()
 	}
 	return nil
 }
 
 // sweep evicts every hold that has ended: the held job left the queue, or this
-// pass weighed it (weighed[id] present) and it is no longer held. A hold this
-// pass did not weigh (a job outside its repo or session filter) is kept for the
-// pass that does.
-func (l *reviewHoldLog) sweep(queued []db.Job, weighed map[string]bool) {
+// pass weighed it (weighed[id] present) and it is no longer held. queued is the
+// pass's queue, scoped to repoFilter and rootFilter (#2735), so only a hold on
+// a job in that scope is evicted for being absent from it; a hold outside the
+// scope, or one this pass did not weigh, is kept for the pass that does.
+func (l *reviewHoldLog) sweep(queued []db.Job, weighed map[string]bool, repoFilter, rootFilter string) {
 	if l == nil {
 		return
 	}
@@ -357,8 +362,11 @@ func (l *reviewHoldLog) sweep(queued []db.Job, weighed map[string]bool) {
 	for _, job := range queued {
 		stillQueued[job.ID] = true
 	}
-	for heldID := range l.held {
-		if stillHeld, wasWeighed := weighed[heldID]; !stillQueued[heldID] || (wasWeighed && !stillHeld) {
+	repoFilter, rootFilter = strings.TrimSpace(repoFilter), strings.TrimSpace(rootFilter)
+	for heldID, entry := range l.held {
+		inScope := (repoFilter == "" || entry.repo == repoFilter) &&
+			(rootFilter == "" || heldID == rootFilter || entry.root == rootFilter)
+		if stillHeld, wasWeighed := weighed[heldID]; (inScope && !stillQueued[heldID]) || (wasWeighed && !stillHeld) {
 			delete(l.held, heldID)
 		}
 	}

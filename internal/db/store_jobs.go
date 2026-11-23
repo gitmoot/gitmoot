@@ -656,19 +656,47 @@ func (s *Store) SumJobTokensByRoot(ctx context.Context, rootID string) (int, err
 	return total, err
 }
 
-// listQueuedJobsSQL is ListQueuedJobs' exact query, exported as a package-level const
-// so the plan test (TestListQueuedJobsUsesQueuedIndex) can EXPLAIN QUERY PLAN the
-// PRODUCTION text rather than a hand-copied duplicate — a change to this query is then
-// what the test actually asserts a plan for.
-const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, repo, pull_request, lifecycle_generation
-		FROM jobs WHERE state = 'queued' AND externally_driven = 0 ORDER BY created_at, rowid`
+// listQueuedJobsSQL is ListQueuedJobsInScope's exact query, exported as a
+// package-level const so the plan tests (TestListQueuedJobsUsesQueuedIndex,
+// TestListQueuedJobsInScopeReadsTheQueuedIndex) EXPLAIN QUERY PLAN the
+// PRODUCTION text rather than a hand-copied duplicate.
+//
+// Its arguments are (repo, repo, root, root, root); an empty repo or root means
+// no filter on it. The repo test is exact and case-sensitive, as the
+// scheduler's payload check (payload.Repo == repo) is: every writer of a job
+// payload writes the repo column from the same payload (jobProjectionFromPayload)
+// and migrations backfilled older rows from json_extract, so the column equals
+// payload.repo. The root test is the session rule: the job is the root itself,
+// or root_id (payload root_job_id, else the job id, written at insert and
+// backfilled by backfillJobRootID) is the root. A row with an empty repo or
+// root_id column is kept either way, so a caller that must be exact on a row
+// the projection never reached decodes it (#2735).
+//
+// INDEXED BY pins the plan to the queued partial index in created_at order, as
+// listQueuedJobsForRepoSQL does: today's planner picks it unaided, but with a
+// repo bound idx_jobs_repo is a candidate, and it walks every job the repo has
+// ever had and sorts them.
+const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, repo, pull_request, root_id, lifecycle_generation
+		FROM jobs INDEXED BY idx_jobs_queued_created
+		WHERE state = 'queued' AND externally_driven = 0
+		AND (? = '' OR repo = ? OR repo = '')
+		AND (? = '' OR root_id = ? OR id = ? OR root_id = '')
+		ORDER BY created_at, rowid`
 
-// ListQueuedJobs returns the queued jobs in created_at (then rowid) order. The
-// state predicate is the SQL literal 'queued' — not a bound parameter — so SQLite
-// can prove it matches the partial index idx_jobs_queued_created (WHERE
-// state='queued') and read the queued rows in order directly; a bound `state = ?`
-// leaves the planner unable to prove the partial predicate, so it full-scans jobs
-// and builds a temp b-tree for the ORDER BY every worker tick (#619, verified by
+// ListQueuedJobs returns every queued job in created_at (then rowid) order:
+// ListQueuedJobsInScope with no repo and no root.
+func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
+	return s.ListQueuedJobsInScope(ctx, "", "")
+}
+
+// ListQueuedJobsInScope returns the queued jobs of repo (all repos when empty)
+// in the coordination tree rooted at root (all when empty), in created_at
+// (then rowid) order, as listQueuedJobsSQL describes. The state predicate is
+// the SQL literal 'queued' — not a bound parameter — so SQLite can prove it
+// matches the partial index idx_jobs_queued_created (WHERE state='queued') and
+// read the queued rows in order directly; a bound `state = ?` leaves the
+// planner unable to prove the partial predicate, so it full-scans jobs and
+// builds a temp b-tree for the ORDER BY every worker tick (#619, verified by
 // EXPLAIN QUERY PLAN). 'queued' is a fixed constant, so inlining it is safe.
 //
 // The `externally_driven = 0` predicate defends the session-job invariant (#657):
@@ -679,11 +707,12 @@ const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, model, parent
 // belt-and-suspenders guard mirroring the reaper's exemption below. It is a residual
 // filter on top of the partial-index scan, so the query plan is unchanged.
 //
-// The denormalized repo and pull_request columns ride along so the review
-// overlap hold (#2726) can match a queued review to a running one without
-// decoding its payload.
-func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, listQueuedJobsSQL)
+// The denormalized repo, pull_request and root_id columns ride along so the
+// scheduler can scope and the review overlap hold (#2726) can match a queued
+// review to a running one without decoding payloads.
+func (s *Store) ListQueuedJobsInScope(ctx context.Context, repo, root string) ([]Job, error) {
+	repo, root = strings.TrimSpace(repo), strings.TrimSpace(root)
+	rows, err := s.db.QueryContext(ctx, listQueuedJobsSQL, repo, repo, root, root, root)
 	if err != nil {
 		return nil, err
 	}
@@ -692,7 +721,7 @@ func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.Repo, &job.PullRequest, &job.LifecycleGeneration); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.Repo, &job.PullRequest, &job.RootID, &job.LifecycleGeneration); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)

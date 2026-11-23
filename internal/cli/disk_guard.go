@@ -224,17 +224,14 @@ func diskGuardPaths(worker jobWorker) (config.Paths, error) {
 // diskGuardQueuedDispatch applies the source-host floor to every delivery,
 // including E2B reviews that still write controller state. Above that floor,
 // the warning band routes reviews before Janitor's fresh-space admission.
-// Maintenance and reconciliation remain outside this new-work guard.
-func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) []db.Job {
-	matching := make([]db.Job, 0, len(jobs))
-	for _, job := range jobs {
-		if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {
-			matching = append(matching, job)
-		}
-	}
-	if len(matching) == 0 {
+// Maintenance and reconciliation remain outside this new-work guard. jobs is
+// one scheduling pass's queue, already scoped to its repo and session by
+// listPendingQueuedJobs (#2735), so every job is the guard's to decide.
+func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job) []db.Job {
+	if len(jobs) == 0 {
 		return jobs
 	}
+	matching := jobs
 
 	paths, err := diskGuardPaths(worker)
 	var evaluation diskGuardEvaluation

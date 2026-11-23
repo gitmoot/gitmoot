@@ -2678,7 +2678,7 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 		// run, which can take a long time; re-ask janitor before each later batch
 		// so a hold that began meanwhile stops new preparation.
 		if !listed {
-			if pending = janitorPressureQueuedDispatch(ctx, worker, pending, repoFilter, rootFilter); len(pending) == 0 {
+			if pending = janitorPressureQueuedDispatch(ctx, worker, pending); len(pending) == 0 {
 				return nil
 			}
 		}
@@ -2880,10 +2880,15 @@ const daemonRestartEnvCaveat = "note: Claude runtime auth is read per delivery f
 // promises. A within-pass cache dedupes the probe across auth-held jobs of the same
 // runtime so one outage costs at most one live probe per pass.
 func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, forDispatch bool) ([]db.Job, error) {
-	jobs, err := worker.Store.ListQueuedJobs(ctx)
+	// #2735: read only this pass's repo and session in SQL, then settle exactly
+	// the rows the projected columns could not (queuedJobsInScope). Every step
+	// below sees exactly the in-scope queued jobs, so the disk guard and janitor
+	// need no scope check of their own.
+	jobs, err := worker.Store.ListQueuedJobsInScope(ctx, repoFilter, rootFilter)
 	if err != nil {
 		return nil, err
 	}
+	jobs = queuedJobsInScope(jobs, repoFilter, rootFilter)
 	// #2726: a review waits while another review of the same (repo, PR) at a
 	// different head is running, or dispatched by this process and not yet
 	// reaped, so its prior-verdict list, rendered at dispatch, has that
@@ -2927,16 +2932,20 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		// and every other job keeps dispatching. This runs after the drain check,
 		// because switching a review is a durable change that
 		// must not happen while dispatch is off.
-		jobs = diskGuardQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter)
+		jobs = diskGuardQueuedDispatch(ctx, worker, jobs)
 		if len(jobs) == 0 {
 			return nil, nil
 		}
 		// #2359: default-off janitor pressure admission, after the disk guard so
 		// its own floors still decide first. Off = no janitor process at all.
-		jobs = janitorPressureQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter)
+		jobs = janitorPressureQueuedDispatch(ctx, worker, jobs)
 		if len(jobs) == 0 {
 			return nil, nil
 		}
+	}
+	// Nothing in scope: the role read below would go unused.
+	if len(jobs) == 0 {
+		return nil, nil
 	}
 	unavailableRows, err := worker.Store.ListActiveOrgRolesUnavailable(ctx, time.Now().UTC())
 	if err != nil {
@@ -3855,6 +3864,36 @@ func queuedDecodedJobMatchesSession(jobID string, payload workflow.JobPayload, d
 		return true
 	}
 	return decodeErr == nil && payload.RootJobID == rootFilter
+}
+
+// queuedJobsInScope finishes Store.ListQueuedJobsInScope's scoping exactly. A
+// row it returned with a non-empty repo column has that column equal to the
+// filter, and with a non-empty root_id column has the job or its root equal to
+// the session filter, which is queuedJobMatchesRepo/Session's answer without a
+// decode (the columns are projected from the same payload). Only a row whose
+// column is empty, which the query keeps so it can be settled here, is decoded
+// and checked as those functions would. jobs is filtered in place.
+func queuedJobsInScope(jobs []db.Job, repoFilter, rootFilter string) []db.Job {
+	repoFilter, rootFilter = strings.TrimSpace(repoFilter), strings.TrimSpace(rootFilter)
+	if repoFilter == "" && rootFilter == "" {
+		return jobs
+	}
+	kept := jobs[:0]
+	for _, job := range jobs {
+		repoUnknown := repoFilter != "" && job.Repo == ""
+		rootUnknown := rootFilter != "" && job.RootID == "" && job.ID != rootFilter
+		if repoUnknown || rootUnknown {
+			payload, err := daemonJobPayload(job)
+			if repoUnknown && (err != nil || !queuedPayloadMatchesRepo(payload, repoFilter)) {
+				continue
+			}
+			if rootUnknown && !queuedDecodedJobMatchesSession(job.ID, payload, err, rootFilter) {
+				continue
+			}
+		}
+		kept = append(kept, job)
+	}
+	return kept
 }
 
 func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) string {

@@ -332,7 +332,7 @@ func TestReviewHoldEventIsKeyedOnHeldAndHolderIdentity(t *testing.T) {
 		t.Fatalf("hold events = %+v, want one for the one holder", events)
 	}
 	h.filter(holds, "")
-	if got := holds.held["review-held"]; got != "review-first" {
+	if got := holds.held["review-held"].holder; got != "review-first" {
 		t.Fatalf("hold log entry = %q, want review-first", got)
 	}
 
@@ -347,7 +347,7 @@ func TestReviewHoldEventIsKeyedOnHeldAndHolderIdentity(t *testing.T) {
 	h.enqueue("review-second", "owner/repo", 12, overlapHeadC)
 	h.startRunning("review-second")
 	h.filter(holds, "")
-	if got := holds.held["review-held"]; got != "review-second" {
+	if got := holds.held["review-held"].holder; got != "review-second" {
 		t.Fatalf("hold log entry = %q, want review-second", got)
 	}
 	if moved, err := h.store.TransitionJobState(h.ctx, "review-held", string(workflow.JobQueued), string(workflow.JobCancelled)); err != nil || !moved {

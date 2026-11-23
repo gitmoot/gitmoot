@@ -16,7 +16,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-func diskGuardDispatchFixture(t *testing.T) (context.Context, *db.Store, config.Paths, jobWorker) {
+func diskGuardDispatchFixture(t testing.TB) (context.Context, *db.Store, config.Paths, jobWorker) {
 	t.Helper()
 	ctx := context.Background()
 	home := t.TempDir()
@@ -42,7 +42,7 @@ func diskGuardDispatchFixture(t *testing.T) (context.Context, *db.Store, config.
 	return ctx, store, paths, defaultJobWorker(store, io.Discard, home)
 }
 
-func replaceDiskGuardMeasurement(t *testing.T, fn func(string) (diskFilesystemUsage, error)) {
+func replaceDiskGuardMeasurement(t testing.TB, fn func(string) (diskFilesystemUsage, error)) {
 	t.Helper()
 	original := measureDiskGuardFilesystem
 	measureDiskGuardFilesystem = fn
@@ -203,7 +203,7 @@ func TestDispatchDiskGuardAggregatesAndRateLimitsEventWriteFailures(t *testing.T
 	}
 
 	for range 2 {
-		if len(diskGuardQueuedDispatch(ctx, worker, jobs, "owner/repo", "")) > 0 {
+		if len(diskGuardQueuedDispatch(ctx, worker, jobs)) > 0 {
 			t.Fatal("dispatch allowed below disk floor")
 		}
 	}

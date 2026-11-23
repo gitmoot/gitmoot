@@ -121,7 +121,7 @@ func TestJanitorCapacityDisabledStartsNoProcess(t *testing.T) {
 	ctx, _, _, worker := diskGuardDispatchFixture(t)
 	calls := replaceJanitorStatus(t, "", errors.New("must not run"))
 	jobs := []db.Job{{ID: "queued-job", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`}}
-	if got := janitorPressureQueuedDispatch(ctx, worker, jobs, "", ""); len(got) != 1 {
+	if got := janitorPressureQueuedDispatch(ctx, worker, jobs); len(got) != 1 {
 		t.Fatalf("disabled consumer dropped jobs: %+v", got)
 	}
 	if *calls != 0 {
@@ -151,7 +151,7 @@ func TestJanitorPressureHoldsQueuedWorkUntilRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	replaceJanitorStatus(t, janitorStatusJSON(time.Now().Add(-10*time.Second), 2*time.Minute, janitorTestPolicyHash, volumes("critical", true)...), nil)
-	if got := janitorPressureQueuedDispatch(ctx, worker, []db.Job{job}, "", ""); len(got) != 0 {
+	if got := janitorPressureQueuedDispatch(ctx, worker, []db.Job{job}); len(got) != 0 {
 		t.Fatalf("critical device dispatched %+v", got)
 	}
 	latest, err := store.GetJob(ctx, job.ID)
@@ -170,13 +170,13 @@ func TestJanitorPressureHoldsQueuedWorkUntilRecovery(t *testing.T) {
 	}
 
 	replaceJanitorStatus(t, janitorStatusJSON(time.Now().Add(-10*time.Second), 2*time.Minute, janitorTestPolicyHash, volumes("target_recovered", false)...), nil)
-	if got := janitorPressureQueuedDispatch(ctx, worker, []db.Job{job}, "", ""); len(got) != 1 {
+	if got := janitorPressureQueuedDispatch(ctx, worker, []db.Job{job}); len(got) != 1 {
 		t.Fatalf("recovered device still holds: %+v", got)
 	}
 
 	// Producer unavailable: unknown, so it holds again.
 	replaceJanitorStatus(t, "", errors.New("janitor status timed out after 5s"))
-	if got := janitorPressureQueuedDispatch(ctx, worker, []db.Job{job}, "", ""); len(got) != 0 {
+	if got := janitorPressureQueuedDispatch(ctx, worker, []db.Job{job}); len(got) != 0 {
 		t.Fatalf("unavailable producer admitted %+v", got)
 	}
 }
