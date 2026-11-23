@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"io"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +31,25 @@ func (v *jobScopeVerifier) trusted() bool {
 // can shorten it.
 var jobScopeRepairBackoff = [2]time.Duration{time.Second, time.Minute}
 
+// jobScopeStopTimeout bounds how long stop waits for the repair to return.
+// A var so a test can shorten it.
+var jobScopeStopTimeout = daemonShutdownDrainTimeout
+
+// stopOverrunDiagnostics receives the line a background loop's stop reports
+// when the loop outlives its stop timeout. It is not the worker's output: the
+// loops write there through the serialized writer (output.go), and a write
+// stalled under that writer's mutex is one way a loop outlives the timeout, so
+// a report through the same sink could block the shutdown it bounds (#2739).
+// A var so a test can capture it.
+var stopOverrunDiagnostics io.Writer = os.Stderr
+
+// reportStopOverrun reports that a background loop did not stop within
+// timeout. It writes from its own goroutine, so the stop that calls it returns
+// on time even when stopOverrunDiagnostics stalls too.
+func reportStopOverrun(loop string, timeout time.Duration) {
+	go writeLine(stopOverrunDiagnostics, "gitmoot: %s did not stop within %s", loop, timeout)
+}
+
 // startJobScopeVerifier runs the repair in the background until it succeeds
 // or ctx ends, logging each failure and the success, and returns the verifier
 // the daemon's workers share and a stop that cancels the repair and waits for
@@ -45,12 +65,12 @@ func startJobScopeVerifier(ctx context.Context, store *db.Store, stdout io.Write
 	}()
 	return v, func() {
 		cancel()
-		timer := time.NewTimer(daemonShutdownDrainTimeout)
+		timer := time.NewTimer(jobScopeStopTimeout)
 		defer timer.Stop()
 		select {
 		case <-done:
 		case <-timer.C:
-			writeLine(stdout, "job scope repair did not stop within %s", daemonShutdownDrainTimeout)
+			reportStopOverrun("job scope repair", jobScopeStopTimeout)
 		}
 	}
 }

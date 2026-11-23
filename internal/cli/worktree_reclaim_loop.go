@@ -65,7 +65,7 @@ func startWorktreeReclaimLoop(ctx context.Context, store *db.Store, worker jobWo
 		case <-done:
 			tracker.setReclaimLoopActive(false)
 		case <-timer.C:
-			writeLine(stdout, "worktree reclaim loop did not stop within %s", daemonShutdownDrainTimeout)
+			reportStopOverrun("worktree reclaim loop", daemonShutdownDrainTimeout)
 		}
 	}
 }
