@@ -2689,9 +2689,9 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 	// Preflight (#444): if the config can't actually run same-repo jobs in
 	// parallel (single worker, or the per-tick barrier scheduler) yet ≥2
 	// parallelizable jobs are queued, surface the exact relaunch command instead
-	// of silently serializing them. "Parallelizable" = same repo, dep-unblocked
-	// (already true of queued jobs), and DISTINCT runtime sessions — same-session
-	// jobs serialize on the runtime session lock even under pool, so counting raw
+	// of silently serializing them. "Parallelizable" = the jobs one pool
+	// selection would start at once (parallelizableSerialJobs): same-session jobs
+	// serialize on the runtime session lock even under pool, so counting raw
 	// same-repo jobs would over-warn.
 	if serializingConfig(worker.UsePool, limit) {
 		warnSerializedParallelJobs(ctx, worker, limit, repoFilter, rootFilter)
@@ -2775,12 +2775,20 @@ func serializingConfig(usePool bool, limit int) bool {
 }
 
 // parallelizableSerialJobs counts the queued jobs for this repo/session filter
-// that could run concurrently but won't under a serializing config (#444):
-// distinct runtime sessions among same-repo dep-unblocked queued jobs. Jobs with
-// no resolvable runtime session key are counted individually (each is its own
-// would-be parallel slot). The count is what the preflight warns on (≥2). The
-// returned signature uniquely identifies the parallelizable session set so the
-// preflight can de-duplicate an unchanged backlog across ticks.
+// that could run concurrently but won't under a serializing config (#444): the
+// jobs one pool selection would start at once, with no dispatch limit. It walks
+// the pending jobs through the selector's read-only resource admission, so a
+// job counts only if the selector admits it and only an admitted job takes a
+// checkout, a runtime session or its pull request's review head (#2746). One
+// exception models what the pool adds to the selector: a job the pool would
+// isolate (#394) out of a taken same-repo checkout runs in its own worktree, so
+// that checkout does not decline it. Same-repo serialization of such jobs is
+// what the warning reports; a checkout the pool cannot sidestep (a shared task
+// or review worktree) serializes under any config and is not counted. Jobs
+// with no resolvable runtime session key are counted individually (each is its
+// own would-be parallel slot). The count is what the preflight warns on (≥2).
+// The returned signature uniquely identifies the parallelizable session set so
+// the preflight can de-duplicate an unchanged backlog across ticks.
 func parallelizableSerialJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) (int, string) {
 	// forDispatch=false: this is a preflight COUNT for the serialization warning, not
 	// a dispatch. It must stay a pure read — no live auth probe (`claude -p`
@@ -2798,36 +2806,24 @@ func parallelizableSerialJobs(ctx context.Context, worker jobWorker, repoFilter 
 	if len(pending) < 2 {
 		return 0, ""
 	}
+	selection := queuedJobResourceSelector{checkouts: map[string]bool{}, runtimes: map[string]bool{}, reviews: map[string]string{}}
 	sessions := map[string]bool{}
-	// The selector admits reviews of one head per pull request per selection
-	// (#2726), so a review of another head than the one it admitted for its pull
-	// request is no parallel slot more workers could fill. As in the selector, a
-	// head is admitted only with its job: a review the selector declines on its
-	// runtime session leaves its pull request open to the next head (#2737).
-	admitted := queuedJobResourceSelector{reviews: map[string]string{}}
 	for _, job := range pending {
-		reviewKey, reviewHead, isReview := queuedJobReviewOverlap(job)
-		if isReview {
-			if _, ok := admitted.reviewAdmits(reviewKey, reviewHead); !ok {
-				continue
-			}
+		claim := queuedJobResourceClaimFor(ctx, worker.Store, job)
+		if selection.checkouts[claim.checkoutKey] && poolIsolatesFromCheckout(job, claim.checkoutKey) {
+			claim.checkoutKey = "isolated:" + job.ID
 		}
-		key := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
-		switch {
-		case key == "":
-			// Each session-less job is its own parallel slot; key it by job ID
-			// so the dedup signature still reflects backlog changes. The job-ID
-			// key already makes it a distinct entry in `sessions`, so it must NOT
-			// also be counted separately or the slot would be double-counted.
-			key = "job:" + job.ID
-		case sessions[key]:
-			// The selector declines a job whose runtime session is taken.
+		if clause, _ := selection.resourceDecline(claim); clause != "" {
 			continue
 		}
-		sessions[key] = true
-		if isReview {
-			admitted.reviews[reviewKey] = reviewHead
+		selection.take(claim)
+		// Each session-less job is its own parallel slot; key it by job ID so
+		// the dedup signature still reflects backlog changes.
+		key := claim.runtimeKey
+		if key == "" {
+			key = "job:" + job.ID
 		}
+		sessions[key] = true
 	}
 	count := len(sessions)
 	if count < 2 {
@@ -3119,6 +3115,15 @@ var poolIsolationAttemptObserver func(jobID string)
 // pinned to the E2B lane is never isolated; it waits for remote headroom.
 func poolIsolationCandidate(job db.Job, payload workflow.JobPayload) bool {
 	return poolIsolationEligible(job, payload) && !queuedJobUsesRemoteLane(job)
+}
+
+// poolIsolatesFromCheckout reports whether the pool's isolation pass (#394)
+// would run job, declined on the taken checkoutKey, in its own worktree: an
+// isolation candidate keyed on its repository's shared checkout, the gate the
+// isolation loop of runQueuedJobsForRepoPoolTracked applies before allocating.
+func poolIsolatesFromCheckout(job db.Job, checkoutKey string) bool {
+	payload, err := daemonJobPayload(job)
+	return err == nil && poolIsolationCandidate(job, payload) && checkoutKey == "repo:"+payload.Repo
 }
 
 // runQueuedJobsForRepoPoolTracked is the pool pass with the supervisor's
@@ -3826,42 +3831,65 @@ func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store,
 	if selected >= s.limit {
 		return false, "limit", fmt.Sprintf("dispatch limit reached: selected=%d limit=%d", selected, s.limit)
 	}
-	checkoutKey := queuedJobCheckoutKey(ctx, store, job)
-	runtimeKey := queuedJobRuntimeResourceKey(ctx, store, job)
-	if s.checkouts[checkoutKey] {
-		return false, "checkout", fmt.Sprintf("checkout already taken this pass: checkout=%s", checkoutKey)
+	claim := queuedJobResourceClaimFor(ctx, store, job)
+	if clause, detail := s.resourceDecline(claim); clause != "" {
+		return false, clause, detail
 	}
-	if runtimeKey != "" && s.runtimes[runtimeKey] {
-		return false, "runtime", fmt.Sprintf("runtime already taken this pass: runtime=%s", runtimeKey)
+	s.take(claim)
+	return true, "", ""
+}
+
+// queuedJobResourceClaim is what a queued job takes from a selection when it
+// is admitted: its checkout, its runtime session (if any) and, for a review,
+// the head of its pull request.
+type queuedJobResourceClaim struct {
+	checkoutKey, runtimeKey string
+	reviewKey, reviewHead   string
+	isReview                bool
+}
+
+func queuedJobResourceClaimFor(ctx context.Context, store *db.Store, job db.Job) queuedJobResourceClaim {
+	claim := queuedJobResourceClaim{
+		checkoutKey: queuedJobCheckoutKey(ctx, store, job),
+		runtimeKey:  queuedJobRuntimeResourceKey(ctx, store, job),
+	}
+	claim.reviewKey, claim.reviewHead, claim.isReview = queuedJobReviewOverlap(job)
+	return claim
+}
+
+// resourceDecline is the selector's resource admission, read only: the clause
+// that declines claim against what this selection has taken, with the value it
+// tested, or "" when claim fits. The dispatch caller records the decline; the
+// serialization preflight (#444) counts with it and records nothing.
+func (s queuedJobResourceSelector) resourceDecline(claim queuedJobResourceClaim) (clause string, detail string) {
+	if s.checkouts[claim.checkoutKey] {
+		return "checkout", fmt.Sprintf("checkout already taken this pass: checkout=%s", claim.checkoutKey)
+	}
+	if claim.runtimeKey != "" && s.runtimes[claim.runtimeKey] {
+		return "runtime", fmt.Sprintf("runtime already taken this pass: runtime=%s", claim.runtimeKey)
 	}
 	// #2726: reviews of one pull request at different heads never start in the
 	// same selection. The overlap hold only sees running reviews, so two
 	// waiting heads released together by their holder would otherwise start
 	// side by side, and the later one would miss the earlier one's verdict. The
 	// first admitted one runs, and holds the rest once it is running.
-	reviewKey, reviewHead, isReview := queuedJobReviewOverlap(job)
-	if isReview {
-		if head, ok := s.reviewAdmits(reviewKey, reviewHead); !ok {
-			return false, "review_overlap", fmt.Sprintf("a review of %s at head %s was selected this pass; this one at head %s waits for its verdict", reviewKey, shortReviewHead(head), shortReviewHead(reviewHead))
+	if claim.isReview {
+		if head, taken := s.reviews[claim.reviewKey]; taken && head != claim.reviewHead {
+			return "review_overlap", fmt.Sprintf("a review of %s at head %s was selected this pass; this one at head %s waits for its verdict", claim.reviewKey, shortReviewHead(head), shortReviewHead(claim.reviewHead))
 		}
 	}
-	s.checkouts[checkoutKey] = true
-	if runtimeKey != "" {
-		s.runtimes[runtimeKey] = true
-	}
-	if isReview {
-		s.reviews[reviewKey] = reviewHead
-	}
-	return true, "", ""
+	return "", ""
 }
 
-// reviewAdmits is the selector's one-head-per-pull-request rule (#2726), read
-// only: a review of reviewKey at reviewHead fits unless this selection admitted
-// a review of that pull request at another head, which is returned. The
-// serialization preflight applies it as the selector does (#2737).
-func (s queuedJobResourceSelector) reviewAdmits(reviewKey, reviewHead string) (admittedHead string, ok bool) {
-	head, taken := s.reviews[reviewKey]
-	return head, !taken || head == reviewHead
+// take records an admitted claim in the selection.
+func (s queuedJobResourceSelector) take(claim queuedJobResourceClaim) {
+	s.checkouts[claim.checkoutKey] = true
+	if claim.runtimeKey != "" {
+		s.runtimes[claim.runtimeKey] = true
+	}
+	if claim.isReview {
+		s.reviews[claim.reviewKey] = claim.reviewHead
+	}
 }
 
 func runtimeResourceLocked(ctx context.Context, store *db.Store, runtimeKey string) bool {

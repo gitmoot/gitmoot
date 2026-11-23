@@ -53,18 +53,24 @@ func (h *reviewOverlapHeads) holderFor(head string) *reviewOverlapEntry {
 // and head are compared in db.ReviewIdentity form, the form the routing cap's
 // held-review rule compares in SQL (#2737).
 func reviewOverlapKey(repo string, pullRequest int) string {
-	return db.ReviewIdentity(repo) + "#" + strconv.Itoa(pullRequest)
+	return canonicalReviewOverlapKey(db.ReviewIdentity(repo), pullRequest)
+}
+
+// canonicalReviewOverlapKey is reviewOverlapKey for a repo already in
+// db.ReviewIdentity form.
+func canonicalReviewOverlapKey(repo string, pullRequest int) string {
+	return repo + "#" + strconv.Itoa(pullRequest)
 }
 
 // reviewOverlapEntryFor places a decoded review. ok is false for a job the
 // hold cannot place (no repo, no PR or no head): such a job is neither held
 // nor holds another.
 func reviewOverlapEntryFor(job db.Job, payload workflow.JobPayload) (key string, entry *reviewOverlapEntry, ok bool) {
-	head := db.ReviewIdentity(payload.HeadSHA)
-	if db.ReviewIdentity(payload.Repo) == "" || payload.PullRequest <= 0 || head == "" {
+	repo, head := db.ReviewIdentity(payload.Repo), db.ReviewIdentity(payload.HeadSHA)
+	if repo == "" || payload.PullRequest <= 0 || head == "" {
 		return "", nil, false
 	}
-	return reviewOverlapKey(payload.Repo, payload.PullRequest), &reviewOverlapEntry{job: job, head: head}, true
+	return canonicalReviewOverlapKey(repo, payload.PullRequest), &reviewOverlapEntry{job: job, head: head}, true
 }
 
 // queuedJobReviewOverlap is the (repo, PR) key and head of a review job, for
