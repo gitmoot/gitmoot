@@ -784,35 +784,66 @@ func recoverCancelledRunningJobsForEnabledRepos(ctx context.Context, store *db.S
 	if err != nil {
 		return err
 	}
+	var enabled []string
 	for _, repo := range repos {
-		if !repo.Enabled {
+		if repo.Enabled {
+			enabled = append(enabled, repo.FullName())
+		}
+	}
+	return recoverCancelledRunningJobs(ctx, store, stdout, enabled, rootFilter)
+}
+
+func recoverCancelledRunningJobsForRepo(ctx context.Context, store *db.Store, stdout io.Writer, repoFilter string, rootFilter string) error {
+	return recoverCancelledRunningJobs(ctx, store, stdout, []string{repoFilter}, rootFilter)
+}
+
+// recoverCancelledRunningJobs settles the cancelled jobs of each repo in
+// repoFilters that are in rootFilter's session: repo by repo in the given
+// order, each repo's jobs in id order, as one whole-table read per repo used
+// to (#2740). It reads the cancelled jobs once, through their index, and
+// decodes each payload once. The repo and session checks are
+// queuedJobMatchesRepo's and queuedJobMatchesSession's on that payload, not the
+// projected columns: this runs at startup, before the job scope is verified.
+func recoverCancelledRunningJobs(ctx context.Context, store *db.Store, stdout io.Writer, repoFilters []string, rootFilter string) error {
+	if len(repoFilters) == 0 {
+		return nil
+	}
+	jobs, err := store.ListCancelledJobs(ctx)
+	if err != nil {
+		return err
+	}
+	sortJobsByID(jobs)
+	byRepo := make([][]string, len(repoFilters))
+	for _, job := range jobs {
+		payload, decodeErr := daemonJobPayload(job)
+		if !queuedDecodedJobMatchesSession(job.ID, payload, decodeErr, rootFilter) {
 			continue
 		}
-		if err := recoverCancelledRunningJobsForRepo(ctx, store, stdout, repo.FullName(), rootFilter); err != nil {
-			return err
+		for i, repoFilter := range repoFilters {
+			if strings.TrimSpace(repoFilter) == "" || (decodeErr == nil && queuedPayloadMatchesRepo(payload, repoFilter)) {
+				byRepo[i] = append(byRepo[i], job.ID)
+			}
+		}
+	}
+	for _, ids := range byRepo {
+		for _, id := range ids {
+			settled, err := workflow.SettleCancelledRunningJob(ctx, store, id, "cancelled job recovered after daemon restart")
+			if err != nil {
+				return err
+			}
+			if settled {
+				writeLine(stdout, "settled cancelled running job %s", id)
+			}
 		}
 	}
 	return nil
 }
 
-func recoverCancelledRunningJobsForRepo(ctx context.Context, store *db.Store, stdout io.Writer, repoFilter string, rootFilter string) error {
-	jobs, err := store.ListJobs(ctx)
-	if err != nil {
-		return err
-	}
-	for _, job := range jobs {
-		if job.State != string(workflow.JobCancelled) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
-			continue
-		}
-		settled, err := workflow.SettleCancelledRunningJob(ctx, store, job.ID, "cancelled job recovered after daemon restart")
-		if err != nil {
-			return err
-		}
-		if settled {
-			writeLine(stdout, "settled cancelled running job %s", job.ID)
-		}
-	}
-	return nil
+// sortJobsByID puts jobs in Store.ListJobs's order (ORDER BY id: SQLite's
+// binary collation, which is Go's string order), for a startup recovery that
+// reads one state through its index but keeps the whole-table read's order.
+func sortJobsByID(jobs []db.Job) {
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].ID < jobs[j].ID })
 }
 
 func recoverRunningJobsBeforeForRepo(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, before time.Time, repoFilter string, rootFilter string) error {
