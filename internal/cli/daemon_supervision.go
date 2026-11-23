@@ -59,7 +59,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		worker := executionBackendJobWorker(store, stdout, home)
 		worker.CommenterFactory = worker.defaultCommenter
 		worker.Admission = worker.loadAdmissionBudget()
-		worker.jobScope = startJobScopeVerifier(ctx, store, worker.Stdout)
+		var stopJobScope func()
+		worker.jobScope, stopJobScope = startJobScopeVerifier(ctx, store, worker.Stdout)
+		defer stopJobScope()
 		checkoutLocks := &repoCheckoutLocks{}
 		poller.CheckoutLocks = checkoutLocks
 		var workerErr <-chan error
@@ -211,7 +213,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	worker := executionBackendJobWorker(store, stdout, home)
 	worker.CommenterFactory = worker.defaultCommenter
 	worker.Admission = worker.loadAdmissionBudget()
-	worker.jobScope = startJobScopeVerifier(ctx, store, worker.Stdout)
+	var stopJobScope func()
+	worker.jobScope, stopJobScope = startJobScopeVerifier(ctx, store, worker.Stdout)
+	defer stopJobScope()
 	var checkoutLock sync.Mutex
 	// The in-flight tracker (#562) is what keeps ONE hung/long job from wedging
 	// this whole loop: ticks claim + dispatch async and return, while the tracker

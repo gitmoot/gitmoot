@@ -17,8 +17,8 @@ import (
 
 // rootIDFromPayload extracts the payload's root_job_id (the engine's rootJobID()
 // value source of truth) from a job payload JSON string. A malformed or
-// root_job_id-less payload yields "" — the caller's COALESCE(NULLIF(?,”), ?)
-// then self-roots the row to job.ID, matching rootJobID()'s fallback (#420).
+// root_job_id-less payload yields "", and jobRootID then self-roots the row to
+// its job id, matching rootJobID()'s fallback (#420).
 func rootIDFromPayload(payload string) string {
 	var p struct {
 		RootJobID string `json:"root_job_id"`
@@ -70,35 +70,38 @@ func jobRootID(id string, p jobPayloadProjection) string {
 	return id
 }
 
-// jobRowWriter is what the projection helpers need of *sql.DB and *sql.Tx.
-type jobRowWriter interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
 // writeJobScope sets job id's repo and root_id from payload, the payload the
-// row now holds, for a writer that changed the row without binding them.
-func writeJobScope(ctx context.Context, q jobRowWriter, id, payload string) error {
+// row now holds, for a writer that changed the row in tx without binding them.
+func writeJobScope(ctx context.Context, tx *sql.Tx, id, payload string) error {
 	projection := jobProjectionFromPayload(payload)
-	_, err := q.ExecContext(ctx, `UPDATE jobs SET repo = ?, root_id = ? WHERE id = ?`, projection.Repo, jobRootID(id, projection), id)
+	_, err := tx.ExecContext(ctx, `UPDATE jobs SET repo = ?, root_id = ? WHERE id = ?`, projection.Repo, jobRootID(id, projection), id)
 	return err
 }
 
-// reprojectOnRequeue re-projects repo and root_id of a row a state-only
-// transition has just moved to state `to`, when that is queued. The scoped
-// queue listing trusts both columns (#2735), and these transitions can queue
-// a row from any state, including a terminal one the startup repair skips, so
-// the store re-projects here instead of relying on every caller to have
-// rewritten the payload. Any other target state is a no-op.
-func reprojectOnRequeue(ctx context.Context, q jobRowWriter, id, to string) error {
+// updateJobState runs query, a state-only UPDATE of job id to state `to`, in
+// tx and reports whether it moved the row. When the row enters queued, the
+// statement also returns the payload (RETURNING) and repo and root_id are
+// re-projected from it in tx: the scoped queue listing trusts both columns
+// (#2735), and a state-only transition can queue a row from any state,
+// including a terminal one the startup repair skips, so the store re-projects
+// here rather than relying on every caller to have rewritten the payload. Any
+// other target state is a plain UPDATE.
+func updateJobState(ctx context.Context, tx *sql.Tx, id, to, query string, args ...any) (bool, error) {
 	if to != "queued" {
-		return nil
+		result, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			return false, err
+		}
+		affected, err := result.RowsAffected()
+		return affected > 0, err
 	}
 	var payload string
-	if err := q.QueryRowContext(ctx, `SELECT payload FROM jobs WHERE id = ?`, id).Scan(&payload); err != nil {
-		return err
+	if err := tx.QueryRowContext(ctx, query+` RETURNING payload`, args...).Scan(&payload); errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, err
 	}
-	return writeJobScope(ctx, q, id, payload)
+	return true, writeJobScope(ctx, tx, id, payload)
 }
 
 func jobResultHashFromPayload(payload string) string {
@@ -717,7 +720,7 @@ func (s *Store) SumJobTokensByRoot(ctx context.Context, rootID string) (int, err
 // they equal what the scheduler decodes: every payload writer sets them from
 // the payload it stores (jobProjectionFromPayload, the same Go field matching
 // as the scheduler's decode), in the same statement or transaction, every
-// state-only transition into queued re-projects (reprojectOnRequeue), and
+// state-only transition into queued re-projects (updateJobState), and
 // ReprojectLiveJobScope repairs live rows older code projected otherwise
 // (json_extract's backfill, root_id left by an update); the scheduler trusts
 // the columns only once that repair has succeeded in its process. A
@@ -790,32 +793,45 @@ func (s *Store) ListQueuedJobsInScope(ctx context.Context, repo, root string) ([
 // repo (json_extract matches "repo" case-sensitively and takes the first
 // duplicate) and root_id left stale by a payload update (#2735). A row that
 // is not queued now is re-projected anyway when it is queued again, by
-// reprojectOnRequeue or its payload writer; blocked and running rows are
+// updateJobState or its payload writer; blocked and running rows are
 // repaired here too so the columns of every live row are right from the start.
-// Each row is rewritten only while its payload is unchanged, so a
-// concurrent writer, which projects its own payload, always wins.
+//
+// Each row is rewritten by rowid only while its payload IS the value read, in
+// the value's own storage class: a legacy payload stored as a BLOB never equals
+// the TEXT of the same bytes, so a Go string bound for it would match nothing
+// and report a repair that never happened. A rewrite that matches no row means
+// the row changed under the repair, so the repair fails and its caller
+// retries: a nil error means every live row's columns matched its payload.
 func (s *Store) ReprojectLiveJobScope(ctx context.Context) (int, error) {
 	ctx, release, err := s.AcquireJobLifecycle(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer release()
-	rows, err := s.db.QueryContext(ctx, `SELECT id, payload, repo, root_id FROM jobs
+	rows, err := s.db.QueryContext(ctx, `SELECT rowid, id, payload, repo, root_id FROM jobs
 		WHERE state NOT IN ('succeeded', 'failed', 'cancelled')`)
 	if err != nil {
 		return 0, err
 	}
-	type stale struct{ id, payload, repo, rootID string }
+	type stale struct {
+		rowid            int64
+		id, repo, rootID string
+		payload          any // as stored: string for TEXT, []byte for BLOB
+	}
 	var todo []stale
 	for rows.Next() {
-		var id, payload, repo, rootID string
-		if err := rows.Scan(&id, &payload, &repo, &rootID); err != nil {
+		var (
+			rowid            int64
+			id, repo, rootID string
+			payload          any
+		)
+		if err := rows.Scan(&rowid, &id, &payload, &repo, &rootID); err != nil {
 			rows.Close()
 			return 0, err
 		}
-		projection := jobProjectionFromPayload(payload)
+		projection := jobProjectionFromPayload(storedPayloadText(payload))
 		if wantRoot := jobRootID(id, projection); repo != projection.Repo || rootID != wantRoot {
-			todo = append(todo, stale{id: id, payload: payload, repo: projection.Repo, rootID: wantRoot})
+			todo = append(todo, stale{rowid: rowid, id: id, payload: payload, repo: projection.Repo, rootID: wantRoot})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -831,10 +847,9 @@ func (s *Store) ReprojectLiveJobScope(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
-	changed := 0
 	for _, row := range todo {
-		result, err := tx.ExecContext(ctx, `UPDATE jobs SET repo = ?, root_id = ? WHERE id = ? AND payload = ?`,
-			row.repo, row.rootID, row.id, row.payload)
+		result, err := tx.ExecContext(ctx, `UPDATE jobs SET repo = ?, root_id = ? WHERE rowid = ? AND payload IS ?`,
+			row.repo, row.rootID, row.rowid, row.payload)
 		if err != nil {
 			return 0, err
 		}
@@ -842,12 +857,26 @@ func (s *Store) ReprojectLiveJobScope(ctx context.Context) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		changed += int(affected)
+		if affected != 1 {
+			return 0, fmt.Errorf("job %s changed during the scope repair; its repo and root_id were not re-projected", row.id)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return changed, nil
+	return len(todo), nil
+}
+
+// storedPayloadText is the string view of a payload scanned as its stored
+// SQLite value (TEXT as string, BLOB as []byte).
+func storedPayloadText(payload any) string {
+	switch p := payload.(type) {
+	case string:
+		return p
+	case []byte:
+		return string(p)
+	}
+	return ""
 }
 
 // CountQueuedJobsForRepo returns the queued engine-owned jobs targeting repo.
@@ -1088,15 +1117,12 @@ func (s *Store) UpdateJobState(ctx context.Context, id string, state string) err
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, state, state, id)
+	moved, err := updateJobState(ctx, tx, id, state, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, state, state, id)
 	if err != nil {
 		return err
 	}
-	if err := requireAffected(result, "job", id); err != nil {
-		return err
-	}
-	if err := reprojectOnRequeue(ctx, tx, id, state); err != nil {
-		return err
+	if !moved {
+		return fmt.Errorf("job %q not found", id)
 	}
 	return tx.Commit()
 }
@@ -1111,7 +1137,7 @@ func (s *Store) TransitionJobState(ctx context.Context, id string, from string, 
 }
 
 // transitionJobStateOnly runs one state-only compare-and-swap of job id to
-// state `to` and, when it moved the row, the requeue re-projection, in one
+// state `to` (updateJobState, with its requeue re-projection) in its own
 // transaction.
 func (s *Store) transitionJobStateOnly(ctx context.Context, id, to, query string, args ...any) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1119,15 +1145,8 @@ func (s *Store) transitionJobStateOnly(ctx context.Context, id, to, query string
 		return false, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, query, args...)
-	if err != nil {
-		return false, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil || affected != 1 {
-		return false, err
-	}
-	if err := reprojectOnRequeue(ctx, tx, id, to); err != nil {
+	moved, err := updateJobState(ctx, tx, id, to, query, args...)
+	if err != nil || !moved {
 		return false, err
 	}
 	return true, tx.Commit()
@@ -1164,19 +1183,12 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
+	moved, err := updateJobState(ctx, tx, id, to, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
 	if err != nil {
 		return false, err
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if affected == 0 {
+	if !moved {
 		return false, tx.Commit()
-	}
-	if err := reprojectOnRequeue(ctx, tx, id, to); err != nil {
-		return false, err
 	}
 	if event.JobID == "" {
 		event.JobID = id
@@ -1221,19 +1233,12 @@ func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id 
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ?`, to, to, id, from, fromGeneration)
+	moved, err := updateJobState(ctx, tx, id, to, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ?`, to, to, id, from, fromGeneration)
 	if err != nil {
 		return false, err
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if affected == 0 {
+	if !moved {
 		return false, tx.Commit()
-	}
-	if err := reprojectOnRequeue(ctx, tx, id, to); err != nil {
-		return false, err
 	}
 	if event.JobID == "" {
 		event.JobID = id
@@ -1379,19 +1384,12 @@ func (s *Store) claimRunningJob(ctx context.Context, id string, from string, to 
 		query += ` AND lifecycle_generation = ?`
 		args = append(args, *generation)
 	}
-	result, err := tx.ExecContext(ctx, query, args...)
+	moved, err := updateJobState(ctx, tx, id, to, query, args...)
 	if err != nil {
 		return false, err
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if affected == 0 {
+	if !moved {
 		return false, tx.Commit()
-	}
-	if err := reprojectOnRequeue(ctx, tx, id, to); err != nil {
-		return false, err
 	}
 	if event.JobID == "" {
 		event.JobID = id
@@ -2973,35 +2971,35 @@ func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id s
 	}
 	defer tx.Rollback()
 
-	var result sql.Result
+	var moved bool
 	if payload == nil {
-		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
+		moved, err = updateJobState(ctx, tx, id, to, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
 	} else {
 		// DERIVED FIELDS TRAVEL WITH THE PAYLOAD. jobs.result_hash and the payload
 		// projections are not decoration: the hash is the terminal result's
 		// proof-integrity receipt and its memory-harvest key, and writing a payload that
 		// installs a result while leaving the old (or empty) hash behind breaks that
 		// invariant silently. Every other payload writer recomputes them in the same
-		// UPDATE; so does this one (#1673).
-		projection := jobProjectionFromPayload(string(payload))
+		// UPDATE; so does this one (#1673). The payload is bound as a string so it is
+		// stored as TEXT like every other writer's: a []byte parameter stores a BLOB,
+		// which SQLite never equates with a TEXT value (#2735).
+		text := string(payload)
+		projection := jobProjectionFromPayload(text)
+		var result sql.Result
 		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, root_id = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
-			to, payload, jobResultHashFromPayload(string(payload)), projection.Repo, jobRootID(id, projection), projection.PullRequest,
+			to, text, jobResultHashFromPayload(text), projection.Repo, jobRootID(id, projection), projection.PullRequest,
 			projection.BlockerRetryAt, projection.BlockerSuggestedAction, to, id, from)
-	}
-	if err != nil {
-		return false, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if affected == 0 {
-		return false, tx.Commit()
-	}
-	if payload == nil {
-		if err := reprojectOnRequeue(ctx, tx, id, to); err != nil {
-			return false, err
+		if err == nil {
+			var affected int64
+			affected, err = result.RowsAffected()
+			moved = affected > 0
 		}
+	}
+	if err != nil {
+		return false, err
+	}
+	if !moved {
+		return false, tx.Commit()
 	}
 	for _, event := range events {
 		if event.JobID == "" {

@@ -288,9 +288,9 @@ WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.re
 	}()
 
 	var out lockedBuffer
-	runCtx, cancel := context.WithCancel(ctx)
-	t.Cleanup(cancel)
-	worker.jobScope = startJobScopeVerifier(runCtx, store, &out)
+	var stop func()
+	worker.jobScope, stop = startJobScopeVerifier(ctx, store, &out)
+	t.Cleanup(stop)
 	if got := scopedIDs(t, ctx, worker, "owner/b", ""); got != "dup" {
 		t.Fatalf("owner/b pass while the repair is pending = %q, want dup", got)
 	}
@@ -309,9 +309,13 @@ WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.re
 	}
 	locked = false
 
-	waitFor(t, "the repair to succeed", 90*time.Second, worker.jobScope.trusted)
-	if !strings.Contains(out.String(), "job scope verified: re-projected repo/session columns of 1 live job(s)") {
-		t.Fatalf("verifier output %q does not report the one repaired job", out.String())
+	// The verifier publishes the flag before it writes this line, so once the
+	// line is there the passes list by column.
+	waitFor(t, "the repair to succeed", 90*time.Second, func() bool {
+		return strings.Contains(out.String(), "job scope verified: re-projected repo/session columns of 1 live job(s)")
+	})
+	if !worker.jobScope.trusted() {
+		t.Fatalf("job scope not verified after the success log %q", out.String())
 	}
 	var repo string
 	if err := raw.QueryRowContext(ctx, `SELECT repo FROM jobs WHERE id = 'dup'`).Scan(&repo); err != nil || repo != "owner/b" {
@@ -322,6 +326,60 @@ WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.re
 	}
 	if got := scopedIDs(t, ctx, worker, "owner/a", ""); got != "" {
 		t.Fatalf("owner/a pass after the repair = %q, want none", got)
+	}
+}
+
+// Legacy rows whose payload SQLite stores as a BLOB (the []byte payload writer
+// used to bind one) are repaired before the scope is verified, so the
+// column-scoped passes still list them (#2735 round 3, P2): a stale repo from
+// the #1066 backfill and a stale root_id. A repair that compared the payload
+// as TEXT matched neither row and reported success anyway.
+func TestJobScopeVerifierRepairsBlobPayloadsBeforeVerifying(t *testing.T) {
+	ctx, store, _, worker := diskGuardDispatchFixture(t)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 50 << 30}, nil
+	})
+	for id, payload := range map[string]string{
+		"blob-repo": `{"repo":"owner/a","Repo":"owner/b"}`,
+		"blob-root": `{"repo":"owner/c","root_job_id":"session-b"}`,
+	} {
+		if err := store.CreateJobWithEvent(ctx, db.Job{ID: id, Agent: "worker", Type: "ask", State: string(workflow.JobQueued), Payload: payload},
+			db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	for _, stmt := range []string{
+		`UPDATE jobs SET payload = CAST(payload AS BLOB), repo = 'owner/a' WHERE id = 'blob-repo'`,
+		`UPDATE jobs SET payload = CAST(payload AS BLOB), root_id = 'stale-root' WHERE id = 'blob-root'`,
+	} {
+		if _, err := raw.ExecContext(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out lockedBuffer
+	var stop func()
+	worker.jobScope, stop = startJobScopeVerifier(ctx, store, &out)
+	t.Cleanup(stop)
+	waitFor(t, "the repair to succeed", 90*time.Second, func() bool {
+		return strings.Contains(out.String(), "job scope verified:")
+	})
+	if !strings.Contains(out.String(), "re-projected repo/session columns of 2 live job(s)") {
+		t.Fatalf("verifier output %q does not report the two repaired BLOB rows", out.String())
+	}
+	if got := scopedIDs(t, ctx, worker, "owner/b", ""); got != "blob-repo" {
+		t.Fatalf("owner/b pass after verification = %q, want blob-repo", got)
+	}
+	if got := scopedIDs(t, ctx, worker, "owner/a", ""); got != "" {
+		t.Fatalf("owner/a pass after verification = %q, want none", got)
+	}
+	if got := scopedIDs(t, ctx, worker, "owner/c", "session-b"); got != "blob-root" {
+		t.Fatalf("owner/c session-b pass after verification = %q, want blob-root", got)
 	}
 }
 

@@ -198,6 +198,9 @@ func (s *Store) SupersedeCleanupReceipt(ctx context.Context, receipt CleanupRece
 // RecordCleanupArtifactSnapshot attaches preserved outputs only to the exact
 // terminal snapshot that was collected. Publication runs outside a SQL
 // transaction; a same-generation payload change must not be overwritten.
+// owner.Payload is the text the caller read, so the snapshot compares the
+// stored payload as TEXT: a legacy BLOB payload never equals a TEXT parameter,
+// and without the CAST its publication would always look stale (#2735).
 func (s *Store) RecordCleanupArtifactSnapshot(ctx context.Context, owner Job, snapshot string) (bool, error) {
 	ctx, release, err := s.AcquireJobLifecycle(ctx)
 	if err != nil {
@@ -211,7 +214,7 @@ func (s *Store) RecordCleanupArtifactSnapshot(ctx context.Context, owner Job, sn
 	defer tx.Rollback()
 	row := tx.QueryRowContext(ctx, `UPDATE jobs
 		SET payload=json_set(payload, '$.cleanup_artifacts', json(?)), updated_at=CURRENT_TIMESTAMP
-		WHERE id=? AND lifecycle_generation=? AND state=? AND payload=?
+		WHERE id=? AND lifecycle_generation=? AND state=? AND CAST(payload AS TEXT)=?
 		  AND state IN ('succeeded', 'failed', 'cancelled')
 		RETURNING payload`,
 		snapshot, owner.ID, owner.LifecycleGeneration, owner.State, owner.Payload)
@@ -236,7 +239,7 @@ func (s *Store) RecordReadOnlyCleanupDiff(ctx context.Context, owner Job, diff s
 		'$.read_only_worktree_diff', ?,
 		'$.read_only_worktree_diff_truncated', json(?),
 		'$.read_only_worktree_diff_error', ?), updated_at=CURRENT_TIMESTAMP
-		WHERE id=? AND lifecycle_generation=? AND state=? AND payload=?
+		WHERE id=? AND lifecycle_generation=? AND state=? AND CAST(payload AS TEXT)=?
 		  AND state IN ('succeeded', 'failed', 'cancelled')
 		RETURNING payload`,
 		diff, strconv.FormatBool(truncated), captureError, owner.ID,
