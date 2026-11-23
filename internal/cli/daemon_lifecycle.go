@@ -1514,10 +1514,9 @@ func daemonMetaWithCurrentBuild(meta daemonMeta) daemonMeta {
 
 // daemonRunStartupReconcile performs the #505 startup steps for a directly
 // launched `daemon run`: it self-registers THIS process's pid/meta so `daemon
-// status` and the dashboard recognize it (gap 3), it sweeps read-only seat
-// temp dirs a previously-crashed daemon left behind (#2314), and it re-projects
-// the live jobs' repo and session columns (#2735). All are best-effort — a
-// failure never blocks the daemon. It returns a cleanup
+// status` and the dashboard recognize it (gap 3), and it sweeps read-only seat
+// temp dirs a previously-crashed daemon left behind (#2314). Both are
+// best-effort — a failure never blocks the daemon. It returns a cleanup
 // func (never nil) the caller defers: it deregisters this process's state on exit
 // only when this process actually self-registered (so a `daemon start`-spawned
 // child, whose parent already owns the pid, is a no-op). Keeping the logic here —
@@ -1542,16 +1541,6 @@ func daemonRunStartupReconcile(ctx context.Context, home string, argv []string, 
 		if err != nil {
 			writeLine(stdout, "read-only seat temp sweep: %v", err)
 		}
-	}
-	// The scheduler's scoped listing trusts the repo and root_id columns
-	// (#2735). Re-project them for every live job once per start, so a row an
-	// older version projected differently from its payload is listed again.
-	if err := withStore(home, func(store *db.Store) error {
-		changed, err := store.ReprojectLiveJobScope(ctx)
-		writeLine(stdout, "re-projected repo/session columns of %d live job(s)", changed)
-		return err
-	}); err != nil {
-		writeLine(stdout, "live job scope re-projection: %v", err)
 	}
 	return cleanup
 }

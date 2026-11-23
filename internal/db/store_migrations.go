@@ -145,11 +145,8 @@ func (s *Store) backfillJobRootID(ctx context.Context) error {
 			rows.Close()
 			return err
 		}
-		rootID := rootIDFromPayload(payload)
-		if strings.TrimSpace(rootID) == "" {
-			rootID = id // malformed / root_job_id-less payload self-roots
-		}
-		todo = append(todo, pending{id: id, rootID: rootID})
+		// A malformed or root_job_id-less payload self-roots (jobRootID).
+		todo = append(todo, pending{id: id, rootID: jobRootID(id, jobProjectionFromPayload(payload))})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()

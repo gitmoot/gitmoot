@@ -2880,15 +2880,13 @@ const daemonRestartEnvCaveat = "note: Claude runtime auth is read per delivery f
 // promises. A within-pass cache dedupes the probe across auth-held jobs of the same
 // runtime so one outage costs at most one live probe per pass.
 func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, forDispatch bool) ([]db.Job, error) {
-	// #2735: read only this pass's repo and session in SQL, then settle exactly
-	// the rows the projected columns could not (queuedJobsInScope). Every step
-	// below sees exactly the in-scope queued jobs, so the disk guard and janitor
-	// need no scope check of their own.
-	jobs, err := worker.Store.ListQueuedJobsInScope(ctx, repoFilter, rootFilter)
+	// #2735: read only this pass's repo and session, exactly (see
+	// listQueuedJobsForPass). Every step below sees exactly the in-scope queued
+	// jobs, so the disk guard and janitor need no scope check of their own.
+	jobs, err := listQueuedJobsForPass(ctx, worker, repoFilter, rootFilter)
 	if err != nil {
 		return nil, err
 	}
-	jobs = queuedJobsInScope(jobs, repoFilter, rootFilter)
 	// #2726: a review waits while another review of the same (repo, PR) at a
 	// different head is running, or dispatched by this process and not yet
 	// reaped, so its prior-verdict list, rendered at dispatch, has that
@@ -3894,6 +3892,37 @@ func queuedJobsInScope(jobs []db.Job, repoFilter, rootFilter string) []db.Job {
 		kept = append(kept, job)
 	}
 	return kept
+}
+
+// listQueuedJobsForPass lists the queued jobs in one pass's repo and session
+// scope, as queuedJobMatchesRepo and queuedJobMatchesSession decide. Once this
+// process's startup repair has verified the projected repo and root_id
+// columns (worker.jobScope), SQL scopes the read and queuedJobsInScope
+// settles the rows it could not (#2735). Until then the whole queue is read
+// and scoped by payload, as before, so a column the repair has not yet
+// corrected can never hide a job from its pass.
+func listQueuedJobsForPass(ctx context.Context, worker jobWorker, repoFilter, rootFilter string) ([]db.Job, error) {
+	if worker.jobScope.trusted() {
+		jobs, err := worker.Store.ListQueuedJobsInScope(ctx, repoFilter, rootFilter)
+		if err != nil {
+			return nil, err
+		}
+		return queuedJobsInScope(jobs, repoFilter, rootFilter), nil
+	}
+	jobs, err := worker.Store.ListQueuedJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(repoFilter) == "" && strings.TrimSpace(rootFilter) == "" {
+		return jobs, nil
+	}
+	kept := jobs[:0]
+	for _, job := range jobs {
+		if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {
+			kept = append(kept, job)
+		}
+	}
+	return kept, nil
 }
 
 func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) string {

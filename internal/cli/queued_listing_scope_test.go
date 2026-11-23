@@ -4,16 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // queuedListingFixture is a healthy-disk daemon home with `repos` repositories
-// of `perRepo` queued ask jobs each: owner/repo-<r>, job-<r>-<j>.
+// of `perRepo` queued ask jobs each: owner/repo-<r>, job-<r>-<j>. Its worker's
+// job scope is verified, as after the daemon's startup repair, so passes list
+// by column.
 func queuedListingFixture(tb testing.TB, repos, perRepo int) (context.Context, jobWorker) {
 	tb.Helper()
 	ctx, store, _, worker := diskGuardDispatchFixture(tb)
@@ -33,6 +35,8 @@ func queuedListingFixture(tb testing.TB, repos, perRepo int) (context.Context, j
 			}
 		}
 	}
+	worker.jobScope = &jobScopeVerifier{}
+	worker.jobScope.verified.Store(true)
 	return ctx, worker
 }
 
@@ -235,14 +239,21 @@ func TestUpdatedPayloadListsAQueuedJobInItsNewSession(t *testing.T) {
 
 // A legacy row whose repo column the #1066 SQL backfill projected with
 // json_extract ("repo" only, case-sensitively) disagrees with the scheduler's
-// decode, which also matches "Repo" and keeps the last key. The daemon's
-// startup repair re-projects it, after which the owner/b pass lists it and the
-// owner/a pass does not (#2735 review, P2).
-func TestDaemonStartupRepairListsALegacyRowUnderTheDecodedRepo(t *testing.T) {
-	ctx, store, paths, worker := diskGuardDispatchFixture(t)
+// decode, which also matches "Repo" and keeps the last key. The reviewer's
+// probe (#2735 round 2): another connection holds the write lock while the
+// daemon starts, so the repair fails and retries. Until it succeeds, the
+// owner/b pass still lists the row, because an unverified worker reads the
+// whole queue and scopes it by payload. Once the lock is released the retry
+// re-projects the row, the scope is verified, and the column-scoped owner/b
+// pass lists the row while the owner/a pass does not.
+func TestJobScopeVerifierListsALegacyRowBeforeAndAfterTheRepair(t *testing.T) {
+	ctx, store, _, worker := diskGuardDispatchFixture(t)
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 50 << 30}, nil
 	})
+	backoff := jobScopeRepairBackoff
+	jobScopeRepairBackoff = [2]time.Duration{10 * time.Millisecond, 50 * time.Millisecond}
+	t.Cleanup(func() { jobScopeRepairBackoff = backoff })
 	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "dup", Agent: "worker", Type: "ask", State: string(workflow.JobQueued),
 		Payload: `{"repo":"owner/a","Repo":"owner/b"}`}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
 		t.Fatal(err)
@@ -261,14 +272,50 @@ func TestDaemonStartupRepairListsALegacyRowUnderTheDecodedRepo(t *testing.T) {
 WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.repo'), '') != ''`); err != nil {
 		t.Fatal(err)
 	}
-	if got := scopedIDs(t, ctx, worker, "owner/b", ""); got != "" {
-		t.Fatalf("precondition: the owner/b pass lists %q before the repair; the legacy projection was not reproduced", got)
+	lock, err := raw.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var out strings.Builder
-	// paths.Home is <home>/.gitmoot; the daemon takes <home>, as --home does.
-	daemonRunStartupReconcile(ctx, filepath.Dir(paths.Home), []string{"gitmoot-test"}, &out)()
-	if !strings.Contains(out.String(), "re-projected repo/session columns of 1 live job(s)") {
-		t.Fatalf("startup output %q does not report the one repaired job", out.String())
+	defer lock.Close()
+	if _, err := lock.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = lock.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+
+	var out lockedBuffer
+	runCtx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+	worker.jobScope = startJobScopeVerifier(runCtx, store, &out)
+	if got := scopedIDs(t, ctx, worker, "owner/b", ""); got != "dup" {
+		t.Fatalf("owner/b pass while the repair is pending = %q, want dup", got)
+	}
+	// The repair waits out the busy timeout, fails, and retries.
+	waitFor(t, "the first failed repair attempt", 90*time.Second, func() bool {
+		return strings.Contains(out.String(), "job scope repair attempt 1 failed")
+	})
+	if worker.jobScope.trusted() {
+		t.Fatalf("job scope verified while the repair could not write; output %q", out.String())
+	}
+	if got := scopedIDs(t, ctx, worker, "owner/b", ""); got != "dup" {
+		t.Fatalf("owner/b pass after a failed repair = %q, want dup", got)
+	}
+	if _, err := lock.ExecContext(ctx, `ROLLBACK`); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+
+	waitFor(t, "the repair to succeed", 90*time.Second, worker.jobScope.trusted)
+	if !strings.Contains(out.String(), "job scope verified: re-projected repo/session columns of 1 live job(s)") {
+		t.Fatalf("verifier output %q does not report the one repaired job", out.String())
+	}
+	var repo string
+	if err := raw.QueryRowContext(ctx, `SELECT repo FROM jobs WHERE id = 'dup'`).Scan(&repo); err != nil || repo != "owner/b" {
+		t.Fatalf("repo column after the repair = %q (err %v), want owner/b", repo, err)
 	}
 	if got := scopedIDs(t, ctx, worker, "owner/b", ""); got != "dup" {
 		t.Fatalf("owner/b pass after the repair = %q, want dup", got)

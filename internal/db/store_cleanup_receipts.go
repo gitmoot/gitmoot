@@ -209,15 +209,13 @@ func (s *Store) RecordCleanupArtifactSnapshot(ctx context.Context, owner Job, sn
 		return false, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE jobs
+	row := tx.QueryRowContext(ctx, `UPDATE jobs
 		SET payload=json_set(payload, '$.cleanup_artifacts', json(?)), updated_at=CURRENT_TIMESTAMP
 		WHERE id=? AND lifecycle_generation=? AND state=? AND payload=?
-		  AND state IN ('succeeded', 'failed', 'cancelled')`,
+		  AND state IN ('succeeded', 'failed', 'cancelled')
+		RETURNING payload`,
 		snapshot, owner.ID, owner.LifecycleGeneration, owner.State, owner.Payload)
-	if err != nil {
-		return false, err
-	}
-	return commitReprojectedJobScope(ctx, tx, result, owner.ID)
+	return commitReprojectedJobScope(ctx, tx, row, owner.ID)
 }
 
 // RecordReadOnlyCleanupDiff updates only captured metadata and only while the
@@ -234,36 +232,31 @@ func (s *Store) RecordReadOnlyCleanupDiff(ctx context.Context, owner Job, diff s
 		return false, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload=json_set(payload,
+	row := tx.QueryRowContext(ctx, `UPDATE jobs SET payload=json_set(payload,
 		'$.read_only_worktree_diff', ?,
 		'$.read_only_worktree_diff_truncated', json(?),
 		'$.read_only_worktree_diff_error', ?), updated_at=CURRENT_TIMESTAMP
 		WHERE id=? AND lifecycle_generation=? AND state=? AND payload=?
-		  AND state IN ('succeeded', 'failed', 'cancelled')`,
+		  AND state IN ('succeeded', 'failed', 'cancelled')
+		RETURNING payload`,
 		diff, strconv.FormatBool(truncated), captureError, owner.ID,
 		owner.LifecycleGeneration, owner.State, owner.Payload)
-	if err != nil {
-		return false, err
-	}
-	return commitReprojectedJobScope(ctx, tx, result, owner.ID)
+	return commitReprojectedJobScope(ctx, tx, row, owner.ID)
 }
 
 // commitReprojectedJobScope finishes a single-row payload rewrite done in SQL
-// (json_set), whose result Go only sees afterwards: it re-projects repo and
-// root_id from the stored payload in the same transaction, as every
-// Go-built payload write does in its UPDATE (#2735), then commits.
-func commitReprojectedJobScope(ctx context.Context, tx *sql.Tx, result sql.Result, id string) (bool, error) {
-	affected, err := result.RowsAffected()
-	if err != nil || affected != 1 {
-		return false, err
-	}
+// (json_set) whose UPDATE returns the rewritten payload: no row means the
+// owner snapshot was stale and nothing changed. Otherwise it projects repo
+// and root_id from that payload in the same transaction, as every Go-built
+// payload write does in its UPDATE (#2735), then commits.
+func commitReprojectedJobScope(ctx context.Context, tx *sql.Tx, row *sql.Row, id string) (bool, error) {
 	var payload string
-	if err := tx.QueryRowContext(ctx, `SELECT payload FROM jobs WHERE id = ?`, id).Scan(&payload); err != nil {
+	if err := row.Scan(&payload); errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
 		return false, err
 	}
-	projection := jobProjectionFromPayload(payload)
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET repo = ?, root_id = COALESCE(NULLIF(?, ''), id) WHERE id = ?`,
-		projection.Repo, projection.RootJobID, id); err != nil {
+	if err := writeJobScope(ctx, tx, id, payload); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
