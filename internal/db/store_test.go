@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
 )
 
 func TestOpenMigratesSchema(t *testing.T) {
@@ -2727,6 +2728,8 @@ func TestRouteCapHeldReviewSQLReadsTheRunningIndex(t *testing.T) {
 		{ID: "running-a", Type: "review", State: "running", Payload: `{"repo":"owner/repo","pull_request":12,"head_sha":"AAA"}`},
 		{ID: "held-b", Type: "review", State: "queued", Payload: `{"repo":"Owner/Repo","pull_request":12,"head_sha":"bbb"}`},
 		{ID: "same-head", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","pull_request":12,"head_sha":"aaa"}`},
+		{ID: "same-head-padded", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","pull_request":12,"head_sha":"\tAaa\n"}`},
+		{ID: "held-c-padded-repo", Type: "review", State: "queued", Payload: `{"repo":" Owner/Repo\t","pull_request":12,"head_sha":"ccc"}`},
 		{ID: "other-pr", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","pull_request":13,"head_sha":"bbb"}`},
 		{ID: "other-repo", Type: "review", State: "queued", Payload: `{"repo":"other/repo","pull_request":12,"head_sha":"bbb"}`},
 		{ID: "no-head", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","pull_request":12}`},
@@ -2763,11 +2766,51 @@ func TestRouteCapHeldReviewSQLReadsTheRunningIndex(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(held, ",") != "held-b" {
-		t.Fatalf("held rows = %v, want only held-b", held)
+	// Repo and head compare in ReviewIdentity form (#2737): padding and case
+	// make neither another pull request nor another head.
+	if strings.Join(held, ",") != "held-b,held-c-padded-repo" {
+		t.Fatalf("held rows = %v, want only held-b and held-c-padded-repo", held)
 	}
 	if plan := explainQueryPlan(t, store, query); !strings.Contains(plan, "USING INDEX idx_jobs_running_updated_at") || strings.Contains(plan, "AUTOMATIC") {
 		t.Fatalf("held-review lookup does not read the running index (or builds an automatic index):\n%s", plan)
+	}
+}
+
+// TestReviewIdentityMatchesItsSQL pins one canonical review identity (#2737):
+// for every rune strings.TrimSpace trims, and every other Latin-1 rune, around
+// and inside ASCII and non-ASCII letters, SQLite's reviewIdentitySQL computes
+// exactly ReviewIdentity, so the routing cap's held-review rule and the
+// scheduler's overlap hold place every repo and head alike.
+func TestReviewIdentityMatchesItsSQL(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	runes := []rune{'\u200b', '\ufeff', '\u212a', 'É', 'ß'}
+	for r := rune(1); r <= unicode.MaxLatin1; r++ {
+		runes = append(runes, r)
+	}
+	for r := rune(unicode.MaxLatin1 + 1); r <= 0x3000; r++ {
+		if unicode.IsSpace(r) {
+			runes = append(runes, r)
+		}
+	}
+	inputs := []string{"", "Owner/Repo", "ABCdef0123", "ÉCOLE"}
+	for _, r := range runes {
+		s := string(r)
+		inputs = append(inputs, s, s+"AbC"+s, s+s+"aB"+s+"Cd", "Ab"+s+"ÉCOLE")
+	}
+	query := `SELECT ` + reviewIdentitySQL(`?`)
+	for _, in := range inputs {
+		var got string
+		if err := store.db.QueryRowContext(ctx, query, in).Scan(&got); err != nil {
+			t.Fatalf("reviewIdentitySQL(%q): %v", in, err)
+		}
+		if want := ReviewIdentity(in); got != want {
+			t.Fatalf("reviewIdentitySQL(%q) = %q, ReviewIdentity = %q", in, got, want)
+		}
 	}
 }
 

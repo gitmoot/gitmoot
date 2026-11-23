@@ -2800,26 +2800,34 @@ func parallelizableSerialJobs(ctx context.Context, worker jobWorker, repoFilter 
 	}
 	sessions := map[string]bool{}
 	// The selector admits reviews of one head per pull request per selection
-	// (#2726), so a review of another head than the first queued one of its
-	// pull request is no parallel slot more workers could fill.
-	reviewHeads := map[string]string{}
+	// (#2726), so a review of another head than the one it admitted for its pull
+	// request is no parallel slot more workers could fill. As in the selector, a
+	// head is admitted only with its job: a review the selector declines on its
+	// runtime session leaves its pull request open to the next head (#2737).
+	admitted := queuedJobResourceSelector{reviews: map[string]string{}}
 	for _, job := range pending {
-		if prKey, head, ok := queuedJobReviewOverlap(job); ok {
-			if first, seen := reviewHeads[prKey]; seen && first != head {
+		reviewKey, reviewHead, isReview := queuedJobReviewOverlap(job)
+		if isReview {
+			if _, ok := admitted.reviewAdmits(reviewKey, reviewHead); !ok {
 				continue
 			}
-			reviewHeads[prKey] = head
 		}
 		key := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
-		if key == "" {
+		switch {
+		case key == "":
 			// Each session-less job is its own parallel slot; key it by job ID
 			// so the dedup signature still reflects backlog changes. The job-ID
 			// key already makes it a distinct entry in `sessions`, so it must NOT
 			// also be counted separately or the slot would be double-counted.
-			sessions["job:"+job.ID] = true
+			key = "job:" + job.ID
+		case sessions[key]:
+			// The selector declines a job whose runtime session is taken.
 			continue
 		}
 		sessions[key] = true
+		if isReview {
+			admitted.reviews[reviewKey] = reviewHead
+		}
 	}
 	count := len(sessions)
 	if count < 2 {
@@ -3516,7 +3524,6 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					if iso.runtimeKey != "" {
 						inflightRuntimes[iso.runtimeKey] = true
 					}
-					worker.dispatchedReviews.register(iso.job)
 					// #739: make the reactive isolation observable on SUCCESS too (it was
 					// silent both ways). Emitted only past the host-cap/double-dispatch gate
 					// above, so the event means the job is truly dispatched in its own
@@ -3834,7 +3841,7 @@ func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store,
 	// first admitted one runs, and holds the rest once it is running.
 	reviewKey, reviewHead, isReview := queuedJobReviewOverlap(job)
 	if isReview {
-		if head, taken := s.reviews[reviewKey]; taken && head != reviewHead {
+		if head, ok := s.reviewAdmits(reviewKey, reviewHead); !ok {
 			return false, "review_overlap", fmt.Sprintf("a review of %s at head %s was selected this pass; this one at head %s waits for its verdict", reviewKey, shortReviewHead(head), shortReviewHead(reviewHead))
 		}
 	}
@@ -3846,6 +3853,15 @@ func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store,
 		s.reviews[reviewKey] = reviewHead
 	}
 	return true, "", ""
+}
+
+// reviewAdmits is the selector's one-head-per-pull-request rule (#2726), read
+// only: a review of reviewKey at reviewHead fits unless this selection admitted
+// a review of that pull request at another head, which is returned. The
+// serialization preflight applies it as the selector does (#2737).
+func (s queuedJobResourceSelector) reviewAdmits(reviewKey, reviewHead string) (admittedHead string, ok bool) {
+	head, taken := s.reviews[reviewKey]
+	return head, !taken || head == reviewHead
 }
 
 func runtimeResourceLocked(ctx context.Context, store *db.Store, runtimeKey string) bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -48,11 +49,23 @@ func TestReviewHoldCountsADispatchedUnclaimedReview(t *testing.T) {
 	if !tracker.tryBeginPool("owner/repo") {
 		t.Fatal("could not begin the pool pass")
 	}
-	passDone := make(chan error, 1)
+	// The runner ignores cancellation while it waits on releaseA, so every exit,
+	// Fatal included, releases it and joins the pass before the deferred drain
+	// and the cleanup that restores the hooks the pass reads.
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseA) }) }
+	passCtx, cancelPass := context.WithCancel(ctx)
+	passExited := make(chan struct{})
+	var passErr error
 	go func() {
-		err := runQueuedJobsForRepoPoolTracked(ctx, worker, 2, 2, "owner/repo", "", tracker)
+		defer close(passExited)
+		passErr = runQueuedJobsForRepoPoolTracked(passCtx, worker, 2, 2, "owner/repo", "", tracker)
 		tracker.endPool("owner/repo")
-		passDone <- err
+	}()
+	defer func() {
+		release()
+		cancelPass()
+		<-passExited
 	}()
 	select {
 	case id := <-started:
@@ -71,7 +84,7 @@ func TestReviewHoldCountsADispatchedUnclaimedReview(t *testing.T) {
 	}
 
 	warning.Store(false)
-	close(releaseA)
+	release()
 	select {
 	case id := <-started:
 		if id != "review-b" {
@@ -81,9 +94,9 @@ func TestReviewHoldCountsADispatchedUnclaimedReview(t *testing.T) {
 		t.Fatal("review-b did not start after review-a ended")
 	}
 	select {
-	case err := <-passDone:
-		if err != nil {
-			t.Fatalf("pool pass: %v", err)
+	case <-passExited:
+		if passErr != nil {
+			t.Fatalf("pool pass: %v", passErr)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("pool pass did not finish")
@@ -151,5 +164,38 @@ func TestParallelizableSerialJobsCountsOneHeadPerPullRequest(t *testing.T) {
 	h.enqueue("review-other", "owner/repo", 13, overlapHeadB)
 	if got, _ := parallelizableSerialJobs(h.ctx, h.worker, "owner/repo", ""); got != 2 {
 		t.Fatalf("parallelizableSerialJobs = %d, want 2 (one head of PR 12, one of PR 13)", got)
+	}
+}
+
+// The preflight takes a pull request's head only with a job the selector
+// admits (#2737): R, a review of PR 13, takes session A; head B of PR 12 also
+// needs A, so the selector declines it and admits head C of PR 12 on session
+// B. That is two parallel slots, R and head C, as the selector itself selects.
+func TestParallelizableSerialJobsTakesAHeadOnlyWithItsAdmittedJob(t *testing.T) {
+	h := newOverlapHoldHarness(t)
+	for _, job := range []struct {
+		id, head, session string
+		pr                int
+	}{
+		{"review-r", overlapHeadB, "session-a", 13},
+		{"review-b", overlapHeadB, "session-a", 12},
+		{"review-c", overlapHeadC, "session-b", 12},
+	} {
+		h.enqueueRequest(workflow.JobRequest{ID: job.id, Repo: "owner/repo", PullRequest: job.pr, HeadSHA: job.head, RuntimeOverride: "omp", RuntimeOverrideRef: job.session})
+	}
+	pending, err := listPendingQueuedJobs(h.ctx, h.worker, "owner/repo", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, _ := selectRunnableQueuedJobs(h.ctx, h.store, pending, len(pending))
+	var ids []string
+	for _, job := range selected {
+		ids = append(ids, job.ID)
+	}
+	if strings.Join(ids, ",") != "review-r,review-c" {
+		t.Fatalf("selector admitted %v, want review-r and review-c", ids)
+	}
+	if got, _ := parallelizableSerialJobs(h.ctx, h.worker, "owner/repo", ""); got != 2 {
+		t.Fatalf("parallelizableSerialJobs = %d, want 2: review-b, declined on its session, must not keep head C out", got)
 	}
 }
