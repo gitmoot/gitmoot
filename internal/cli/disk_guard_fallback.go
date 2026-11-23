@@ -113,10 +113,11 @@ func diskGuardAlert(ctx context.Context, worker jobWorker, job db.Job, payload w
 
 // diskGuardReviewBandDispatch handles free space below remote_reviews_below_bytes
 // but above the dispatch floor: reviews move to the remote backend or wait
-// (with an alert), and every other job dispatches as normal.
-func diskGuardReviewBandDispatch(ctx context.Context, worker jobWorker, jobs, matching []db.Job, evaluation diskGuardEvaluation) []db.Job {
+// (with an alert), and every other job dispatches as normal. jobs is one
+// pass's queue, already scoped to its repo and session (#2735).
+func diskGuardReviewBandDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, evaluation diskGuardEvaluation) []db.Job {
 	reason := fmt.Sprintf("free space %d bytes is below the review threshold [disk_guard] remote_reviews_below_bytes=%d", evaluation.Usage.FreeBytes, evaluation.Policy.RemoteReviewsBelowBytes)
-	remote := diskGuardRemoteReviews(ctx, worker, matching, reason)
+	remote := diskGuardRemoteReviews(ctx, worker, jobs, reason)
 	routed := make(map[string]bool, len(remote))
 	paths, pathsErr := diskGuardPaths(worker)
 	for _, job := range remote {
@@ -144,7 +145,7 @@ func diskGuardReviewBandDispatch(ctx context.Context, worker jobWorker, jobs, ma
 	}
 	held := make(map[string]bool)
 	remoteAvailable := diskGuardRemoteAvailable(worker)
-	for _, job := range matching {
+	for _, job := range jobs {
 		if strings.EqualFold(strings.TrimSpace(job.Type), "review") && !routed[job.ID] {
 			held[job.ID] = true
 			// No silent starvation (#2373 review, P3): every held review gets a

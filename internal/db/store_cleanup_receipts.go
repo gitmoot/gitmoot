@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -197,22 +198,27 @@ func (s *Store) SupersedeCleanupReceipt(ctx context.Context, receipt CleanupRece
 // RecordCleanupArtifactSnapshot attaches preserved outputs only to the exact
 // terminal snapshot that was collected. Publication runs outside a SQL
 // transaction; a same-generation payload change must not be overwritten.
+// owner.Payload is the text the caller read, so the snapshot compares the
+// stored payload as TEXT: a legacy BLOB payload never equals a TEXT parameter,
+// and without the CAST its publication would always look stale (#2735).
 func (s *Store) RecordCleanupArtifactSnapshot(ctx context.Context, owner Job, snapshot string) (bool, error) {
 	ctx, release, err := s.AcquireJobLifecycle(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer release()
-	result, err := s.db.ExecContext(ctx, `UPDATE jobs
-		SET payload=json_set(payload, '$.cleanup_artifacts', json(?)), updated_at=CURRENT_TIMESTAMP
-		WHERE id=? AND lifecycle_generation=? AND state=? AND payload=?
-		  AND state IN ('succeeded', 'failed', 'cancelled')`,
-		snapshot, owner.ID, owner.LifecycleGeneration, owner.State, owner.Payload)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	affected, err := result.RowsAffected()
-	return affected == 1, err
+	defer tx.Rollback()
+	row := tx.QueryRowContext(ctx, `UPDATE jobs
+		SET payload=json_set(payload, '$.cleanup_artifacts', json(?)), updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND lifecycle_generation=? AND state=? AND CAST(payload AS TEXT)=?
+		  AND state IN ('succeeded', 'failed', 'cancelled')
+		RETURNING payload`,
+		snapshot, owner.ID, owner.LifecycleGeneration, owner.State, owner.Payload)
+	return commitReprojectedJobScope(ctx, tx, row, owner.ID)
 }
 
 // RecordReadOnlyCleanupDiff updates only captured metadata and only while the
@@ -224,17 +230,40 @@ func (s *Store) RecordReadOnlyCleanupDiff(ctx context.Context, owner Job, diff s
 		return false, err
 	}
 	defer release()
-	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET payload=json_set(payload,
-		'$.read_only_worktree_diff', ?,
-		'$.read_only_worktree_diff_truncated', json(?),
-		'$.read_only_worktree_diff_error', ?), updated_at=CURRENT_TIMESTAMP
-		WHERE id=? AND lifecycle_generation=? AND state=? AND payload=?
-		  AND state IN ('succeeded', 'failed', 'cancelled')`,
-		diff, strconv.FormatBool(truncated), captureError, owner.ID,
-		owner.LifecycleGeneration, owner.State, owner.Payload)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	affected, err := result.RowsAffected()
-	return affected == 1, err
+	defer tx.Rollback()
+	row := tx.QueryRowContext(ctx, `UPDATE jobs SET payload=json_set(payload,
+		'$.read_only_worktree_diff', ?,
+		'$.read_only_worktree_diff_truncated', json(?),
+		'$.read_only_worktree_diff_error', ?), updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND lifecycle_generation=? AND state=? AND CAST(payload AS TEXT)=?
+		  AND state IN ('succeeded', 'failed', 'cancelled')
+		RETURNING payload`,
+		diff, strconv.FormatBool(truncated), captureError, owner.ID,
+		owner.LifecycleGeneration, owner.State, owner.Payload)
+	return commitReprojectedJobScope(ctx, tx, row, owner.ID)
+}
+
+// commitReprojectedJobScope finishes a single-row payload rewrite done in SQL
+// (json_set) whose UPDATE returns the rewritten payload: no row means the
+// owner snapshot was stale and nothing changed. Otherwise it projects repo
+// and root_id from that payload in the same transaction, as every Go-built
+// payload write does in its UPDATE (#2735), then commits.
+func commitReprojectedJobScope(ctx context.Context, tx *sql.Tx, row *sql.Row, id string) (bool, error) {
+	var payload string
+	if err := row.Scan(&payload); errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	if err := writeJobScope(ctx, tx, id, payload); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }

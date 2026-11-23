@@ -121,6 +121,11 @@ type jobWorker struct {
 	// have not yet reaped (#2726); the overlap hold treats them as running.
 	// Shared like reviewHolds. nil (a hand-built test worker) registers nothing.
 	dispatchedReviews *reviewDispatchRegistry
+	// jobScope gates the scheduler's column-scoped queue listing on this
+	// process's startup repair (#2735). The daemon supervisors set it, shared
+	// across passes; nil (a hand-built or one-shot worker) lists the whole
+	// queue and scopes it by payload.
+	jobScope *jobScopeVerifier
 	// EventSinkOverride lets a test inject a recording events.Sink (#446). When
 	// nil (production), eventSink() resolves the shared event-rule sink.
 	EventSinkOverride events.Sink

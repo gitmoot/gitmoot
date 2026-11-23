@@ -30,7 +30,7 @@ const templatePublicationAttempts = 3
 // Open copies the current migrated schema into path when path does not exist,
 // then opens it without replaying migrations. Existing databases are never
 // replaced, which preserves data when a test reopens the same path.
-func Open(t *testing.T, path string) (*db.Store, error) {
+func Open(t testing.TB, path string) (*db.Store, error) {
 	t.Helper()
 
 	_, snapshot, err := migratedTemplate()

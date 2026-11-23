@@ -447,8 +447,9 @@ func (a janitorAdmission) expired() string {
 
 // janitorPressureQueuedDispatch drops the queued jobs janitor pressure holds
 // from a dispatch listing. It runs only on the forDispatch path, so diagnostic
-// listings never start janitor. Jobs outside the filters pass through untouched.
-func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) []db.Job {
+// listings never start janitor. jobs is already scoped to the pass's repo and
+// session (listPendingQueuedJobs, #2735).
+func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job) []db.Job {
 	if len(jobs) == 0 {
 		return jobs
 	}
@@ -461,22 +462,12 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 		return jobs
 	}
 	if evaluation, inBand := canonicalReviewWarningBand(paths, admission); inBand {
-		matching := make([]db.Job, 0, len(jobs))
-		for _, job := range jobs {
-			if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {
-				matching = append(matching, job)
-			}
-		}
-		jobs = diskGuardReviewBandDispatch(ctx, worker, jobs, matching, evaluation)
+		jobs = diskGuardReviewBandDispatch(ctx, worker, jobs, evaluation)
 	}
 	reasons := map[string]string{}
 	allowed := make([]db.Job, 0, len(jobs))
 	now := time.Now()
 	for _, job := range jobs {
-		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
-			allowed = append(allowed, job)
-			continue
-		}
 		repo := ""
 		sourceOnly := false
 		if payload, perr := daemonJobPayload(job); perr == nil {

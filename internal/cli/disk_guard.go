@@ -224,18 +224,13 @@ func diskGuardPaths(worker jobWorker) (config.Paths, error) {
 // diskGuardQueuedDispatch applies the source-host floor to every delivery,
 // including E2B reviews that still write controller state. Above that floor,
 // the warning band routes reviews before Janitor's fresh-space admission.
-// Maintenance and reconciliation remain outside this new-work guard.
-func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) []db.Job {
-	matching := make([]db.Job, 0, len(jobs))
-	for _, job := range jobs {
-		if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {
-			matching = append(matching, job)
-		}
-	}
-	if len(matching) == 0 {
+// Maintenance and reconciliation remain outside this new-work guard. jobs is
+// one scheduling pass's queue, already scoped to its repo and session by
+// listPendingQueuedJobs (#2735), so every job is the guard's to decide.
+func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job) []db.Job {
+	if len(jobs) == 0 {
 		return jobs
 	}
-
 	paths, err := diskGuardPaths(worker)
 	var evaluation diskGuardEvaluation
 	if err != nil {
@@ -250,7 +245,7 @@ func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Jo
 	if evaluation.allowsDispatch() {
 		clearDiskGuardRefusal(evaluation.Path)
 		if evaluation.reviewsBelowThreshold() {
-			return diskGuardReviewBandDispatch(ctx, worker, jobs, matching, evaluation)
+			return diskGuardReviewBandDispatch(ctx, worker, jobs, evaluation)
 		}
 		return jobs
 	}
@@ -263,7 +258,7 @@ func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Jo
 	}
 	failedEventWrites := 0
 	var firstEventWriteErr error
-	for _, job := range matching {
+	for _, job := range jobs {
 		if err := worker.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    diskGuardRefusalEventKind,
@@ -280,7 +275,7 @@ func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Jo
 			worker.Stdout,
 			"DISK GUARD event writes failed: failed=%d matching_jobs=%d path=%s reason=%s first_error=%v",
 			failedEventWrites,
-			len(matching),
+			len(jobs),
 			evaluation.Path,
 			evaluation.refusalReason(),
 			firstEventWriteErr,
