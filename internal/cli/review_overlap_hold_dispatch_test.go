@@ -199,3 +199,39 @@ func TestParallelizableSerialJobsTakesAHeadOnlyWithItsAdmittedJob(t *testing.T) 
 		t.Fatalf("parallelizableSerialJobs = %d, want 2: review-b, declined on its session, must not keep head C out", got)
 	}
 }
+
+// A job the selector declines on its checkout takes nothing in the preflight
+// either (#2746): X and Y share a review worktree, which the pool cannot
+// isolate around, so Y waits for X under any config. Y must not take head B of
+// PR 12 or session B, which Z (head C of PR 12) and Q (session B) need: the
+// preflight counts X, Z and Q, the jobs the selector itself admits.
+func TestParallelizableSerialJobsTakesNothingForACheckoutDeclinedJob(t *testing.T) {
+	h := newOverlapHoldHarness(t)
+	shared := t.TempDir()
+	for _, job := range []struct {
+		id, head, session, worktree string
+		pr                          int
+	}{
+		{"review-x", overlapHeadB, "session-a", shared, 13},
+		{"review-y", overlapHeadB, "session-b", shared, 12},
+		{"review-z", overlapHeadC, "session-c", "", 12},
+		{"review-q", overlapHeadB, "session-b", "", 14},
+	} {
+		h.enqueueRequest(workflow.JobRequest{ID: job.id, Repo: "owner/repo", PullRequest: job.pr, HeadSHA: job.head, WorktreePath: job.worktree, RuntimeOverride: "omp", RuntimeOverrideRef: job.session})
+	}
+	pending, err := listPendingQueuedJobs(h.ctx, h.worker, "owner/repo", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, _ := selectRunnableQueuedJobs(h.ctx, h.store, pending, len(pending))
+	var ids []string
+	for _, job := range selected {
+		ids = append(ids, job.ID)
+	}
+	if strings.Join(ids, ",") != "review-x,review-z,review-q" {
+		t.Fatalf("selector admitted %v, want review-x, review-z and review-q", ids)
+	}
+	if got, _ := parallelizableSerialJobs(h.ctx, h.worker, "owner/repo", ""); got != 3 {
+		t.Fatalf("parallelizableSerialJobs = %d, want 3: review-y, declined on its checkout, must not keep review-z and review-q out", got)
+	}
+}
