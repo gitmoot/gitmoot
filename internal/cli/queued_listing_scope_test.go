@@ -383,6 +383,99 @@ func TestJobScopeVerifierRepairsBlobPayloadsBeforeVerifying(t *testing.T) {
 	}
 }
 
+// stallingWriter blocks every Write until release is closed, announcing the
+// first one on entered.
+type stallingWriter struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w *stallingWriter) Write(p []byte) (int, error) {
+	select {
+	case w.entered <- struct{}{}:
+	default:
+	}
+	<-w.release
+	return len(p), nil
+}
+
+// Stop waits for the repair goroutine, not just cancels it: the supervisor
+// closes the store once stop returns, so a repair still running then could
+// touch a closed store (#2739). The repair is held in its success write; stop
+// stays blocked until that write returns.
+func TestJobScopeVerifierStopWaitsForTheRepairToReturn(t *testing.T) {
+	ctx, store, _, _ := diskGuardDispatchFixture(t)
+	stall := &stallingWriter{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(stall.release)
+		}
+	})
+
+	_, stop := startJobScopeVerifier(ctx, store, stall)
+	select {
+	case <-stall.entered:
+	case <-time.After(90 * time.Second):
+		t.Fatal("the verifier never wrote its success line")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		stop()
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("stop returned while the repair goroutine was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(stall.release)
+	released = true
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop did not return after the repair did")
+	}
+}
+
+// The worker's output stalls while the verifier writes its success line under
+// the serialized writer's mutex, so the repair outlives the stop timeout. Stop
+// still returns on time and reports the overrun through its own diagnostic
+// sink: a report through the stalled writer would wait on that mutex for as
+// long as the stall lasts (#2739).
+func TestJobScopeVerifierStopReportsATimeoutWithoutTheStalledWorkerOutput(t *testing.T) {
+	ctx, store, _, _ := diskGuardDispatchFixture(t)
+	stopTimeout, diagnostics := jobScopeStopTimeout, jobScopeStopDiagnostics
+	var diag lockedBuffer
+	jobScopeStopTimeout, jobScopeStopDiagnostics = 50*time.Millisecond, &diag
+	t.Cleanup(func() { jobScopeStopTimeout, jobScopeStopDiagnostics = stopTimeout, diagnostics })
+	stall := &stallingWriter{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	t.Cleanup(func() { close(stall.release) })
+
+	verifier, stop := startJobScopeVerifier(ctx, store, serializeWrites(stall))
+	select {
+	case <-stall.entered:
+	case <-time.After(90 * time.Second):
+		t.Fatal("the verifier never wrote its success line")
+	}
+	if !verifier.trusted() {
+		t.Fatal("job scope not verified before the success line")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		stop()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop did not return while the worker output was stalled")
+	}
+	waitFor(t, "the stop timeout diagnostic", 10*time.Second, func() bool {
+		return strings.Contains(diag.String(), "job scope repair did not stop within 50ms")
+	})
+}
+
 // The hold log stays bounded with no pass to prune it: a new hold past
 // reviewHoldLogCap evicts the oldest entry (#2735 review, P3).
 func TestReviewHoldLogEvictsTheOldestHoldAtItsCap(t *testing.T) {

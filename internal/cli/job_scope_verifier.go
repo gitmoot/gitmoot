@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"io"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -30,11 +31,25 @@ func (v *jobScopeVerifier) trusted() bool {
 // can shorten it.
 var jobScopeRepairBackoff = [2]time.Duration{time.Second, time.Minute}
 
+// jobScopeStopTimeout bounds how long stop waits for the repair to return.
+// A var so a test can shorten it.
+var jobScopeStopTimeout = daemonShutdownDrainTimeout
+
+// jobScopeStopDiagnostics receives the line stop reports when the repair
+// outlives jobScopeStopTimeout. It is not the worker's output: the repair
+// writes there through the serialized writer (output.go), and a write stalled
+// under that writer's mutex is one way the repair outlives the timeout, so a
+// report through the same sink could block the shutdown it bounds (#2739).
+// A var so a test can capture it.
+var jobScopeStopDiagnostics io.Writer = os.Stderr
+
 // startJobScopeVerifier runs the repair in the background until it succeeds
 // or ctx ends, logging each failure and the success, and returns the verifier
 // the daemon's workers share and a stop that cancels the repair and waits for
 // it, as the worktree reclaim loop's does: the supervisor calls it before it
-// returns and its store is closed.
+// returns and its store is closed. A repair still running after
+// jobScopeStopTimeout is reported to jobScopeStopDiagnostics from its own
+// goroutine, so stop returns on time even when that sink stalls too.
 func startJobScopeVerifier(ctx context.Context, store *db.Store, stdout io.Writer) (*jobScopeVerifier, func()) {
 	v := &jobScopeVerifier{}
 	repairCtx, cancel := context.WithCancel(ctx)
@@ -45,12 +60,12 @@ func startJobScopeVerifier(ctx context.Context, store *db.Store, stdout io.Write
 	}()
 	return v, func() {
 		cancel()
-		timer := time.NewTimer(daemonShutdownDrainTimeout)
+		timer := time.NewTimer(jobScopeStopTimeout)
 		defer timer.Stop()
 		select {
 		case <-done:
 		case <-timer.C:
-			writeLine(stdout, "job scope repair did not stop within %s", daemonShutdownDrainTimeout)
+			go writeLine(jobScopeStopDiagnostics, "gitmoot: job scope repair did not stop within %s", jobScopeStopTimeout)
 		}
 	}
 }
