@@ -445,10 +445,10 @@ func TestJobScopeVerifierStopWaitsForTheRepairToReturn(t *testing.T) {
 // long as the stall lasts (#2739).
 func TestJobScopeVerifierStopReportsATimeoutWithoutTheStalledWorkerOutput(t *testing.T) {
 	ctx, store, _, _ := diskGuardDispatchFixture(t)
-	stopTimeout, diagnostics := jobScopeStopTimeout, jobScopeStopDiagnostics
+	stopTimeout, diagnostics := jobScopeStopTimeout, stopOverrunDiagnostics
 	var diag lockedBuffer
-	jobScopeStopTimeout, jobScopeStopDiagnostics = 50*time.Millisecond, &diag
-	t.Cleanup(func() { jobScopeStopTimeout, jobScopeStopDiagnostics = stopTimeout, diagnostics })
+	jobScopeStopTimeout, stopOverrunDiagnostics = 50*time.Millisecond, &diag
+	t.Cleanup(func() { jobScopeStopTimeout, stopOverrunDiagnostics = stopTimeout, diagnostics })
 	stall := &stallingWriter{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	t.Cleanup(func() { close(stall.release) })
 

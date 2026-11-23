@@ -71,7 +71,7 @@ func startReplyWakeDrainLoop(ctx context.Context, store *db.Store, worker jobWor
 		select {
 		case <-done:
 		case <-timer.C:
-			writeLine(stdout, "reply wake outbox drain did not stop within %s", daemonShutdownDrainTimeout)
+			reportStopOverrun("reply wake outbox drain", daemonShutdownDrainTimeout)
 		}
 	}
 }
