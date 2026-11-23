@@ -511,6 +511,26 @@ func (s *Store) ListJobsByState(ctx context.Context, state string) ([]Job, error
 	return scanJobs(rows)
 }
 
+// listCancelledJobsSQL reads the cancelled jobs through
+// idx_jobs_terminal_state_updated_at, in that index's (updated_at, id) order.
+// The IN term restates the index's partial WHERE: SQLite uses a partial index
+// only for a query that implies its WHERE, and state = 'cancelled' alone does
+// not imply the IN list, so ListJobsByState("cancelled") scans the whole table
+// (#2740). INDEXED BY pins the plan, as listQueuedJobsSQL does.
+const listCancelledJobsSQL = `SELECT ` + jobColumns + ` FROM jobs INDEXED BY idx_jobs_terminal_state_updated_at
+		WHERE state IN ('succeeded', 'failed', 'cancelled') AND state = 'cancelled'
+		ORDER BY updated_at, id`
+
+// ListCancelledJobs returns every cancelled job, ordered by updated_at then id,
+// reading only the cancelled rows' payloads.
+func (s *Store) ListCancelledJobs(ctx context.Context) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, listCancelledJobsSQL)
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
+}
+
 // ListReviewJobsForRepoPoll returns the review jobs one repository's poll can
 // match, in id order: those whose denormalized repo is repo, plus every row
 // with an empty repo (#2530).

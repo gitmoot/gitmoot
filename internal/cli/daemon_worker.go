@@ -2804,13 +2804,16 @@ func armJobKillPending(store *db.Store, jobID string, deadline time.Time) func()
 // recoverKillPendingJobs is the startup anti-immortality pass. A running job
 // with a pre-kill witness but no terminal event consumed its deadline and the
 // daemon died during the kill unwind; it must be failed, never silently requeued.
+// It reads only the running jobs, through idx_jobs_running_updated_at, in the
+// id order the whole-table read it replaces had (#2740).
 func recoverKillPendingJobs(ctx context.Context, store *db.Store, stdout io.Writer) error {
-	jobs, err := store.ListJobs(ctx)
+	jobs, err := store.ListJobsByState(ctx, string(workflow.JobRunning))
 	if err != nil {
 		return err
 	}
+	sortJobsByID(jobs)
 	for _, job := range jobs {
-		if job.State != string(workflow.JobRunning) || isSessionRecordedJob(job) {
+		if isSessionRecordedJob(job) {
 			continue
 		}
 		events, err := store.ListJobEvents(ctx, job.ID)
