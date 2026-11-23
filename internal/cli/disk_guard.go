@@ -231,8 +231,6 @@ func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Jo
 	if len(jobs) == 0 {
 		return jobs
 	}
-	matching := jobs
-
 	paths, err := diskGuardPaths(worker)
 	var evaluation diskGuardEvaluation
 	if err != nil {
@@ -247,7 +245,7 @@ func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Jo
 	if evaluation.allowsDispatch() {
 		clearDiskGuardRefusal(evaluation.Path)
 		if evaluation.reviewsBelowThreshold() {
-			return diskGuardReviewBandDispatch(ctx, worker, jobs, matching, evaluation)
+			return diskGuardReviewBandDispatch(ctx, worker, jobs, evaluation)
 		}
 		return jobs
 	}
@@ -260,7 +258,7 @@ func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Jo
 	}
 	failedEventWrites := 0
 	var firstEventWriteErr error
-	for _, job := range matching {
+	for _, job := range jobs {
 		if err := worker.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    diskGuardRefusalEventKind,
@@ -277,7 +275,7 @@ func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Jo
 			worker.Stdout,
 			"DISK GUARD event writes failed: failed=%d matching_jobs=%d path=%s reason=%s first_error=%v",
 			failedEventWrites,
-			len(matching),
+			len(jobs),
 			evaluation.Path,
 			evaluation.refusalReason(),
 			firstEventWriteErr,

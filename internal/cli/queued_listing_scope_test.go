@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -189,5 +190,113 @@ func TestReviewHoldLogKeepsHoldsOutsideThePassScope(t *testing.T) {
 	}
 	if got := holds.held["other-held"].holder; got != "other-running" {
 		t.Fatalf("an owner/repo pass dropped other/repo's hold: entry = %q", got)
+	}
+}
+
+// scopedIDs lists, through the scheduler's listing, the queued job ids of one
+// repo and session pass.
+func scopedIDs(t *testing.T, ctx context.Context, worker jobWorker, repoFilter, rootFilter string) string {
+	t.Helper()
+	jobs, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		ids = append(ids, job.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
+// A queued child whose payload update moves it from session-a to session-b is
+// listed by the session-b pass and no longer by session-a's: UpdateJobPayload
+// re-projects root_id from the payload it writes, as every payload writer does
+// (#2735 review, P2).
+func TestUpdatedPayloadListsAQueuedJobInItsNewSession(t *testing.T) {
+	ctx, worker := queuedListingFixture(t, 0, 0)
+	store := worker.Store
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "child", Agent: "worker", Type: "ask", State: string(workflow.JobQueued),
+		Payload: `{"repo":"owner/repo","root_job_id":"session-a"}`}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := scopedIDs(t, ctx, worker, "", "session-a"); got != "child" {
+		t.Fatalf("session-a pass before the update = %q, want child", got)
+	}
+	if err := store.UpdateJobPayload(ctx, "child", `{"repo":"owner/repo","root_job_id":"session-b"}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := scopedIDs(t, ctx, worker, "", "session-b"); got != "child" {
+		t.Fatalf("session-b pass after the update = %q, want child", got)
+	}
+	if got := scopedIDs(t, ctx, worker, "", "session-a"); got != "" {
+		t.Fatalf("session-a pass after the update = %q, want none", got)
+	}
+}
+
+// A legacy row whose repo column the #1066 SQL backfill projected with
+// json_extract ("repo" only, case-sensitively) disagrees with the scheduler's
+// decode, which also matches "Repo" and keeps the last key. The daemon's
+// startup repair re-projects it, after which the owner/b pass lists it and the
+// owner/a pass does not (#2735 review, P2).
+func TestDaemonStartupRepairListsALegacyRowUnderTheDecodedRepo(t *testing.T) {
+	ctx, store, paths, worker := diskGuardDispatchFixture(t)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 50 << 30}, nil
+	})
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "dup", Agent: "worker", Type: "ask", State: string(workflow.JobQueued),
+		Payload: `{"repo":"owner/a","Repo":"owner/b"}`}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	// The row as it stands after a pre-projection insert and the #1066 backfill
+	// (store_migrations.go), statement for statement.
+	if _, err := raw.ExecContext(ctx, `UPDATE jobs SET repo = '' WHERE id = 'dup'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `UPDATE jobs SET repo = json_extract(payload, '$.repo')
+WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.repo'), '') != ''`); err != nil {
+		t.Fatal(err)
+	}
+	if got := scopedIDs(t, ctx, worker, "owner/b", ""); got != "" {
+		t.Fatalf("precondition: the owner/b pass lists %q before the repair; the legacy projection was not reproduced", got)
+	}
+	var out strings.Builder
+	// paths.Home is <home>/.gitmoot; the daemon takes <home>, as --home does.
+	daemonRunStartupReconcile(ctx, filepath.Dir(paths.Home), []string{"gitmoot-test"}, &out)()
+	if !strings.Contains(out.String(), "re-projected repo/session columns of 1 live job(s)") {
+		t.Fatalf("startup output %q does not report the one repaired job", out.String())
+	}
+	if got := scopedIDs(t, ctx, worker, "owner/b", ""); got != "dup" {
+		t.Fatalf("owner/b pass after the repair = %q, want dup", got)
+	}
+	if got := scopedIDs(t, ctx, worker, "owner/a", ""); got != "" {
+		t.Fatalf("owner/a pass after the repair = %q, want none", got)
+	}
+}
+
+// The hold log stays bounded with no pass to prune it: a new hold past
+// reviewHoldLogCap evicts the oldest entry (#2735 review, P3).
+func TestReviewHoldLogEvictsTheOldestHoldAtItsCap(t *testing.T) {
+	ctx, store, _, _ := diskGuardDispatchFixture(t)
+	holds := newReviewHoldLog()
+	for i := range reviewHoldLogCap {
+		holds.seq++
+		holds.held[fmt.Sprintf("held-%d", i)] = reviewHoldLogEntry{holder: "holder", seq: holds.seq}
+	}
+	if err := holds.record(ctx, store, "disk-guard-job", "holder", workflow.JobPayload{Repo: "owner/repo"}, "held"); err != nil {
+		t.Fatal(err)
+	}
+	if len(holds.held) != reviewHoldLogCap {
+		t.Fatalf("hold log size = %d, want the cap %d", len(holds.held), reviewHoldLogCap)
+	}
+	if _, kept := holds.held["held-0"]; kept {
+		t.Fatal("the oldest hold was kept past the cap")
+	}
+	if holds.held["disk-guard-job"].holder != "holder" || holds.held["held-1"].holder != "holder" {
+		t.Fatal("the new hold or the next-oldest one is missing")
 	}
 }

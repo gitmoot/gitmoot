@@ -462,7 +462,7 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 		return jobs
 	}
 	if evaluation, inBand := canonicalReviewWarningBand(paths, admission); inBand {
-		jobs = diskGuardReviewBandDispatch(ctx, worker, jobs, jobs, evaluation)
+		jobs = diskGuardReviewBandDispatch(ctx, worker, jobs, evaluation)
 	}
 	reasons := map[string]string{}
 	allowed := make([]db.Job, 0, len(jobs))

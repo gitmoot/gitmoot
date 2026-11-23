@@ -43,12 +43,18 @@ type jobPayloadProjection struct {
 	BlockerRetryAt         string          `json:"blocker_retry_at"`
 	BlockerSuggestedAction string          `json:"blocker_suggested_action"`
 	Result                 json.RawMessage `json:"result"`
+	// RootJobID is rootIDFromPayload's answer, kept beside repo so every payload
+	// writer re-projects jobs.root_id from the same decode as the payload it
+	// stores (#2735: the scheduler's session listing filters on that column).
+	RootJobID string `json:"root_job_id"`
 }
 
 func jobProjectionFromPayload(payload string) jobPayloadProjection {
 	var p jobPayloadProjection
 	if err := json.Unmarshal([]byte(payload), &p); err != nil {
-		return jobPayloadProjection{}
+		// A type error elsewhere in the payload must not drop the root the
+		// narrower rootIDFromPayload decode still finds.
+		return jobPayloadProjection{RootJobID: rootIDFromPayload(payload)}
 	}
 	return p
 }
@@ -663,14 +669,16 @@ func (s *Store) SumJobTokensByRoot(ctx context.Context, rootID string) (int, err
 //
 // Its arguments are (repo, repo, root, root, root); an empty repo or root means
 // no filter on it. The repo test is exact and case-sensitive, as the
-// scheduler's payload check (payload.Repo == repo) is: every writer of a job
-// payload writes the repo column from the same payload (jobProjectionFromPayload)
-// and migrations backfilled older rows from json_extract, so the column equals
-// payload.repo. The root test is the session rule: the job is the root itself,
-// or root_id (payload root_job_id, else the job id, written at insert and
-// backfilled by backfillJobRootID) is the root. A row with an empty repo or
-// root_id column is kept either way, so a caller that must be exact on a row
-// the projection never reached decodes it (#2735).
+// scheduler's payload check (payload.Repo == repo) is. The root test is the
+// session rule: the job is the root itself, or root_id (payload root_job_id,
+// else the job id) is the root. Both columns may EXCLUDE a row only because
+// they equal what the scheduler decodes: every payload writer sets them from
+// the payload it stores (jobProjectionFromPayload, the same Go field matching
+// as the scheduler's decode), in the same statement or transaction, and
+// ReprojectLiveJobScope repairs, at daemon start, live rows older code
+// projected otherwise (json_extract's backfill, root_id left by an update). A
+// row with an empty repo or root_id column is kept either way, so a caller
+// that must be exact on a row the projection never reached decodes it (#2735).
 //
 // INDEXED BY pins the plan to the queued partial index in created_at order, as
 // listQueuedJobsForRepoSQL does: today's planner picks it unaided, but with a
@@ -727,6 +735,78 @@ func (s *Store) ListQueuedJobsInScope(ctx context.Context, repo, root string) ([
 		jobs = append(jobs, job)
 	}
 	return jobs, rows.Err()
+}
+
+// ReprojectLiveJobScope re-derives repo and root_id for every job not in a
+// terminal state from its payload, with the decode every payload writer now
+// uses (jobProjectionFromPayload: Go's case-insensitive, last-key-wins field
+// matching, which the scheduler's own decode shares). It returns how many rows
+// changed. ListQueuedJobsInScope trusts a non-empty column to exclude a row, so
+// this repairs the rows older code projected differently: the SQL backfill of
+// repo (json_extract matches "repo" case-sensitively and takes the first
+// duplicate) and root_id left stale by a payload update (#2735). Blocked and
+// running jobs are included because a state-only transition can queue them
+// again; a terminal job is queued again only by a payload write, which
+// re-projects. Each row is rewritten only while its payload is unchanged, so a
+// concurrent writer, which projects its own payload, always wins.
+func (s *Store) ReprojectLiveJobScope(ctx context.Context) (int, error) {
+	ctx, release, err := s.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	rows, err := s.db.QueryContext(ctx, `SELECT id, payload, repo, root_id FROM jobs
+		WHERE state NOT IN ('succeeded', 'failed', 'cancelled')`)
+	if err != nil {
+		return 0, err
+	}
+	type stale struct{ id, payload, repo, rootID string }
+	var todo []stale
+	for rows.Next() {
+		var id, payload, repo, rootID string
+		if err := rows.Scan(&id, &payload, &repo, &rootID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		projection := jobProjectionFromPayload(payload)
+		wantRoot := projection.RootJobID
+		if wantRoot == "" {
+			wantRoot = id
+		}
+		if repo != projection.Repo || rootID != wantRoot {
+			todo = append(todo, stale{id: id, payload: payload, repo: projection.Repo, rootID: wantRoot})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	if len(todo) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	changed := 0
+	for _, row := range todo {
+		result, err := tx.ExecContext(ctx, `UPDATE jobs SET repo = ?, root_id = ? WHERE id = ? AND payload = ?`,
+			row.repo, row.rootID, row.id, row.payload)
+		if err != nil {
+			return 0, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		changed += int(affected)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return changed, nil
 }
 
 // CountQueuedJobsForRepo returns the queued engine-owned jobs targeting repo.
@@ -1158,8 +1238,8 @@ func (s *Store) transitionJobStatePayloadAtGeneration(ctx context.Context, id st
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(payload)
-	query := `UPDATE jobs SET state = ?, ` + bumpLifecycleGenerationSQL + `, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ? AND workflow_id = ?`
-	args := []any{to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	query := `UPDATE jobs SET state = ?, ` + bumpLifecycleGenerationSQL + `, payload = ?, result_hash = ?, repo = ?, root_id = COALESCE(NULLIF(?, ''), id), pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ? AND workflow_id = ?`
+	args := []any{to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.RootJobID, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, from, fromGeneration, projection.WorkflowID}
 	if runner != nil {
 		query += ` AND runner_pid = ? AND runner_boot_id = ?`
@@ -1321,9 +1401,9 @@ func (s *Store) TransitionJobStatePayloadWithEventUnlessAdvanceOwned(ctx context
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, root_id = COALESCE(NULLIF(?, ''), id), pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ? AND state = ? AND workflow_id = ?`+noLiveSupersedeAdvanceLockSQL,
-		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.RootJobID, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, from, projection.WorkflowID, formatResourceLockTime(now))
 	if err != nil {
 		return false, err
@@ -1376,8 +1456,8 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
-		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, root_id = COALESCE(NULLIF(?, ''), id), pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.RootJobID, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
 	if err != nil {
 		return false, err
@@ -1437,8 +1517,8 @@ func (s *Store) TransitionJobStatePayloadUsageWithEvent(ctx context.Context, id 
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, model = ?, input_tokens = ?, output_tokens = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
-		to, to, payload, strings.TrimSpace(model), inputTokens, outputTokens, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, model = ?, input_tokens = ?, output_tokens = ?, result_hash = ?, repo = ?, root_id = COALESCE(NULLIF(?, ''), id), pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+		to, to, payload, strings.TrimSpace(model), inputTokens, outputTokens, jobResultHashFromPayload(payload), projection.Repo, projection.RootJobID, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
 	if err != nil {
 		return false, err
@@ -1515,9 +1595,9 @@ func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.
 	}
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, root_id = COALESCE(NULLIF(?, ''), id), pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ? AND state = ? AND workflow_id = ?`+noLiveSupersedeAdvanceLockSQL,
-		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.RootJobID, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, from, projection.WorkflowID, formatResourceLockTime(now))
 	if err != nil {
 		return false, err
@@ -1561,8 +1641,8 @@ func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string)
 	}
 	defer tx.Rollback()
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ?`,
-		payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, root_id = COALESCE(NULLIF(?, ''), id), pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ?`,
+		payload, jobResultHashFromPayload(payload), projection.Repo, projection.RootJobID, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, projection.WorkflowID)
 	if err != nil {
 		return err
@@ -1685,9 +1765,9 @@ func (s *Store) rerouteQueuedJob(ctx context.Context, id string, payload string,
 	}
 	defer tx.Rollback()
 	projection := jobProjectionFromPayload(payload)
-	args := []any{payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	args := []any{payload, jobResultHashFromPayload(payload), projection.Repo, projection.RootJobID, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, projection.WorkflowID, atGeneration}
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ? AND lifecycle_generation = ? AND state = 'queued'`+clause,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, root_id = COALESCE(NULLIF(?, ''), id), pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ? AND lifecycle_generation = ? AND state = 'queued'`+clause,
 		append(args, clauseArgs...)...)
 	if err != nil {
 		return false, err
@@ -1722,8 +1802,8 @@ func (s *Store) UpdateJobPayloadAtGeneration(ctx context.Context, id string, pay
 	}
 	defer tx.Rollback()
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ? AND lifecycle_generation = ?`,
-		payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, root_id = COALESCE(NULLIF(?, ''), id), pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ? AND lifecycle_generation = ?`,
+		payload, jobResultHashFromPayload(payload), projection.Repo, projection.RootJobID, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, projection.WorkflowID, atGeneration)
 	if err != nil {
 		return false, err
@@ -1754,8 +1834,8 @@ func (s *Store) UpdateJobPayloadAndStateWithEvent(ctx context.Context, id string
 	}
 	defer tx.Rollback()
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ?`,
-		state, state, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, root_id = COALESCE(NULLIF(?, ''), id), pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ?`,
+		state, state, payload, jobResultHashFromPayload(payload), projection.Repo, projection.RootJobID, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, projection.WorkflowID)
 	if err != nil {
 		return err
@@ -2839,8 +2919,8 @@ func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id s
 		// invariant silently. Every other payload writer recomputes them in the same
 		// UPDATE; so does this one (#1673).
 		projection := jobProjectionFromPayload(string(payload))
-		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
-			to, payload, jobResultHashFromPayload(string(payload)), projection.Repo, projection.PullRequest,
+		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, root_id = COALESCE(NULLIF(?, ''), id), pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
+			to, payload, jobResultHashFromPayload(string(payload)), projection.Repo, projection.RootJobID, projection.PullRequest,
 			projection.BlockerRetryAt, projection.BlockerSuggestedAction, to, id, from)
 	}
 	if err != nil {

@@ -309,16 +309,26 @@ func reviewOverlapHeldMessage(key, head string, holder *reviewOverlapEntry) stri
 // id to holder job id, with the held job's repo and session root. It saves an
 // event write per pass for a hold already recorded; the store's dedupe (on a
 // message that is a function of the same identity) stays the source of truth
-// across restarts. Every dispatch listing prunes the holds in its scope, so it
-// never outgrows the queue. A nil log records every pass and remembers nothing.
+// across restarts. Every dispatch listing prunes the holds in its scope, and
+// the log keeps at most reviewHoldLogCap entries, evicting the oldest first, so
+// it stays bounded even for a repo that no longer gets passes (#2735). An
+// evicted hold that is still in force costs one deduplicated event claim on
+// its next pass. A nil log records every pass and remembers nothing.
 type reviewHoldLog struct {
 	mu   sync.Mutex
 	held map[string]reviewHoldLogEntry
+	seq  uint64
 }
 
 type reviewHoldLogEntry struct {
 	holder, repo, root string
+	seq                uint64
 }
+
+// reviewHoldLogCap bounds the log. Holds live only while their review waits on
+// another review of the same pull request, so a live set this large means
+// that many pull requests each have two reviews in flight at once.
+const reviewHoldLogCap = 1024
 
 func newReviewHoldLog() *reviewHoldLog {
 	return &reviewHoldLog{held: map[string]reviewHoldLogEntry{}}
@@ -338,10 +348,26 @@ func (l *reviewHoldLog) record(ctx context.Context, store *db.Store, heldID, hol
 	}
 	if l != nil {
 		l.mu.Lock()
-		l.held[heldID] = reviewHoldLogEntry{holder: holderID, repo: payload.Repo, root: payload.RootJobID}
+		if _, present := l.held[heldID]; !present && len(l.held) >= reviewHoldLogCap {
+			l.evictOldestLocked()
+		}
+		l.seq++
+		l.held[heldID] = reviewHoldLogEntry{holder: holderID, repo: payload.Repo, root: payload.RootJobID, seq: l.seq}
 		l.mu.Unlock()
 	}
 	return nil
+}
+
+// evictOldestLocked drops the entry recorded longest ago. It runs only when
+// the log is full, so a linear scan of reviewHoldLogCap entries is cheap.
+func (l *reviewHoldLog) evictOldestLocked() {
+	oldestID, oldestSeq := "", uint64(0)
+	for id, entry := range l.held {
+		if oldestID == "" || entry.seq < oldestSeq {
+			oldestID, oldestSeq = id, entry.seq
+		}
+	}
+	delete(l.held, oldestID)
 }
 
 // sweep evicts every hold that has ended: the held job left the queue, or this

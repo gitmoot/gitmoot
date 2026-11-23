@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -203,7 +204,12 @@ func (s *Store) RecordCleanupArtifactSnapshot(ctx context.Context, owner Job, sn
 		return false, err
 	}
 	defer release()
-	result, err := s.db.ExecContext(ctx, `UPDATE jobs
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE jobs
 		SET payload=json_set(payload, '$.cleanup_artifacts', json(?)), updated_at=CURRENT_TIMESTAMP
 		WHERE id=? AND lifecycle_generation=? AND state=? AND payload=?
 		  AND state IN ('succeeded', 'failed', 'cancelled')`,
@@ -211,8 +217,7 @@ func (s *Store) RecordCleanupArtifactSnapshot(ctx context.Context, owner Job, sn
 	if err != nil {
 		return false, err
 	}
-	affected, err := result.RowsAffected()
-	return affected == 1, err
+	return commitReprojectedJobScope(ctx, tx, result, owner.ID)
 }
 
 // RecordReadOnlyCleanupDiff updates only captured metadata and only while the
@@ -224,7 +229,12 @@ func (s *Store) RecordReadOnlyCleanupDiff(ctx context.Context, owner Job, diff s
 		return false, err
 	}
 	defer release()
-	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET payload=json_set(payload,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload=json_set(payload,
 		'$.read_only_worktree_diff', ?,
 		'$.read_only_worktree_diff_truncated', json(?),
 		'$.read_only_worktree_diff_error', ?), updated_at=CURRENT_TIMESTAMP
@@ -235,6 +245,29 @@ func (s *Store) RecordReadOnlyCleanupDiff(ctx context.Context, owner Job, diff s
 	if err != nil {
 		return false, err
 	}
+	return commitReprojectedJobScope(ctx, tx, result, owner.ID)
+}
+
+// commitReprojectedJobScope finishes a single-row payload rewrite done in SQL
+// (json_set), whose result Go only sees afterwards: it re-projects repo and
+// root_id from the stored payload in the same transaction, as every
+// Go-built payload write does in its UPDATE (#2735), then commits.
+func commitReprojectedJobScope(ctx context.Context, tx *sql.Tx, result sql.Result, id string) (bool, error) {
 	affected, err := result.RowsAffected()
-	return affected == 1, err
+	if err != nil || affected != 1 {
+		return false, err
+	}
+	var payload string
+	if err := tx.QueryRowContext(ctx, `SELECT payload FROM jobs WHERE id = ?`, id).Scan(&payload); err != nil {
+		return false, err
+	}
+	projection := jobProjectionFromPayload(payload)
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET repo = ?, root_id = COALESCE(NULLIF(?, ''), id) WHERE id = ?`,
+		projection.Repo, projection.RootJobID, id); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
