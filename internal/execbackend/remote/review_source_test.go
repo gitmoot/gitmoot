@@ -147,7 +147,8 @@ func TestRemoteReviewFetchesExactSourceWithoutHostCheckout(t *testing.T) {
 	}
 
 	// #2736: a failed preparation carries the failing step and git's own error
-	// through the real envd path, without leaking the source credentials.
+	// (forwarded from stderr; envd's end event says only "exit status N"),
+	// without leaking the source credentials.
 	failing, err := backend.Provision(ctx, execbackend.JobScope{JobID: "source-review-missing-base", TTL: time.Minute})
 	if err != nil {
 		t.Fatal(err)

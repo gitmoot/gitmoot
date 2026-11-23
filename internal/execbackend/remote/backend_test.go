@@ -656,7 +656,8 @@ func (h *providerHarness) runProcess(ctx context.Context, command string, args [
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return stdout.Bytes(), stderr.Bytes(), exitErr.ExitCode(), strings.TrimSpace(stderr.String())
+		// Real envd reports "exit status N" here; stderr arrives only as data frames.
+		return stdout.Bytes(), stderr.Bytes(), exitErr.ExitCode(), exitErr.Error()
 	}
 	return stdout.Bytes(), stderr.Bytes(), 1, err.Error()
 }

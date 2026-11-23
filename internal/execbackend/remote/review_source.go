@@ -47,6 +47,7 @@ else
     step=fetch-merged
     git fetch --quiet --no-tags --no-recurse-submodules source "$merged"
     if git cat-file -e "$merged^2" 2>/dev/null; then
+      step=merged-merge-base
       base=$(git merge-base "$merged^1" "$head")
     fi
   fi
