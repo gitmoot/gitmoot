@@ -68,3 +68,33 @@ func TestReviewHoldKeepsAHeldReviewOutOfRemoteRouting(t *testing.T) {
 		t.Fatalf("review-c backend = %q, want remote", c)
 	}
 }
+
+// The routing cap compares heads as the hold does (#2737): with local review A
+// running and X, a review of A's pull request already routed at A's head with
+// whitespace padding, the hold leaves X eligible, so X keeps the one routing
+// slot and C, a review of another pull request, is not routed beside it.
+func TestReviewHoldRoutingCapComparesHeadsAsTheHoldDoes(t *testing.T) {
+	ctx, store, worker := diskGuardRemoteFixture(t, true, 1)
+	for _, job := range []struct{ id, payload string }{
+		{"review-a", `{"repo":"owner/repo","pull_request":7,"head_sha":"` + overlapHeadA + `","exec_backend":"local"}`},
+		{"review-x", `{"repo":"owner/repo","pull_request":7,"head_sha":"\t` + overlapHeadA + `\n","exec_backend":"remote"}`},
+		{"review-c", `{"repo":"owner/repo","pull_request":8,"head_sha":"` + overlapHeadC + `"}`},
+	} {
+		if err := store.CreateJobWithEvent(ctx, db.Job{ID: job.id, Agent: "rev-omp", Type: "review", State: string(workflow.JobQueued), Payload: job.payload},
+			db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
+			t.Fatalf("CreateJobWithEvent %s: %v", job.id, err)
+		}
+		if job.id == "review-a" {
+			if claimed, err := store.ClaimRunningJob(ctx, "review-a", string(workflow.JobQueued), string(workflow.JobRunning), db.JobEvent{Kind: string(workflow.JobRunning)}, 1, "boot"); err != nil || !claimed {
+				t.Fatalf("claim review-a: claimed=%v err=%v", claimed, err)
+			}
+		}
+	}
+
+	if got := strings.Join(pendingIDs(t, ctx, worker), ","); got != "review-x" {
+		t.Fatalf("warning-band pending = %q, want review-x: the hold leaves it eligible, so it keeps the one routing slot", got)
+	}
+	if c := storedBackend(t, ctx, store, "review-c"); c != "" {
+		t.Fatalf("review-c backend = %q, want unset: review-x holds the routing slot", c)
+	}
+}

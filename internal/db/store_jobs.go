@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // rootIDFromPayload extracts the payload's root_job_id (the engine's rootJobID()
@@ -1818,23 +1820,68 @@ func (s *Store) RouteQueuedJobRemote(ctx context.Context, id string, payload str
 	return s.rerouteQueuedJob(ctx, id, payload, atGeneration, event, clause, args)
 }
 
+// ReviewIdentity is the canonical form of a review's repo or head for the
+// review overlap hold (#2726): whitespace trimmed as strings.TrimSpace trims it
+// and ASCII letters lowered. It is exactly what reviewIdentitySQL computes in
+// SQLite, whose trim takes the same whitespace set and whose lower folds ASCII
+// only, so the scheduler's hold and the routing cap's held-review rule agree on
+// every repo and head (#2737).
+func ReviewIdentity(s string) string {
+	s = strings.TrimSpace(s)
+	for i := 0; i < len(s); i++ {
+		if 'A' <= s[i] && s[i] <= 'Z' {
+			b := []byte(s)
+			for j := i; j < len(b); j++ {
+				if 'A' <= b[j] && b[j] <= 'Z' {
+					b[j] += 'a' - 'A'
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
+}
+
+// reviewIdentityTrimChars is the SQLite char() argument list of every rune
+// strings.TrimSpace trims: unicode.IsSpace is the White_Space property.
+var reviewIdentityTrimChars = func() string {
+	var codes []string
+	for _, r := range unicode.White_Space.R16 {
+		for c := uint32(r.Lo); c <= uint32(r.Hi); c += uint32(r.Stride) {
+			codes = append(codes, strconv.FormatUint(uint64(c), 10))
+		}
+	}
+	for _, r := range unicode.White_Space.R32 {
+		for c := r.Lo; c <= r.Hi; c += r.Stride {
+			codes = append(codes, strconv.FormatUint(uint64(c), 10))
+		}
+	}
+	return strings.Join(codes, ",")
+}()
+
+// reviewIdentitySQL is ReviewIdentity of the SQL text expression expr.
+func reviewIdentitySQL(expr string) string {
+	return "lower(trim(" + expr + ", char(" + reviewIdentityTrimChars + ")))"
+}
+
 // routeCapHeldReviewSQL is true for a jobs row r that is a queued review the
 // review overlap hold (#2726) holds by a running review: an engine-owned review
 // (externally_driven = 0) of the same repo and pull request, by the projected
 // columns, is running at a different payload head. It is the hold's rule for
-// running holders; a sibling the daemon has dispatched but not yet claimed is
+// running holders, repo and head compared by ReviewIdentity as the hold
+// compares them; a sibling the daemon has dispatched but not yet claimed is
 // in-process state the store cannot see, so a review held only by that counts
 // until the sibling claims. Every term is non-NULL, so NOT (...) never drops a
 // row from the count by accident. The EXISTS reads the running partial index:
 // INDEXED BY is required, left to itself SQLite builds an automatic index over
 // the whole jobs table on every execution (measured with EXPLAIN QUERY PLAN,
 // TestRouteCapHeldReviewSQLReadsTheRunningIndex).
-const routeCapHeldReviewSQL = `r.state = 'queued' AND r.type = 'review' AND COALESCE(r.repo, '') != '' AND COALESCE(r.pull_request, 0) > 0
-		AND COALESCE(trim(json_extract(r.payload, '$.head_sha')), '') != ''
+var routeCapHeldReviewSQL = `r.state = 'queued' AND r.type = 'review' AND ` + reviewIdentitySQL(`COALESCE(r.repo, '')`) + ` != '' AND COALESCE(r.pull_request, 0) > 0
+		AND ` + reviewIdentitySQL(`COALESCE(json_extract(r.payload, '$.head_sha'), '')`) + ` != ''
 		AND EXISTS (SELECT 1 FROM jobs h INDEXED BY idx_jobs_running_updated_at WHERE h.state = 'running' AND h.type = 'review' AND h.externally_driven = 0
-			AND lower(h.repo) = lower(r.repo) AND h.pull_request = r.pull_request
-			AND COALESCE(trim(json_extract(h.payload, '$.head_sha')), '') != ''
-			AND lower(trim(json_extract(h.payload, '$.head_sha'))) != lower(trim(json_extract(r.payload, '$.head_sha'))))`
+			AND ` + reviewIdentitySQL(`COALESCE(h.repo, '')`) + ` = ` + reviewIdentitySQL(`r.repo`) + ` AND h.pull_request = r.pull_request
+			AND ` + reviewIdentitySQL(`COALESCE(json_extract(h.payload, '$.head_sha'), '')`) + ` != ''
+			AND ` + reviewIdentitySQL(`COALESCE(json_extract(h.payload, '$.head_sha'), '')`) + ` != ` + reviewIdentitySQL(`json_extract(r.payload, '$.head_sha')`) + `)`
 
 func (s *Store) rerouteQueuedJob(ctx context.Context, id string, payload string, atGeneration int64, event JobEvent, clause string, clauseArgs []any) (bool, error) {
 	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)

@@ -49,17 +49,19 @@ func (h *reviewOverlapHeads) holderFor(head string) *reviewOverlapEntry {
 }
 
 // reviewOverlapKey is the (repo, pull request) a review belongs to. The repo
-// is part of the key because pull request numbers are not repo-qualified.
+// is part of the key because pull request numbers are not repo-qualified. Repo
+// and head are compared in db.ReviewIdentity form, the form the routing cap's
+// held-review rule compares in SQL (#2737).
 func reviewOverlapKey(repo string, pullRequest int) string {
-	return strings.ToLower(strings.TrimSpace(repo)) + "#" + strconv.Itoa(pullRequest)
+	return db.ReviewIdentity(repo) + "#" + strconv.Itoa(pullRequest)
 }
 
 // reviewOverlapEntryFor places a decoded review. ok is false for a job the
 // hold cannot place (no repo, no PR or no head): such a job is neither held
 // nor holds another.
 func reviewOverlapEntryFor(job db.Job, payload workflow.JobPayload) (key string, entry *reviewOverlapEntry, ok bool) {
-	head := strings.ToLower(strings.TrimSpace(payload.HeadSHA))
-	if strings.TrimSpace(payload.Repo) == "" || payload.PullRequest <= 0 || head == "" {
+	head := db.ReviewIdentity(payload.HeadSHA)
+	if db.ReviewIdentity(payload.Repo) == "" || payload.PullRequest <= 0 || head == "" {
 		return "", nil, false
 	}
 	return reviewOverlapKey(payload.Repo, payload.PullRequest), &reviewOverlapEntry{job: job, head: head}, true

@@ -73,9 +73,12 @@ status` shows that it is running.
    and its frozen prior-verdict list has the verdicts recorded by then,
    normally including the one it waited on. `gitmoot run show <run-id>` shows
    `review_held_for_running_review` naming the review it waits on. While it
-   waits it is not routed to the remote backend, does not count against the
-   remote routing cap, holds no lock and spends nothing; a local review keeps
-   the worktree it was created with. If you push again while it waits, the
+   waits it is not routed to the remote backend, holds no lock and spends
+   nothing; a local review keeps the worktree it was created with. A waiting
+   review that was already routed to the remote backend stops counting
+   against the remote routing cap only once the review it waits on is
+   running; while that review is started but still preparing, the waiting
+   one still counts. If you push again while it waits, the
    waiting reviews start one head at a time once it ends, so each later one
    also sees the verdict of the one started before it. Waiting cancels neither
    review. The daemon's pull request watcher still ends a queued or running
