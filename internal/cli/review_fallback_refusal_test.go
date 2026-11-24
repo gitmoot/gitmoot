@@ -16,17 +16,28 @@ import (
 const codexCyberPolicyRefusal = "delivery failed: omp turn failed (stopReason error): Codex error event: This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. If you’re doing authorized security work that requires more cyber permissive safeguards, apply for Daybreak access via https://platform.openai.com/settings/organization/status-and-access before retrying. (code=cyber_policy): exit status 1"
 
 func TestProviderContentRefusalClassifiesAsModelRefused(t *testing.T) {
-	got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(codexCyberPolicyRefusal)}, time.Now())
-	if !ok || got.Class != blockerClassModelRefused {
-		t.Fatalf("classifyOperationalBlocker = %+v, %v; want class %s", got, ok, blockerClassModelRefused)
+	const flagged = "omp turn failed (stopReason error): Codex error event: This content was flagged for possible cybersecurity risk. (code=cyber_policy)"
+	// The three suffix shapes seen across all 18 live failures.
+	for _, text := range []string{
+		codexCyberPolicyRefusal,
+		flagged,
+		flagged + ": remote command exited with code 1: exit status 1",
+	} {
+		got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(text)}, time.Now())
+		if !ok || got.Class != blockerClassModelRefused {
+			t.Fatalf("classifyOperationalBlocker(%q) = %+v, %v; want class %s", text, got, ok, blockerClassModelRefused)
+		}
+		if !got.RetryAt.IsZero() {
+			t.Fatalf("RetryAt = %v, want zero: a classifier verdict does not expire on a timer", got.RetryAt)
+		}
 	}
-	if !got.RetryAt.IsZero() {
-		t.Fatalf("RetryAt = %v, want zero: a classifier verdict does not expire on a timer", got.RetryAt)
-	}
-	// Naming the code is not the provider's error-code field.
+	// Quoting the code is not the provider refusing the content.
 	for _, text := range []string{
 		"delivery failed: the reviewer flagged cyber_policy handling as untested",
-		"delivery failed: plan validation: step 2 mentions (cyber_policy) in prose",
+		`delivery failed: {"error":{"message":"The submitted fixture contains (code=cyber_policy)","code":"invalid_request_error"}}`,
+		"omp turn failed (stopReason error): Codex error event: the fixture quotes (code=cyber_policy) mid-sentence and goes on",
+		"omp turn failed (stopReason error): Codex error event: flagged (diagnostic-code=cyber_policy)",
+		"omp turn failed (stopReason error): Codex error event: flagged (code=cyber_policy-preview-v2)",
 	} {
 		if got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(text)}, time.Now()); ok && got.Class == blockerClassModelRefused {
 			t.Fatalf("classifyOperationalBlocker(%q) = %s, want no model_refused", text, got.Class)
@@ -34,26 +45,35 @@ func TestProviderContentRefusalClassifiesAsModelRefused(t *testing.T) {
 	}
 }
 
-// A content refusal is a fact about one pool entry: a routed review moves to
-// the next entry immediately; with nothing left it stays failed, because
-// waiting does not change the classifier's verdict.
-func TestContentRefusalAdvancesReviewPoolOrStaysTerminal(t *testing.T) {
-	run := func(t *testing.T, pool []string) (bool, string, string, string, int, int) {
+// #2469 and #2750. An unknown model and a content refusal are facts about one
+// pool entry: a routed review moves to the next entry immediately; with
+// nothing left, or no pool at all, it stays failed, because waiting changes
+// neither omp's catalog nor the provider's verdict.
+func TestPerModelFailureAdvancesReviewPoolOrStaysTerminal(t *testing.T) {
+	type outcome struct {
+		deferred         bool
+		state, model     string
+		class            string
+		fallbacks, holds int
+	}
+	run := func(t *testing.T, failure, current string, pool []string) outcome {
 		t.Helper()
 		ctx := context.Background()
 		store, home := blockerE2EHome(t)
 		checkout := t.TempDir()
 		seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 		seedDaemonWorkerAgent(t, store, "omp-reviewer", runtime.OmpRuntime, "true", []string{"review"}, "owner/repo")
-		request := poolReviewRequest("job-refusal", "omp-reviewer")
+		request := poolReviewRequest("job-per-model", "omp-reviewer")
 		request.ReviewModelPool = pool
-		request.Model = pool[0]
+		request.Model = current
+		remote := "remote"
+		request.ExecBackend = &remote
 		enqueueDaemonWorkerJob(t, store, request)
 		if _, err := store.TransitionJobState(ctx, request.ID, string(workflow.JobQueued), string(workflow.JobRunning)); err != nil {
 			t.Fatalf("TransitionJobState: %v", err)
 		}
 		worker := blockerE2EWorker(store, home, checkout)
-		deferred, err := worker.deferOperationalBlockerPreTerminal(ctx, request.ID, workflow.DeliveryError{Err: errors.New(codexCyberPolicyRefusal)})
+		deferred, err := worker.deferOperationalBlockerPreTerminal(ctx, request.ID, workflow.DeliveryError{Err: errors.New(failure)})
 		if err != nil {
 			t.Fatalf("deferOperationalBlockerPreTerminal: %v", err)
 		}
@@ -62,20 +82,43 @@ func TestContentRefusalAdvancesReviewPoolOrStaysTerminal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return deferred, job.State, payload.Model, payload.BlockerClass,
-			len(eventsOfKind(events, reviewModelFallbackEventKind)), len(eventsOfKind(events, blockerDeferredEventKind))
+		return outcome{deferred, job.State, payload.Model, payload.BlockerClass,
+			len(eventsOfKind(events, reviewModelFallbackEventKind)), len(eventsOfKind(events, blockerDeferredEventKind))}
 	}
-	t.Run("next pool entry", func(t *testing.T) {
-		deferred, state, model, class, fallbacks, _ := run(t, []string{"openai-codex/gpt-6.2-sol", "anthropic/claude-opus-5-5"})
-		if !deferred || state != string(workflow.JobQueued) || model != "anthropic/claude-opus-5-5" || class != string(blockerClassModelRefused) || fallbacks != 1 {
-			t.Fatalf("deferred=%v state=%s model=%q class=%q fallbacks=%d, want queued on anthropic/claude-opus-5-5 as model_refused with one fallback event",
-				deferred, state, model, class, fallbacks)
-		}
-	})
-	t.Run("exhausted pool stays terminal", func(t *testing.T) {
-		deferred, state, _, class, _, holds := run(t, []string{"openai-codex/gpt-6.2-sol"})
-		if deferred || state != string(workflow.JobRunning) || class != "" || holds != 0 {
-			t.Fatalf("deferred=%v state=%s class=%q holds=%d, want the failure left to the terminal path with no timed hold", deferred, state, class, holds)
+	for _, tc := range []struct {
+		name, failure string
+		class         blockerClass
+	}{
+		{"unknown model", unknownModelFailure, blockerClassModelUnavailable},
+		{"content refusal", codexCyberPolicyRefusal, blockerClassModelRefused},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("next pool entry", func(t *testing.T) {
+				got := run(t, tc.failure, "openai-codex/gpt-6.1-sol", []string{"openai-codex/gpt-6.1-sol", "kimi-code/k3"})
+				if !got.deferred || got.state != string(workflow.JobQueued) || got.model != "kimi-code/k3" || got.class != string(tc.class) || got.fallbacks != 1 {
+					t.Fatalf("got %+v, want queued on kimi-code/k3 as %s with one fallback event", got, tc.class)
+				}
+			})
+			for name, pool := range map[string][]string{
+				"exhausted pool": {"openai-codex/gpt-6.1-sol"},
+				"no pool":        nil,
+			} {
+				t.Run(name+" stays terminal", func(t *testing.T) {
+					got := run(t, tc.failure, "openai-codex/gpt-6.1-sol", pool)
+					if got.deferred || got.state != string(workflow.JobRunning) || got.class != "" || got.holds != 0 {
+						t.Fatalf("got %+v, want the failure left to the terminal path with no timed hold", got)
+					}
+				})
+			}
+		})
+	}
+	// The reviewer's probe: an unrelated provider error that quotes the code
+	// must not move the review to another model.
+	t.Run("quoted code does not fall back", func(t *testing.T) {
+		got := run(t, `delivery failed: {"error":{"message":"The submitted fixture contains (code=cyber_policy)","code":"invalid_request_error"}}`,
+			"openai-codex/gpt-6.1-sol", []string{"openai-codex/gpt-6.1-sol", "kimi-code/k3"})
+		if got.model != "openai-codex/gpt-6.1-sol" || got.fallbacks != 0 {
+			t.Fatalf("got %+v, want no pool advance", got)
 		}
 	})
 }

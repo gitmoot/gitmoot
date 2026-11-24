@@ -1223,7 +1223,9 @@ Usage:
 
 request routes one independent review of the pull request's current (or --head) commit.
 Gitmoot picks a review-capable reviewer (or --reviewer), runs it on omp with the [review_router] model pool
-for the purpose, falls back to the next model on a provider quota/auth failure, and
+for the purpose, falls back to the next model on a provider quota/auth failure, an unknown
+model, or a provider content refusal (`code=cyber_policy`; with no usable model left the
+review fails, with no timed retry), and
 wakes --role (default $GITMOOT_ORG_ROLE) when the verdict is saved. A second request for
 the same head attaches to the running review or to its saved verdict; it never spends
 another reviewer. No verdict ever triggers a model change.

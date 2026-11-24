@@ -496,13 +496,17 @@ var billingExhaustionRe = regexp.MustCompile(
 var providerCapacityRe = regexp.MustCompile(
 	`\bcode"?\s*[=:]\s*"?[a-z_]*rate_limit_exceeded\b`)
 
-// providerContentRefusalRe matches a provider's content-policy refusal, by
-// the same rule as providerCapacityRe: only the provider's error-code field
-// counts, never the code named in prose. Measured wording (Codex via omp):
+// providerContentRefusalRe matches a provider's content-policy refusal as omp
+// renders it, not the code quoted anywhere in the error. Measured on all 18
+// live failures (2026-11-24): the `(code=cyber_policy)` group CLOSES the
+// `Codex error event:` line, followed only by the end of the text, a newline,
+// or the `: exit status N` / `: remote command exited ...` wrapper. A message
+// or fixture that quotes the group mid-sentence, a different code value, or
+// another key (`diagnostic-code`) does not match.
 //
-//	This content was flagged for possible cybersecurity risk. ...
-//	(code=cyber_policy)
-var providerContentRefusalRe = regexp.MustCompile(`\bcode"?\s*[=:]\s*"?cyber_policy\b`)
+//	Codex error event: This content was flagged for possible cybersecurity
+//	risk. ... (code=cyber_policy): exit status 1
+var providerContentRefusalRe = regexp.MustCompile(`codex error event: [^\n]*\(code=cyber_policy\)(?:\z|\n|:)`)
 
 // entitlementRevokedRe matches a provider saying the account is no longer
 // ALLOWED to use this product, as distinct from being unable to pay for it.
@@ -844,7 +848,7 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 				strings.Join(skipped, ", "), strings.Join(remoteOmpAuthenticatedProviders(), ", ")),
 		})
 	}
-	if !ok && (classification.Class == blockerClassModelUnavailable || classification.Class == blockerClassModelRefused) {
+	if !ok && classification.RetryAt.IsZero() {
 		// No usable next pool entry (or no pool at all): retrying the same model
 		// later fails identically, so keep the failure terminal.
 		return false, nil
