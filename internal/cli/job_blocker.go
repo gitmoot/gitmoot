@@ -461,6 +461,28 @@ var billingExhaustionRe = regexp.MustCompile(
 		`need a [\w -]*subscription|requires? a [\w -]*subscription to|` +
 		`upgrade at https?://)`)
 
+// providerCapacityRe matches a provider refusing a call because it is out of
+// CAPACITY. That is a throttle like any other: this model cannot serve the job
+// now, another in the pool can. Measured, 2026-11-24: six routed reviews in 7
+// days died on
+//
+//	Codex error event: Codex is at capacity, please try again later
+//	(code=turn_rate_limit_exceeded) retry-after-ms=417000
+//
+// with fallback models behind them, because "rate_limit" (underscore) is not
+// "rate limit" and the line carries no 429.
+//
+// ONLY THE PROVIDER'S ERROR-CODE FIELD COUNTS: omp renders it `(code=<code>)`,
+// and a raw provider body carries `"code":"<code>"`. A DeliveryError marks the
+// delivery seam, not the origin of its text, so independent review of #2749
+// executed the first cut, which matched the bare identifier and the quoted
+// "at capacity" sentence: a delivery failure that merely mentioned
+// rate_limit_exceeded, an omp plan-validation error and an unknown model whose
+// name ended in rate_limit_exceeded all advanced the pool, the last one ahead
+// of model_unavailable. None of those carries a code FIELD.
+var providerCapacityRe = regexp.MustCompile(
+	`\bcode"?\s*[=:]\s*"?[a-z_]*rate_limit_exceeded\b`)
+
 // entitlementRevokedRe matches a provider saying the account is no longer
 // ALLOWED to use this product, as distinct from being unable to pay for it.
 //
@@ -502,7 +524,7 @@ func classifyAuthQuotaStrict(text string) string {
 			strings.Contains(l, "weekly limit"),
 			claudeHitYourQuotaLimit(l),
 			strings.Contains(l, "quota"), strings.Contains(l, "limit resets"),
-			billingExhaustionRe.MatchString(l),
+			billingExhaustionRe.MatchString(l), providerCapacityRe.MatchString(l),
 			httpCtx && code429Re.MatchString(l):
 			return "throttled"
 		case strings.Contains(l, "authentication"), strings.Contains(l, "unauthorized"),
