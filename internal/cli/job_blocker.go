@@ -470,13 +470,18 @@ var billingExhaustionRe = regexp.MustCompile(
 //	(code=turn_rate_limit_exceeded) retry-after-ms=417000
 //
 // with fallback models behind them, because "rate_limit" (underscore) is not
-// "rate limit" and the line carries no 429. As with billingExhaustionRe, each
-// alternative is provider wording, not a topic word: a review saying "the
-// worker pool is at capacity" must not park as a provider outage, so "at
-// capacity" counts only beside the provider's own retry instruction, and the
-// error code only as one identifier token.
+// "rate limit" and the line carries no 429.
+//
+// ONLY THE PROVIDER'S ERROR-CODE FIELD COUNTS: omp renders it `(code=<code>)`,
+// and a raw provider body carries `"code":"<code>"`. A DeliveryError marks the
+// delivery seam, not the origin of its text, so independent review of #2749
+// executed the first cut, which matched the bare identifier and the quoted
+// "at capacity" sentence: a delivery failure that merely mentioned
+// rate_limit_exceeded, an omp plan-validation error and an unknown model whose
+// name ended in rate_limit_exceeded all advanced the pool, the last one ahead
+// of model_unavailable. None of those carries a code FIELD.
 var providerCapacityRe = regexp.MustCompile(
-	`(?:\b[a-z_]*rate_limit_exceeded\b|\bat capacity, please try again later\b)`)
+	`\bcode"?\s*[=:]\s*"?[a-z_]*rate_limit_exceeded\b`)
 
 // entitlementRevokedRe matches a provider saying the account is no longer
 // ALLOWED to use this product, as distinct from being unable to pay for it.

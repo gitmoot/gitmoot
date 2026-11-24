@@ -44,6 +44,11 @@ func TestProviderCapacityPhrasesDoNotMatchReviewProse(t *testing.T) {
 		"the handler returns RateLimitExceeded without a retry hint",
 		"rename rate_limit_exceeded_total to follow the metric naming convention",
 		"please try again later is shown to users without a retry button",
+		// #2749 review probes: a mention of the code, or the provider's sentence
+		// quoted, is not the provider's error-code field.
+		"P2: the handler drops the rate_limit_exceeded response",
+		"delivery failed: plan validation: step 3 quotes \"at capacity, please try again later\"",
+		"delivery failed: retry when the upstream returns rate_limit_exceeded",
 	} {
 		t.Run(text, func(t *testing.T) {
 			if got := classifyAuthQuotaStrict(text); got != "" {
@@ -53,5 +58,15 @@ func TestProviderCapacityPhrasesDoNotMatchReviewProse(t *testing.T) {
 				t.Fatalf("classifyAuthQuota(%q) = %q, want \"\"", text, got)
 			}
 		})
+	}
+}
+
+// An unknown model whose name ends in the code is model_unavailable, not a
+// throttle: the first cut of #2749 let the capacity match claim it first.
+func TestUnknownModelNamedLikeTheCapacityCodeStaysModelUnavailable(t *testing.T) {
+	text := "delivery failed: omp turn failed: unknown model: acme/turn_rate_limit_exceeded: exit status 1"
+	got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(text)}, time.Now())
+	if !ok || got.Class != blockerClassModelUnavailable {
+		t.Fatalf("classifyOperationalBlocker = %+v, %v; want class %s", got, ok, blockerClassModelUnavailable)
 	}
 }
