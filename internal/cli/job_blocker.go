@@ -500,13 +500,16 @@ var providerCapacityRe = regexp.MustCompile(
 // renders it, not the code quoted anywhere in the error. Measured on all 18
 // live failures (2026-11-24): the `(code=cyber_policy)` group CLOSES the
 // `Codex error event:` line, followed only by the end of the text, a newline,
-// or the `: exit status N` / `: remote command exited ...` wrapper. A message
-// or fixture that quotes the group mid-sentence, a different code value, or
-// another key (`diagnostic-code`) does not match.
+// or the runtime's own exit wrappers (`: exit status N`, optionally preceded
+// by `: remote command exited with code N`). Nothing else may follow: a
+// message that quotes the group, even right before a colon, and then carries
+// the provider's real code does not match, nor does a different code value or
+// another key (`diagnostic-code`).
 //
 //	Codex error event: This content was flagged for possible cybersecurity
 //	risk. ... (code=cyber_policy): exit status 1
-var providerContentRefusalRe = regexp.MustCompile(`codex error event: [^\n]*\(code=cyber_policy\)(?:\z|\n|:)`)
+var providerContentRefusalRe = regexp.MustCompile(
+	`codex error event: [^\n]*\(code=cyber_policy\)(?:: remote command exited with code \d+)?(?:: exit status \d+)?(?:\n|\z)`)
 
 // entitlementRevokedRe matches a provider saying the account is no longer
 // ALLOWED to use this product, as distinct from being unable to pay for it.
@@ -827,13 +830,13 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	payload.BlockerClass = string(classification.Class)
 	payload.BlockerAttempts = attempt
 	payload.BlockerSuggestedAction = classification.SuggestedAction
-	// #2171 router fallback: a quota, auth, unknown-model (#2469) or
-	// content-refusal failure on one pool entry is an
-	// operational fact about that provider, not about the review, so advance to
-	// the next untried model and re-queue immediately instead of waiting out the
-	// provider's window. Only pre-verdict operational classes qualify; the
-	// exhausted pool falls through to the timed hold unchanged, and the shared
-	// attempt budget above still bounds the whole sequence.
+	// #2171 router fallback: a failure the classifier attributes to one pool
+	// entry (see nextReviewPoolModel for the classes) is an operational fact
+	// about that provider, not about the review, so advance to the next untried
+	// model and re-queue immediately instead of waiting out the provider's
+	// window. With no usable next model the job waits only when the
+	// classification supplies a retry time; otherwise it stays failed. The
+	// shared attempt budget above still bounds the whole sequence.
 	eventKind := blockerDeferredEventKind
 	previousModel := payload.Model
 	previousRuntime := strings.TrimSpace(payload.RuntimeOverride)

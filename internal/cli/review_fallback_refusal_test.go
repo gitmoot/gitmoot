@@ -15,6 +15,15 @@ import (
 // behind them.
 const codexCyberPolicyRefusal = "delivery failed: omp turn failed (stopReason error): Codex error event: This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. If you’re doing authorized security work that requires more cyber permissive safeguards, apply for Daybreak access via https://platform.openai.com/settings/organization/status-and-access before retrying. (code=cyber_policy): exit status 1"
 
+// unknownModelFailure is omp's measured refusal when a pool model is missing
+// from the remote catalog (herdrup#589, data-core#29).
+const unknownModelFailure = "omp turn failed (stopReason error): Unknown model: openai-codex/gpt-6.1-sol: remote command exited with code 1: exit status 1"
+
+// quotedRefusalCodeBeforeColon is the round-2 reviewer's probe: a Codex error
+// whose message quotes the refusal code right before a colon, while the
+// provider's real code is a different one.
+const quotedRefusalCodeBeforeColon = "omp turn failed (stopReason error): Codex error event: The submitted fixture contains (code=cyber_policy): the marker is not valid in this field. (code=invalid_request_error): exit status 1"
+
 func TestProviderContentRefusalClassifiesAsModelRefused(t *testing.T) {
 	const flagged = "omp turn failed (stopReason error): Codex error event: This content was flagged for possible cybersecurity risk. (code=cyber_policy)"
 	// The three suffix shapes seen across all 18 live failures.
@@ -38,6 +47,7 @@ func TestProviderContentRefusalClassifiesAsModelRefused(t *testing.T) {
 		"omp turn failed (stopReason error): Codex error event: the fixture quotes (code=cyber_policy) mid-sentence and goes on",
 		"omp turn failed (stopReason error): Codex error event: flagged (diagnostic-code=cyber_policy)",
 		"omp turn failed (stopReason error): Codex error event: flagged (code=cyber_policy-preview-v2)",
+		quotedRefusalCodeBeforeColon,
 	} {
 		if got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(text)}, time.Now()); ok && got.Class == blockerClassModelRefused {
 			t.Fatalf("classifyOperationalBlocker(%q) = %s, want no model_refused", text, got.Class)
@@ -112,13 +122,17 @@ func TestPerModelFailureAdvancesReviewPoolOrStaysTerminal(t *testing.T) {
 			}
 		})
 	}
-	// The reviewer's probe: an unrelated provider error that quotes the code
+	// The reviewers' probes: an unrelated provider error that quotes the code
 	// must not move the review to another model.
-	t.Run("quoted code does not fall back", func(t *testing.T) {
-		got := run(t, `delivery failed: {"error":{"message":"The submitted fixture contains (code=cyber_policy)","code":"invalid_request_error"}}`,
-			"openai-codex/gpt-6.1-sol", []string{"openai-codex/gpt-6.1-sol", "kimi-code/k3"})
-		if got.model != "openai-codex/gpt-6.1-sol" || got.fallbacks != 0 {
-			t.Fatalf("got %+v, want no pool advance", got)
-		}
-	})
+	for name, failure := range map[string]string{
+		"quoted in JSON":      `delivery failed: {"error":{"message":"The submitted fixture contains (code=cyber_policy)","code":"invalid_request_error"}}`,
+		"quoted before colon": quotedRefusalCodeBeforeColon,
+	} {
+		t.Run(name+" does not fall back", func(t *testing.T) {
+			got := run(t, failure, "openai-codex/gpt-6.1-sol", []string{"openai-codex/gpt-6.1-sol", "kimi-code/k3"})
+			if got.model != "openai-codex/gpt-6.1-sol" || got.fallbacks != 0 {
+				t.Fatalf("got %+v, want no pool advance", got)
+			}
+		})
+	}
 }

@@ -117,7 +117,3 @@ func TestRemoteReviewFallbackUsesKimiRoute(t *testing.T) {
 		t.Fatalf("remote review skipped a routed provider: %+v", skipped)
 	}
 }
-
-// unknownModelFailure is omp's measured refusal when a pool model is missing
-// from the remote catalog (herdrup#589, data-core#29).
-const unknownModelFailure = "omp turn failed (stopReason error): Unknown model: openai-codex/gpt-6.1-sol: remote command exited with code 1: exit status 1"
