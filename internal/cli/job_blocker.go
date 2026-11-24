@@ -507,6 +507,13 @@ var providerCapacityRe = regexp.MustCompile(
 // follows the quote, nor does a different code value or another key
 // (`diagnostic-code`).
 //
+// KNOWN LIMIT (#2751): omp delivers the code only inside its rendered
+// errorMessage (ompStreamMessage has errorStatus but no code field), and
+// appends nothing when the provider sends no code. A code-less provider error
+// whose own message ends in this literal is therefore indistinguishable here
+// and also advances the pool. The cost is one unneeded fallback to the next
+// model, never a changed verdict; routing on a typed code needs omp to emit it.
+//
 //	Codex error event: This content was flagged for possible cybersecurity
 //	risk. ... (code=cyber_policy): exit status 1
 var providerContentRefusalRe = regexp.MustCompile(
