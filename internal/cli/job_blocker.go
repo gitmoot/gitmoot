@@ -461,6 +461,23 @@ var billingExhaustionRe = regexp.MustCompile(
 		`need a [\w -]*subscription|requires? a [\w -]*subscription to|` +
 		`upgrade at https?://)`)
 
+// providerCapacityRe matches a provider refusing a call because it is out of
+// CAPACITY. That is a throttle like any other: this model cannot serve the job
+// now, another in the pool can. Measured, 2026-11-24: six routed reviews in 7
+// days died on
+//
+//	Codex error event: Codex is at capacity, please try again later
+//	(code=turn_rate_limit_exceeded) retry-after-ms=417000
+//
+// with fallback models behind them, because "rate_limit" (underscore) is not
+// "rate limit" and the line carries no 429. As with billingExhaustionRe, each
+// alternative is provider wording, not a topic word: a review saying "the
+// worker pool is at capacity" must not park as a provider outage, so "at
+// capacity" counts only beside the provider's own retry instruction, and the
+// error code only as one identifier token.
+var providerCapacityRe = regexp.MustCompile(
+	`(?:\b[a-z_]*rate_limit_exceeded\b|\bat capacity, please try again later\b)`)
+
 // entitlementRevokedRe matches a provider saying the account is no longer
 // ALLOWED to use this product, as distinct from being unable to pay for it.
 //
@@ -502,7 +519,7 @@ func classifyAuthQuotaStrict(text string) string {
 			strings.Contains(l, "weekly limit"),
 			claudeHitYourQuotaLimit(l),
 			strings.Contains(l, "quota"), strings.Contains(l, "limit resets"),
-			billingExhaustionRe.MatchString(l),
+			billingExhaustionRe.MatchString(l), providerCapacityRe.MatchString(l),
 			httpCtx && code429Re.MatchString(l):
 			return "throttled"
 		case strings.Contains(l, "authentication"), strings.Contains(l, "unauthorized"),
