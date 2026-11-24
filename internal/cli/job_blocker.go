@@ -71,6 +71,14 @@ const (
 	// routed review advances to the next entry; waiting cannot teach omp the
 	// model, so with no usable next entry the job stays failed.
 	blockerClassModelUnavailable blockerClass = "model_unavailable"
+	// blockerClassModelRefused classifies a provider's content-policy refusal
+	// of ONE model ("This content was flagged for possible cybersecurity risk
+	// ... (code=cyber_policy)"). Measured 2026-11-24: 18 routed reviews in 30
+	// days failed on it, on ordinary diffs, with fallback models behind them.
+	// Like model_unavailable it is a fact about one pool entry, so a routed
+	// review advances to the next entry at once; waiting does not change a
+	// classifier's verdict, so with no usable next entry the job stays failed.
+	blockerClassModelRefused blockerClass = "model_refused"
 	// blockerClassCheckoutContention (#532 slice C) classifies a daemon-owned
 	// pre-flight checkout failure: a branch-lock conflict (self-heals, short
 	// exponential backoff) or a dirty/wrong-head checkout (usually needs a human;
@@ -172,7 +180,7 @@ func reviewFallbackSwitchesToOmp(effectiveRuntime string) bool {
 // there (#2333); the pool itself is untouched, so local reviews keep the entry.
 func nextReviewPoolModel(payload workflow.JobPayload, classification blockerClassification, usable func(model string) bool) (next string, skipped []string, ok bool) {
 	switch classification.Class {
-	case blockerClassRuntimeQuota, blockerClassRuntimeAuth, blockerClassModelUnavailable:
+	case blockerClassRuntimeQuota, blockerClassRuntimeAuth, blockerClassModelUnavailable, blockerClassModelRefused:
 	case blockerClassNetworkOutage:
 		if !isOmpProviderTransportFailure(classification.Detail) {
 			return "", nil, false
@@ -397,6 +405,11 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 		// either advances a routed review's pool or leaves the failure terminal.
 		return blockerClassification{Class: blockerClassModelUnavailable, Detail: detail}, true
 	}
+	if providerContentRefusalRe.MatchString(strings.ToLower(text)) {
+		// Same routing as model_unavailable: RetryAt stays zero, so the seam
+		// advances a routed review's pool or leaves the failure terminal.
+		return blockerClassification{Class: blockerClassModelRefused, Detail: detail}, true
+	}
 	// CAPABILITY refusal (#1821): the runtime could not be executed at all.
 	// Checked AFTER auth/quota so a 401/429 keeps its more specific class, and
 	// BEFORE the network arm because neither predicate should be able to claim
@@ -482,6 +495,14 @@ var billingExhaustionRe = regexp.MustCompile(
 // of model_unavailable. None of those carries a code FIELD.
 var providerCapacityRe = regexp.MustCompile(
 	`\bcode"?\s*[=:]\s*"?[a-z_]*rate_limit_exceeded\b`)
+
+// providerContentRefusalRe matches a provider's content-policy refusal, by
+// the same rule as providerCapacityRe: only the provider's error-code field
+// counts, never the code named in prose. Measured wording (Codex via omp):
+//
+//	This content was flagged for possible cybersecurity risk. ...
+//	(code=cyber_policy)
+var providerContentRefusalRe = regexp.MustCompile(`\bcode"?\s*[=:]\s*"?cyber_policy\b`)
 
 // entitlementRevokedRe matches a provider saying the account is no longer
 // ALLOWED to use this product, as distinct from being unable to pay for it.
@@ -802,8 +823,8 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	payload.BlockerClass = string(classification.Class)
 	payload.BlockerAttempts = attempt
 	payload.BlockerSuggestedAction = classification.SuggestedAction
-	// #2171 router fallback: a quota, auth or unknown-model (#2469) failure on
-	// one pool entry is an
+	// #2171 router fallback: a quota, auth, unknown-model (#2469) or
+	// content-refusal failure on one pool entry is an
 	// operational fact about that provider, not about the review, so advance to
 	// the next untried model and re-queue immediately instead of waiting out the
 	// provider's window. Only pre-verdict operational classes qualify; the
@@ -823,7 +844,7 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 				strings.Join(skipped, ", "), strings.Join(remoteOmpAuthenticatedProviders(), ", ")),
 		})
 	}
-	if !ok && classification.Class == blockerClassModelUnavailable {
+	if !ok && (classification.Class == blockerClassModelUnavailable || classification.Class == blockerClassModelRefused) {
 		// No usable next pool entry (or no pool at all): retrying the same model
 		// later fails identically, so keep the failure terminal.
 		return false, nil
