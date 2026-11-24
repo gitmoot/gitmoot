@@ -24,13 +24,23 @@ const unknownModelFailure = "omp turn failed (stopReason error): Unknown model: 
 // provider's real code is a different one.
 const quotedRefusalCodeBeforeColon = "omp turn failed (stopReason error): Codex error event: The submitted fixture contains (code=cyber_policy): the marker is not valid in this field. (code=invalid_request_error): exit status 1"
 
+// The round-3 reviewer's probes: omp keeps newlines inside one provider
+// message, so a newline after a quoted code is not the end of the error, and a
+// genuine refusal may carry a multi-line message.
+const (
+	quotedRefusalCodeBeforeNewline = "omp turn failed (stopReason error): Codex error event: The submitted fixture contains (code=cyber_policy)\nthe marker is not valid in this field. (code=invalid_request_error): exit status 1"
+	multilineRefusal               = "omp turn failed (stopReason error): Codex error event: This content was flagged for possible cybersecurity risk.\nIf this seems wrong, try rephrasing your request. (code=cyber_policy): remote command exited with code 1: exit status 1"
+)
+
 func TestProviderContentRefusalClassifiesAsModelRefused(t *testing.T) {
 	const flagged = "omp turn failed (stopReason error): Codex error event: This content was flagged for possible cybersecurity risk. (code=cyber_policy)"
-	// The three suffix shapes seen across all 18 live failures.
+	// The live suffix shapes (all 20 live failures), plus a multi-line message.
 	for _, text := range []string{
 		codexCyberPolicyRefusal,
 		flagged,
 		flagged + ": remote command exited with code 1: exit status 1",
+		flagged + "\n",
+		multilineRefusal,
 	} {
 		got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(text)}, time.Now())
 		if !ok || got.Class != blockerClassModelRefused {
@@ -48,6 +58,7 @@ func TestProviderContentRefusalClassifiesAsModelRefused(t *testing.T) {
 		"omp turn failed (stopReason error): Codex error event: flagged (diagnostic-code=cyber_policy)",
 		"omp turn failed (stopReason error): Codex error event: flagged (code=cyber_policy-preview-v2)",
 		quotedRefusalCodeBeforeColon,
+		quotedRefusalCodeBeforeNewline,
 	} {
 		if got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(text)}, time.Now()); ok && got.Class == blockerClassModelRefused {
 			t.Fatalf("classifyOperationalBlocker(%q) = %s, want no model_refused", text, got.Class)
@@ -125,8 +136,9 @@ func TestPerModelFailureAdvancesReviewPoolOrStaysTerminal(t *testing.T) {
 	// The reviewers' probes: an unrelated provider error that quotes the code
 	// must not move the review to another model.
 	for name, failure := range map[string]string{
-		"quoted in JSON":      `delivery failed: {"error":{"message":"The submitted fixture contains (code=cyber_policy)","code":"invalid_request_error"}}`,
-		"quoted before colon": quotedRefusalCodeBeforeColon,
+		"quoted in JSON":        `delivery failed: {"error":{"message":"The submitted fixture contains (code=cyber_policy)","code":"invalid_request_error"}}`,
+		"quoted before colon":   quotedRefusalCodeBeforeColon,
+		"quoted before newline": quotedRefusalCodeBeforeNewline,
 	} {
 		t.Run(name+" does not fall back", func(t *testing.T) {
 			got := run(t, failure, "openai-codex/gpt-6.1-sol", []string{"openai-codex/gpt-6.1-sol", "kimi-code/k3"})

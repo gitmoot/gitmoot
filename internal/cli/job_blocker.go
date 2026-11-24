@@ -497,19 +497,20 @@ var providerCapacityRe = regexp.MustCompile(
 	`\bcode"?\s*[=:]\s*"?[a-z_]*rate_limit_exceeded\b`)
 
 // providerContentRefusalRe matches a provider's content-policy refusal as omp
-// renders it, not the code quoted anywhere in the error. Measured on all 18
-// live failures (2026-11-24): the `(code=cyber_policy)` group CLOSES the
-// `Codex error event:` line, followed only by the end of the text, a newline,
-// or the runtime's own exit wrappers (`: exit status N`, optionally preceded
-// by `: remote command exited with code N`). Nothing else may follow: a
-// message that quotes the group, even right before a colon, and then carries
-// the provider's real code does not match, nor does a different code value or
-// another key (`diagnostic-code`).
+// renders it: omp appends the provider's code after the WHOLE message, so the
+// refusal is the `(code=cyber_policy)` group that ENDS the error, followed
+// only by the runtime's own exit wrappers (`: exit status N`, optionally
+// preceded by `: remote command exited with code N`) and trailing space. The
+// message itself may span lines. Measured on all 20 live failures
+// (2026-11-24). A message that quotes the group anywhere before the
+// provider's real code does not match, whatever punctuation or newline
+// follows the quote, nor does a different code value or another key
+// (`diagnostic-code`).
 //
 //	Codex error event: This content was flagged for possible cybersecurity
 //	risk. ... (code=cyber_policy): exit status 1
 var providerContentRefusalRe = regexp.MustCompile(
-	`codex error event: [^\n]*\(code=cyber_policy\)(?:: remote command exited with code \d+)?(?:: exit status \d+)?(?:\n|\z)`)
+	`(?s)codex error event: .*\(code=cyber_policy\)(?:: remote command exited with code \d+)?(?:: exit status \d+)?\s*\z`)
 
 // entitlementRevokedRe matches a provider saying the account is no longer
 // ALLOWED to use this product, as distinct from being unable to pay for it.
