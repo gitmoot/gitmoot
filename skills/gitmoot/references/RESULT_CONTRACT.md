@@ -43,7 +43,7 @@ decision other than `blocked` or `failed` ends the run `succeeded`.
 required with `changes_requested`, allowed on an approval that reports
 non-blocking findings, and omitted on an approval with no findings. A
 `severity` key inside a finding is for display; it does not replace the
-top-level field.
+result's own `severity` field.
 
 A repository's `[review] blocking_severity` (default `P3`) is the least severe
 `changes_requested` verdict that counts as blocking. With
@@ -157,21 +157,22 @@ empty.
 
 ## Unknown fields fail
 
-The top-level `gitmoot_result` fields a review uses are the ones in the
-example at the top; gitmoot checks top-level fields against its result
-schema. Keys inside a finding object, such as `continues_uid` and `state`, are
-free-form and not checked here. A top-level field gitmoot does not know,
-including any an older prompt asked for, fails validation with
-`unsupported gitmoot_result field "<name>"`. The reviewer gets a repair turn
-to return the same result without it; if no repair validates, the run fails.
+The keys inside the `gitmoot_result` object that a review uses are the ones
+in the example at the top; gitmoot checks every key inside that object against
+its result schema. Keys inside a finding object, such as `continues_uid` and
+`state`, are free-form and not checked here. A key inside `gitmoot_result`
+that gitmoot does not know, including any an older prompt asked for, fails
+validation with `unsupported gitmoot_result field "<name>"`. The reviewer gets
+a repair turn to return the same result without it; if no repair validates,
+the run fails.
 
 Every field goes inside the `gitmoot_result` object, beside `decision` and
 `summary`. A result field written beside the object, as in
 `{"gitmoot_result":{...},"evidence":"executed"}`, would not be read, so
 gitmoot refuses the output with `gitmoot_result field "evidence" is beside the
 gitmoot_result object` and gives the reviewer the same repair turn rather than
-storing a default. A copy beside the object that matches the value inside is
-accepted. Keys beside the object that are not result fields are ignored.
+storing a default. That holds even when the same value is also inside. Keys
+beside the object that are not result fields are ignored.
 
 ## Attribution
 

@@ -917,7 +917,7 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, r
 			return db.Job{}, fmt.Errorf("review request --supersede: reading the findings ledger for %s#%d at %s: %w", repo, opts.pr, head, err)
 		}
 		if len(obligations) == 0 {
-			return db.Job{}, fmt.Errorf("review request --supersede: review %s approved %s with declared evidence=%s and the findings ledger owes nothing at head %s (see `gitmoot findings --repo %s --pr %d --at-head %s`); an approval with no obligations blocks nothing, so there is nothing to supersede", job.ID, supersedeScope(opts.part), strings.TrimSpace(payload.Result.Evidence), head, repo, opts.pr, head)
+			return db.Job{}, fmt.Errorf("review request --supersede: review %s approved %s with recorded evidence=%s and the findings ledger owes nothing at head %s (see `gitmoot findings --repo %s --pr %d --at-head %s`); an approval with no obligations blocks nothing, so there is nothing to supersede", job.ID, supersedeScope(opts.part), strings.TrimSpace(payload.Result.Evidence), head, repo, opts.pr, head)
 		}
 	default:
 		return db.Job{}, fmt.Errorf("review request --supersede: review %s carries no blocking verdict (decision %q); request it without --supersede", job.ID, decision)

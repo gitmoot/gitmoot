@@ -290,7 +290,7 @@ func TestReviewRequestSupersedeReReviewsAnApprovalThatDeclaredNoEvidence(t *test
 	}
 	settleApproval(declared.JobID, true)
 	var out, errOut strings.Builder
-	if code := runReview(append([]string{"request"}, append(request("declared"), "--supersede", declared.JobID, "--reason", "r")...), &out, &errOut); code == 0 || !strings.Contains(errOut.String(), "declared evidence=static_only") || !strings.Contains(errOut.String(), "nothing to supersede") {
+	if code := runReview(append([]string{"request"}, append(request("declared"), "--supersede", declared.JobID, "--reason", "r")...), &out, &errOut); code == 0 || !strings.Contains(errOut.String(), "recorded evidence=static_only") || !strings.Contains(errOut.String(), "nothing to supersede") {
 		t.Fatalf("supersede of a declared static_only approval: exit %d stderr %q, want a refusal", code, errOut.String())
 	}
 	if claim, err := store.GetReviewRequest(ctx, partSubjectKey(t, head, "declared")); err != nil || claim.JobID != declared.JobID {

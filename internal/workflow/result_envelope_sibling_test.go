@@ -15,32 +15,39 @@ import (
 const herdr513Envelope = `{"gitmoot_result":{"decision":"approved","summary":"signature, asset hashes and docs snapshot all match at this head","findings":[],"changes_made":[],"tests_run":["cargo test -p herdr update:: -> 129 passed","python3 -m unittest scripts.test_preview -> Ran 26 tests, OK"],"needs":[]},"evidence":"executed"}`
 
 func TestExtractAgentResultRefusesAResultFieldBesideTheEnvelope(t *testing.T) {
-	for name, output := range map[string]string{
-		"evidence beside, absent inside":    herdr513Envelope,
-		"severity beside, absent inside":    `{"gitmoot_result":{"decision":"approved","summary":"ok at this head"},"severity":"P3"}`,
-		"evidence beside, different inside": `{"gitmoot_result":{"decision":"approved","summary":"ok at this head","evidence":"static_only"},"evidence":"executed"}`,
+	for name, tc := range map[string]struct{ output, want string }{
+		"evidence beside, absent inside":    {herdr513Envelope, `gitmoot_result field "evidence" is beside the gitmoot_result object`},
+		"severity beside, absent inside":    {`{"gitmoot_result":{"decision":"approved","summary":"ok at this head"},"severity":"P3"}`, `gitmoot_result field "severity" is beside`},
+		"evidence beside, different inside": {`{"gitmoot_result":{"decision":"approved","summary":"ok at this head","evidence":"static_only"},"evidence":"executed"}`, `gitmoot_result field "evidence" is beside`},
+		"two fields beside, named in order": {`{"severity":"P3","gitmoot_result":{"decision":"approved","summary":"ok at this head"},"evidence":"executed"}`, `gitmoot_result fields "evidence", "severity" are beside the gitmoot_result object`},
 	} {
 		t.Run(name, func(t *testing.T) {
-			result, err := ExtractAgentResult(output)
+			result, err := ExtractAgentResult(tc.output)
 			if err == nil {
-				t.Fatalf("ExtractAgentResult accepted %s as %+v; a result field beside gitmoot_result must be refused, not dropped", output, result)
+				t.Fatalf("ExtractAgentResult accepted %s as %+v; a result field beside gitmoot_result must be refused, not dropped", tc.output, result)
 			}
-			if !strings.Contains(err.Error(), "is beside the gitmoot_result object") {
-				t.Fatalf("error = %v, want it to say the field is beside the gitmoot_result object", err)
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want it to contain %q", err, tc.want)
 			}
 		})
 	}
 }
 
-func TestExtractAgentResultAcceptsHarmlessEnvelopeSiblings(t *testing.T) {
-	// A copy that matches the inner value loses nothing.
-	result, err := ExtractAgentResult(`{"gitmoot_result":{"decision":"approved","summary":"ran go test at this head","tests_run":["go test ./... -> ok"],"evidence":"executed"},"evidence":"executed"}`)
-	if err != nil {
-		t.Fatalf("matching sibling refused: %v", err)
+// A copy beside the object that repeats the inner value is refused as well:
+// telling a true duplicate apart needs a lossless JSON comparison, and the
+// repair turn it costs is cheaper than getting that comparison wrong.
+func TestExtractAgentResultRefusesADuplicateBesideTheEnvelope(t *testing.T) {
+	output := `{"gitmoot_result":{"decision":"approved","summary":"ran go test at this head","tests_run":["go test ./... -> ok"],"evidence":"executed"},"evidence":"executed"}`
+	result, err := ExtractAgentResult(output)
+	if err == nil {
+		t.Fatalf("ExtractAgentResult accepted a duplicate evidence beside gitmoot_result as %+v", result)
 	}
-	if result.Evidence != EvidenceExecuted || !result.EvidenceDeclared {
-		t.Fatalf("evidence = %q declared=%v, want executed and declared", result.Evidence, result.EvidenceDeclared)
+	if !strings.Contains(err.Error(), `gitmoot_result field "evidence" is beside the gitmoot_result object`) {
+		t.Fatalf("error = %v, want it to name the duplicated field", err)
 	}
+}
+
+func TestExtractAgentResultIgnoresNonResultEnvelopeSiblings(t *testing.T) {
 	// A key that is not a result field was never part of the contract.
 	if _, err := ExtractAgentResult(`{"gitmoot_result":{"decision":"approved","summary":"read the diff at this head"},"learnings":["x"]}`); err != nil {
 		t.Fatalf("non-result sibling refused: %v", err)

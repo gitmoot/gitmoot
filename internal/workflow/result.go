@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
@@ -568,33 +568,26 @@ func validateAgentResultFields(raw json.RawMessage) error {
 //
 // Refusing it, rather than lifting the value in, sends the output through the
 // existing repair re-ask with this error, so the reviewer restates its own
-// result in the one place it is read. A sibling that repeats the inner value
-// exactly loses nothing and is accepted. Keys that are not result fields stay
-// outside the contract and are ignored, as before.
+// result in the one place it is read. A sibling that repeats the inner value is
+// refused too: comparing the two would need a lossless JSON equality, and the
+// copy carries nothing the inner object does not. Keys that are not result
+// fields stay outside the contract and are ignored, as before.
 func validateEnvelopeSiblings(envelope map[string]json.RawMessage) error {
-	var inner map[string]json.RawMessage
-	if err := json.Unmarshal(envelope["gitmoot_result"], &inner); err != nil {
-		return err
-	}
-	for _, field := range slices.Sorted(maps.Keys(envelope)) {
-		if _, ok := agentResultAllowedFields[field]; !ok {
-			continue
+	var misplaced []string
+	for field := range envelope {
+		if _, ok := agentResultAllowedFields[field]; ok {
+			misplaced = append(misplaced, strconv.Quote(field))
 		}
-		if insideRaw, ok := inner[field]; ok && sameJSONValue(insideRaw, envelope[field]) {
-			continue
-		}
-		return fmt.Errorf("gitmoot_result field %q is beside the gitmoot_result object, where gitmoot does not read it; put it inside gitmoot_result with decision and summary", field)
 	}
-	return nil
-}
-
-// sameJSONValue reports whether two JSON documents decode to the same value.
-func sameJSONValue(a, b json.RawMessage) bool {
-	var left, right any
-	if json.Unmarshal(a, &left) != nil || json.Unmarshal(b, &right) != nil {
-		return false
+	switch len(misplaced) {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("gitmoot_result field %s is beside the gitmoot_result object, where gitmoot does not read it; put it inside gitmoot_result with decision and summary", misplaced[0])
+	default:
+		slices.Sort(misplaced)
+		return fmt.Errorf("gitmoot_result fields %s are beside the gitmoot_result object, where gitmoot does not read them; put them inside gitmoot_result with decision and summary", strings.Join(misplaced, ", "))
 	}
-	return reflect.DeepEqual(left, right)
 }
 
 func validateAgentResult(result AgentResult) error {
