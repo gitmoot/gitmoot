@@ -240,6 +240,64 @@ func TestReviewRequestSupersedeReReviewsAnApprovalTheLedgerStillOwes(t *testing.
 	}
 }
 
+// jerryfane/herdr#513: an approval whose reviewer declared no evidence mode
+// stored the engine's static_only default, a merge gate requiring executed
+// evidence refused it, and a plain request attached to it, so the head had no
+// route to a verdict that gate accepts. --supersede is that route. An approval
+// that DECLARED static_only is the reviewer's own statement and is refused.
+func TestReviewRequestSupersedeReReviewsAnApprovalThatDeclaredNoEvidence(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	request := func(part string) []string {
+		return []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--home", home, "--json", "--role", "joltra", "--part", part}
+	}
+	settleApproval := func(jobID string, declared bool) {
+		t.Helper()
+		payload, err := workflow.ParseJobPayload(mustGetJob(t, store, jobID).Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload.Result = &workflow.AgentResult{Decision: "approved", Summary: "approved at this head", TestsRun: []string{"cargo test -> 129 passed"}, Evidence: workflow.EvidenceStaticOnly, EvidenceDeclared: declared}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.TransitionJobStatePayloadWithEvent(ctx, jobID, string(workflow.JobQueued), string(workflow.JobSucceeded), string(encoded), db.JobEvent{JobID: jobID, Kind: "succeeded", Message: "settled"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	undeclared, failure := runReviewRequestJSON(t, request("undeclared")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	settleApproval(undeclared.JobID, false)
+	second, failure := runReviewRequestJSON(t, append(request("undeclared"), "--supersede", undeclared.JobID, "--reason", "evidence was dropped beside gitmoot_result")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if second.State != reviewRequestDispatched || second.JobID == undeclared.JobID || second.Supersedes != undeclared.JobID {
+		t.Fatalf("supersede request = %+v, want a new dispatched job superseding %s", second, undeclared.JobID)
+	}
+	if claim, err := store.GetReviewRequest(ctx, partSubjectKey(t, head, "undeclared")); err != nil || claim.JobID != second.JobID {
+		t.Fatalf("claim after supersede = %+v (%v), want it on %s", claim, err, second.JobID)
+	}
+
+	declared, failure := runReviewRequestJSON(t, request("declared")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	settleApproval(declared.JobID, true)
+	var out, errOut strings.Builder
+	if code := runReview(append([]string{"request"}, append(request("declared"), "--supersede", declared.JobID, "--reason", "r")...), &out, &errOut); code == 0 || !strings.Contains(errOut.String(), "recorded evidence=static_only") || !strings.Contains(errOut.String(), "nothing to supersede") {
+		t.Fatalf("supersede of a declared static_only approval: exit %d stderr %q, want a refusal", code, errOut.String())
+	}
+	if claim, err := store.GetReviewRequest(ctx, partSubjectKey(t, head, "declared")); err != nil || claim.JobID != declared.JobID {
+		t.Fatalf("claim after refused supersede = %+v (%v), want it unchanged on %s", claim, err, declared.JobID)
+	}
+}
+
 // #2405: a re-review that fails before its job exists gives the claim BACK to
 // the superseded job, so the part is never left unclaimed and its verdict
 // never stops answering.

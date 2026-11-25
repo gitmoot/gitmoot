@@ -135,3 +135,20 @@ func TestRenderRepairPromptBoundsAHugeValidationError(t *testing.T) {
 		t.Fatal("the start of the error must still reach the agent")
 	}
 }
+
+// jerryfane/herdr#513: the help called evidence a "top-level" field and the
+// reviewer wrote it beside the gitmoot_result object, where it was dropped.
+// The job and repair prompts must say the fields go inside the object.
+func TestPromptsPlaceResultFieldsInsideTheEnvelope(t *testing.T) {
+	for name, prompt := range map[string]string{
+		"job":    RenderJob(JobPrompt{Repo: "gitmoot/gitmoot", Action: "review"}),
+		"repair": RenderRepairPrompt(`{"gitmoot_result":{}}`, errors.New("bad")),
+	} {
+		if !strings.Contains(prompt, "each goes INSIDE the gitmoot_result object") {
+			t.Fatalf("%s prompt does not place result fields inside gitmoot_result:\n%s", name, prompt)
+		}
+		if strings.Contains(prompt, "top-level evidence") {
+			t.Fatalf("%s prompt still calls evidence a top-level field:\n%s", name, prompt)
+		}
+	}
+}
