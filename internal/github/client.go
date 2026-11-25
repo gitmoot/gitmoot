@@ -57,6 +57,7 @@ type Client interface {
 	CreateCommitStatus(ctx context.Context, input CommitStatusInput) (CommitStatus, error)
 	ListPullRequestFiles(ctx context.Context, repo Repository, number int64) ([]PullRequestFile, error)
 	ListPullRequestCommits(ctx context.Context, repo Repository, number int64) ([]PullRequestCommit, error)
+	ListCompareCommits(ctx context.Context, repo Repository, base string, head string) ([]PullRequestCommit, error)
 	UpsertFile(ctx context.Context, input UpsertFileInput) (RepositoryFile, error)
 }
 
@@ -1379,6 +1380,52 @@ func (c *GhClient) CompareCommits(ctx context.Context, repo Repository, base str
 	}
 	result.Truncated = len(result.Files) >= compareFilesCap
 	return result, nil
+}
+
+// ListCompareCommits lists every commit of the three-dot range base...head:
+// the commits a pull request with that base and head carries. GitHub's pull
+// request commit list stops at 250 commits; the compare endpoint paginates the
+// whole range, and the result is refused unless it holds exactly the range's
+// total_commits entries, so a short read can never pass for a complete one.
+func (c *GhClient) ListCompareCommits(ctx context.Context, repo Repository, base string, head string) ([]PullRequestCommit, error) {
+	result, err := c.run(ctx, false,
+		"api", "--paginate", "--jq", "{total: .total_commits, shas: [.commits[].sha]}",
+		endpoint(repo, "compare", url.PathEscape(base+"..."+head))+"?per_page=100",
+	)
+	if err != nil {
+		return nil, err
+	}
+	var commits []PullRequestCommit
+	total := -1
+	scanner := bufio.NewScanner(strings.NewReader(result.Stdout))
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for line := 1; scanner.Scan(); line++ {
+		raw := strings.TrimSpace(scanner.Text())
+		if raw == "" {
+			continue
+		}
+		var page struct {
+			Total *int     `json:"total"`
+			SHAs  []string `json:"shas"`
+		}
+		if err := json.Unmarshal([]byte(raw), &page); err != nil {
+			return nil, fmt.Errorf("decode gh compare page %d: %w", line, err)
+		}
+		if page.Total == nil || (total >= 0 && *page.Total != total) {
+			return nil, fmt.Errorf("gh compare page %d reports no consistent total_commits", line)
+		}
+		total = *page.Total
+		for _, sha := range page.SHAs {
+			commits = append(commits, PullRequestCommit{SHA: sha})
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan gh compare response: %w", err)
+	}
+	if total < 0 || len(commits) != total {
+		return nil, fmt.Errorf("compare %s...%s listed %d of %d commits", base, head, len(commits), total)
+	}
+	return commits, nil
 }
 
 func (c *GhClient) ListPullRequestChecks(ctx context.Context, repo Repository, number int64) ([]PullRequestCheck, error) {

@@ -23,12 +23,18 @@ type sharedChangesRequested struct {
 // hold a merge of repo#pullRequest at headSHA, whose commit list is commits
 // (#2755). jobs are review rows at those commits (Store.ListReviewJobsAtHeads).
 //
-// A verdict holds when it is a succeeded, non-delegated review of repo whose
-// effective decision is changes_requested and whose head is one of the carried
-// commits, on ANY pull request: code a reviewer rejected must not reach the
-// base through another pull request whose reviewer never saw that verdict. It
-// is answered by a LATER succeeded approval at that exact commit, from any pull
-// request of the repo, covering the objection's part of a split review.
+// A verdict holds when it is a succeeded, non-delegated, pre-merge review of
+// repo whose effective decision is changes_requested and whose head is one of
+// the carried commits, on ANY pull request: code a reviewer rejected must not
+// reach the base through another pull request whose reviewer never saw that
+// verdict. It is answered by a LATER succeeded pre-merge approval at that exact
+// commit. Across pull requests only a whole-head approval answers it: a split
+// review's part slug names a part of ONE pull request's review, so a same-part
+// approval answers an objection only on the same pull request.
+//
+// Post-merge reviews (#2265 level 2) neither hold nor answer: their findings
+// are follow-up work on an already merged head, never a merge verdict, and a
+// stacked pull request can still list that head after a squash merge.
 //
 // The merging pull request's own verdicts take two narrower rules:
 //   - at its current head they are skipped: the exact-head review gate owns
@@ -63,7 +69,7 @@ func unresolvedSharedChangesRequested(jobs []db.Job, repo string, pullRequest in
 			return nil, fmt.Errorf("decode review job %s: %w", job.ID, err)
 		}
 		head := normalizedSHA(payload.HeadSHA)
-		if payload.Result == nil || !strings.EqualFold(strings.TrimSpace(payload.Repo), strings.TrimSpace(repo)) {
+		if payload.Result == nil || payload.PostMergeReview || !strings.EqualFold(strings.TrimSpace(payload.Repo), strings.TrimSpace(repo)) {
 			continue
 		}
 		if _, ok := carried[head]; !ok {
@@ -77,9 +83,11 @@ func unresolvedSharedChangesRequested(jobs []db.Job, repo string, pullRequest in
 		}
 	}
 	answers := func(approval, objection verdict) bool {
-		part := reviewPartOf(approval.payload)
-		return (part == "" || part == reviewPartOf(objection.payload)) &&
-			reviewJobRecordedAfter(approval.job, objection.job)
+		if part := reviewPartOf(approval.payload); part != "" &&
+			(part != reviewPartOf(objection.payload) || approval.payload.PullRequest != objection.payload.PullRequest) {
+			return false
+		}
+		return reviewJobRecordedAfter(approval.job, objection.job)
 	}
 	var held []sharedChangesRequested
 	for _, objection := range objections {

@@ -139,6 +139,10 @@ func (NoopClient) ListPullRequestCommits(context.Context, github.Repository, int
 	return nil, errors.ErrUnsupported
 }
 
+func (NoopClient) ListCompareCommits(context.Context, github.Repository, string, string) ([]github.PullRequestCommit, error) {
+	return nil, errors.ErrUnsupported
+}
+
 func (NoopClient) UpsertFile(context.Context, github.UpsertFileInput) (github.RepositoryFile, error) {
 	return github.RepositoryFile{}, errors.ErrUnsupported
 }

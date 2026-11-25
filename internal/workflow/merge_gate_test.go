@@ -3950,23 +3950,23 @@ type fakeMergeGateGitHub struct {
 	requiredCalls      int
 	requiredBranches   []string
 	// commits is the pull request's commit list (#2755); nil lists only the
-	// head last returned by GetPullRequest. commitsErr fails the listing.
+	// fixture's declared head, f.pr.HeadSHA. A case whose head moves through
+	// getPullRequest declares its list explicitly. commitsErr fails the listing.
 	commits     []string
 	commitsErr  error
 	commitCalls int
-	lastHead    string
+	// rangeCommits answers ListCompareCommits (the complete base...head range);
+	// rangeErr fails it. rangeCalls records each base...head read.
+	rangeCommits []string
+	rangeErr     error
+	rangeCalls   []string
 }
 
 func (f *fakeMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
 	f.getCalls++
 	if f.getPullRequest != nil {
-		pr, err := f.getPullRequest(f.getCalls)
-		if err == nil {
-			f.lastHead = pr.HeadSHA
-		}
-		return pr, err
+		return f.getPullRequest(f.getCalls)
 	}
-	f.lastHead = f.pr.HeadSHA
 	return f.pr, nil
 }
 
@@ -3977,13 +3977,28 @@ func (f *fakeMergeGateGitHub) ListPullRequestCommits(context.Context, github.Rep
 	}
 	shas := f.commits
 	if shas == nil {
-		shas = []string{f.lastHead}
+		shas = []string{f.pr.HeadSHA}
 	}
+	return fakePullRequestCommits(shas), nil
+}
+
+func (f *fakeMergeGateGitHub) ListCompareCommits(_ context.Context, _ github.Repository, base string, head string) ([]github.PullRequestCommit, error) {
+	f.rangeCalls = append(f.rangeCalls, base+"..."+head)
+	if f.rangeErr != nil {
+		return nil, f.rangeErr
+	}
+	if f.rangeCommits == nil {
+		return nil, errors.New("fake: no complete commit range declared")
+	}
+	return fakePullRequestCommits(f.rangeCommits), nil
+}
+
+func fakePullRequestCommits(shas []string) []github.PullRequestCommit {
 	commits := make([]github.PullRequestCommit, 0, len(shas))
 	for _, sha := range shas {
 		commits = append(commits, github.PullRequestCommit{SHA: sha})
 	}
-	return commits, nil
+	return commits
 }
 
 func (f *fakeMergeGateGitHub) ListPullRequestFiles(context.Context, github.Repository, int64) ([]github.PullRequestFile, error) {

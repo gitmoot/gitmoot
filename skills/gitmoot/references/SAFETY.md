@@ -58,8 +58,12 @@ What gitmoot enforces today, and what a seat must not work around.
   any pull request of the repository, it merges only after a later approval at
   that exact commit. The pull request's own earlier `changes_requested` head is
   also answered by an approval of its current head recorded after it (the
-  ordinary fix round). If GitHub cannot list the pull request's commits, it
-  holds. A rebased copy of a rejected commit (a different SHA) is not matched.
+  ordinary fix round). A split-review part approval answers only the same part
+  on the same pull request. Post-merge reviews neither hold nor clear. GitHub
+  lists at most 250 commits of a pull request; past that the gate reads the
+  full base...head range, and if it cannot list the commits it holds. This
+  check runs only once review and CI pass. A rebased copy of a rejected commit
+  (a different SHA) is not matched.
 - `[repos."owner/repo".merge_gate] auto_merge = false` turns automatic merging
   off for a repository; `/gitmoot merge` still runs the gate on request.
 

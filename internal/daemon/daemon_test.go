@@ -2922,6 +2922,10 @@ func (f *fakeGitHub) ListPullRequestCommits(_ context.Context, _ github.Reposito
 	return nil, errors.New("not implemented")
 }
 
+func (f *fakeGitHub) ListCompareCommits(context.Context, github.Repository, string, string) ([]github.PullRequestCommit, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (f *fakeGitHub) UpsertFile(context.Context, github.UpsertFileInput) (github.RepositoryFile, error) {
 	return github.RepositoryFile{}, errors.New("not implemented")
 }

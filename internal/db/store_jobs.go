@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -599,14 +600,16 @@ func (s *Store) ListReviewJobsForPullRequest(ctx context.Context, repo string, p
 	return scanJobs(rows)
 }
 
-// ListReviewJobsAtHeads returns the review jobs of repo (compared
+// ListReviewJobsAtHeads returns the succeeded review jobs of repo (compared
 // case-insensitively; rows whose repo projection is unset are included for the
 // caller to match by payload) whose payload head_sha is one of heads, compared
 // case-insensitively, oldest first. It serves the merge gate's shared-commit
 // check (#2755), which asks for verdicts on any pull request of the repo at the
-// commits the merging pull request carries. The head filter runs in SQL so the
-// gate decodes only the rows about those commits, never the repo's whole review
-// history; a payload that is not JSON has no head and cannot match.
+// commits the merging pull request carries. The read seeks
+// idx_jobs_review_lower_repo_state on lower(repo) and the succeeded state, so
+// the head JSON is evaluated only on those rows and the gate decodes only the
+// rows about those commits; a payload that is not JSON has no head and cannot
+// match. The few matching rows are ordered here rather than by a SQL sort.
 func (s *Store) ListReviewJobsAtHeads(ctx context.Context, repo string, heads []string) ([]Job, error) {
 	repo = strings.ToLower(strings.TrimSpace(repo))
 	seen := make(map[string]struct{}, len(heads))
@@ -626,15 +629,30 @@ func (s *Store) ListReviewJobsAtHeads(ctx context.Context, repo string, heads []
 		return nil, nil
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(seen)), ",")
-	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs
-		WHERE type = 'review' AND (lower(repo) = ? OR repo = '')
-		AND CASE WHEN json_valid(payload) AND json_type(payload, '$.head_sha') = 'text'
-			THEN lower(trim(json_extract(payload, '$.head_sha'))) ELSE '' END IN (`+placeholders+`)
-		ORDER BY created_at, id`, args...)
+	rows, err := s.db.QueryContext(ctx, listReviewJobsAtHeadsSQL(placeholders), args...)
 	if err != nil {
 		return nil, err
 	}
-	return scanJobs(rows)
+	jobs, err := scanJobs(rows)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(jobs, func(i, j int) bool {
+		if jobs[i].CreatedAt != jobs[j].CreatedAt {
+			return jobs[i].CreatedAt < jobs[j].CreatedAt
+		}
+		return jobs[i].ID < jobs[j].ID
+	})
+	return jobs, nil
+}
+
+// listReviewJobsAtHeadsSQL is ListReviewJobsAtHeads' exact query for
+// headPlaceholders head parameters, after the lowercased repo parameter.
+func listReviewJobsAtHeadsSQL(headPlaceholders string) string {
+	return `SELECT ` + jobColumns + ` FROM jobs
+		WHERE type = 'review' AND lower(repo) IN (?, '') AND state = 'succeeded'
+		AND CASE WHEN json_valid(payload) AND json_type(payload, '$.head_sha') = 'text'
+			THEN lower(trim(json_extract(payload, '$.head_sha'))) ELSE '' END IN (` + headPlaceholders + `)`
 }
 
 // listRunningReviewJobsSQL is ListRunningReviewJobs' exact query. The literal
