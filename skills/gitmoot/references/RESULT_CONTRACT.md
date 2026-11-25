@@ -70,6 +70,12 @@ afterwards. Omitting the field records `static_only`; an unknown value is
 rejected. A review requested with `--no-execution` must return `static_only`
 with an empty `tests_run`, or the run fails.
 
+An approval that omitted the field stores that default, which is not the
+reviewer's claim, so a merge gate that requires `executed` refuses it. To
+re-review that head, run `gitmoot review request --supersede <run-id>
+--reason "why"` with the same reviewer; an approval that declared `static_only`
+itself is not superseded this way.
+
 Two result checks read this field: `review-verdict-has-evidence` (does the
 verdict account for itself at all?) and `review-executed-claim-is-substantiated`
 (does an `executed` claim name something that ran?). A verdict passes the
@@ -158,6 +164,14 @@ free-form and not checked here. A top-level field gitmoot does not know,
 including any an older prompt asked for, fails validation with
 `unsupported gitmoot_result field "<name>"`. The reviewer gets a repair turn
 to return the same result without it; if no repair validates, the run fails.
+
+Every field goes inside the `gitmoot_result` object, beside `decision` and
+`summary`. A result field written beside the object, as in
+`{"gitmoot_result":{...},"evidence":"executed"}`, would not be read, so
+gitmoot refuses the output with `gitmoot_result field "evidence" is beside the
+gitmoot_result object` and gives the reviewer the same repair turn rather than
+storing a default. A copy beside the object that matches the value inside is
+accepted. Keys beside the object that are not result fields are ignored.
 
 ## Attribution
 

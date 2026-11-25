@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
@@ -461,6 +463,12 @@ func ExtractAgentResult(output string) (AgentResult, error) {
 			}
 			continue
 		}
+		if err := validateEnvelopeSiblings(envelope); err != nil {
+			if validationErr == nil {
+				validationErr = err
+			}
+			continue
+		}
 		var result AgentResult
 		if err := json.Unmarshal(raw, &result); err != nil {
 			if validationErr == nil {
@@ -542,6 +550,51 @@ func validateAgentResultFields(raw json.RawMessage) error {
 		}
 	}
 	return nil
+}
+
+// validateEnvelopeSiblings refuses a result field written BESIDE the
+// gitmoot_result object instead of inside it.
+//
+// Only the inner object is the result, so a sibling was silently dropped. The
+// cost was not cosmetic: the prompt called evidence a "top-level" field and
+// reviewers read that as top level of the envelope, so
+// {"gitmoot_result":{...},"evidence":"executed"} stored the engine default
+// static_only. jerryfane/herdr#513 (job
+// local-review-review-router-18eae2a3837d9713-1) ran cargo test, unittest and
+// a signature check, declared executed there, and its approval was then
+// refused by a merge gate reading static_only. Measured over 12,949 succeeded
+// reviews on one host: 157 declared executed this way and were stored
+// static_only; 100 severities and 53 checks_blocked were dropped the same way.
+//
+// Refusing it, rather than lifting the value in, sends the output through the
+// existing repair re-ask with this error, so the reviewer restates its own
+// result in the one place it is read. A sibling that repeats the inner value
+// exactly loses nothing and is accepted. Keys that are not result fields stay
+// outside the contract and are ignored, as before.
+func validateEnvelopeSiblings(envelope map[string]json.RawMessage) error {
+	var inner map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["gitmoot_result"], &inner); err != nil {
+		return err
+	}
+	for _, field := range slices.Sorted(maps.Keys(envelope)) {
+		if _, ok := agentResultAllowedFields[field]; !ok {
+			continue
+		}
+		if insideRaw, ok := inner[field]; ok && sameJSONValue(insideRaw, envelope[field]) {
+			continue
+		}
+		return fmt.Errorf("gitmoot_result field %q is beside the gitmoot_result object, where gitmoot does not read it; put it inside gitmoot_result with decision and summary", field)
+	}
+	return nil
+}
+
+// sameJSONValue reports whether two JSON documents decode to the same value.
+func sameJSONValue(a, b json.RawMessage) bool {
+	var left, right any
+	if json.Unmarshal(a, &left) != nil || json.Unmarshal(b, &right) != nil {
+		return false
+	}
+	return reflect.DeepEqual(left, right)
 }
 
 func validateAgentResult(result AgentResult) error {

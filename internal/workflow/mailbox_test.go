@@ -722,7 +722,7 @@ func TestMailboxRunRepairsReviewVerdictMissingSeverity(t *testing.T) {
 	for i, prompt := range adapter.prompts[1:] {
 		for _, want := range []string{
 			"severity is required when a review requests changes",
-			"top-level severity",
+			"- severity (string, one of",
 			"P0|P1|P2|P3",
 		} {
 			if !strings.Contains(prompt, want) {

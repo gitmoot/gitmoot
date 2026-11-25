@@ -233,7 +233,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
 	fs.StringVar(&opts.part, "part", "", "one part of a split review of the same head: a slug of letters, digits and dashes (e.g. mm-12-mm-15)")
-	fs.StringVar(&opts.supersede, "supersede", "", "re-review at the same head: the settled review (of this --part, or the whole-head review without --part) whose verdict this request replaces once it lands; it must be blocking, or an approval while the findings ledger still lists obligations at that head (see gitmoot findings --at-head); same reviewer only; requires --reason")
+	fs.StringVar(&opts.supersede, "supersede", "", "re-review at the same head: the settled review (of this --part, or the whole-head review without --part) whose verdict this request replaces once it lands; it must be blocking, an approval whose reviewer declared no evidence mode (stored static_only by default), or an approval while the findings ledger still lists obligations at that head (see gitmoot findings --at-head); same reviewer only; requires --reason")
 	fs.StringVar(&opts.supersedeReason, "reason", "", "why --supersede re-reviews the part; recorded on both runs")
 	fs.BoolVar(&opts.noExecution, "no-execution", false, "review by reading code and the exact-head CI evidence only; the reviewer seat cannot run any program (omp, local backend, linux/amd64)")
 	fs.StringVar(&opts.evidenceManifest, "evidence-manifest", "", "absolute path of a JSON manifest (schema_version 1, head_sha, files[{path,bytes,sha256}]) of private files to install read-only into this remote E2B review's sandbox; every file is hash-verified now and again inside the sandbox; requires --exec-backend remote")
@@ -846,9 +846,10 @@ func supersedeScope(part string) string {
 //   - the named job must hold the claim for EXACTLY this repo, PR, full head,
 //     purpose and normalized part (the claim key is all of those);
 //   - it must be settled: not queued, running or scheduled for an automatic
-//     retry, and carry a BLOCKING verdict, or an approval at a head where the
-//     findings ledger still lists obligations (#2653); an approval with none
-//     blocks nothing, so there is nothing to supersede;
+//     retry, and carry a BLOCKING verdict, an approval whose reviewer declared
+//     no evidence mode, or an approval at a head where the findings ledger
+//     still lists obligations (#2653); any other approval blocks nothing, so
+//     there is nothing to supersede;
 //   - the claim moves by compare-and-set from that exact job, so of two
 //     competing superseders exactly one wins;
 //   - NOTHING here touches the old job, its result or findings. Its objection
@@ -894,6 +895,17 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, r
 	switch decision {
 	case "changes_requested", "blocked", "failed":
 	case "approved":
+		// An approval whose reviewer declared NO evidence mode stored the
+		// engine's static_only default, which is not a claim. A merge gate that
+		// requires executed evidence refuses it, and a plain request attaches to
+		// it, so without this exit the head could never be approved by that
+		// reviewer: jerryfane/herdr#513 ran its checks, wrote evidence beside
+		// the gitmoot_result object where it was dropped, and was stuck. A
+		// DECLARED static_only, or an executed claim the engine clamped, is the
+		// reviewer's own statement and stays outside this route.
+		if !workflow.EvidenceWasDeclared(*payload.Result) && !workflow.EvidenceWasExecuted(*payload.Result) {
+			break
+		}
 		// #2653: an approval normally blocks nothing, but the findings ledger can
 		// still owe obligations at its head - an approval that declared answers
 		// recorded as QUOTED, which never discharge. Only a later verdict at this
@@ -905,7 +917,7 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, r
 			return db.Job{}, fmt.Errorf("review request --supersede: reading the findings ledger for %s#%d at %s: %w", repo, opts.pr, head, err)
 		}
 		if len(obligations) == 0 {
-			return db.Job{}, fmt.Errorf("review request --supersede: review %s approved %s and the findings ledger owes nothing at head %s (see `gitmoot findings --repo %s --pr %d --at-head %s`); an approval with no obligations blocks nothing, so there is nothing to supersede", job.ID, supersedeScope(opts.part), head, repo, opts.pr, head)
+			return db.Job{}, fmt.Errorf("review request --supersede: review %s approved %s with declared evidence=%s and the findings ledger owes nothing at head %s (see `gitmoot findings --repo %s --pr %d --at-head %s`); an approval with no obligations blocks nothing, so there is nothing to supersede", job.ID, supersedeScope(opts.part), strings.TrimSpace(payload.Result.Evidence), head, repo, opts.pr, head)
 		}
 	default:
 		return db.Job{}, fmt.Errorf("review request --supersede: review %s carries no blocking verdict (decision %q); request it without --supersede", job.ID, decision)

@@ -53,13 +53,13 @@ type fieldAnnotation struct {
 // field with neither example nor help is not offered to agents at all.
 var resultFieldAnnotations = map[string]fieldAnnotation{
 	"decision":     {example: enumExample(workflow.ResultDecisions)},
-	"severity":     {help: `top-level severity (string, one of ` + enumList(workflow.ReviewSeverities) + `): required when a review returns changes_requested; report the highest-severity finding. Omit it for non-review results and approved reviews with no findings.`},
+	"severity":     {help: `severity (string, one of ` + enumList(workflow.ReviewSeverities) + `): required when a review returns changes_requested; report the highest-severity finding. Omit it for non-review results and approved reviews with no findings.`},
 	"summary":      {example: `"..."`},
 	"findings":     {example: "[]"},
 	"changes_made": {example: "[]"},
 	"tests_run":    {example: "[]"},
 	"needs":        {example: "[]"},
-	"evidence":     {help: `top-level evidence (string, one of ` + enumList(workflow.EvidenceKinds) + `): REQUIRED on reviews. Say "executed" only if you actually ran the commands you cite; say "static_only" when you read code and could not run it (no toolchain, no network, a sandbox refusal). Never infer test success from inability to execute, and never claim "executed" for a command you could not run - a static-only review is a legitimate verdict, a mislabeled one is not. Omitting it is recorded as static_only.`},
+	"evidence":     {help: `evidence (string, one of ` + enumList(workflow.EvidenceKinds) + `): REQUIRED on reviews. Say "executed" only if you actually ran the commands you cite; say "static_only" when you read code and could not run it (no toolchain, no network, a sandbox refusal). Never infer test success from inability to execute, and never claim "executed" for a command you could not run - a static-only review is a legitimate verdict, a mislabeled one is not. Omitting it is recorded as static_only.`},
 	// artifact_body was only required by delegations that requested
 	// artifacts (#2588), so it is no longer offered to agents.
 	"artifact_body": {},
@@ -85,7 +85,7 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	// The empty entry still satisfies the every-field-accounted-for check, so a
 	// future rename cannot silently drop it.
 	"evidence_declared": {},
-	"checks_blocked":    {help: `top-level checks_blocked (string, optional, one of ` + enumList(workflow.ChecksBlockedKinds) + `): when you could not run some or all of the project's checks, name the main reason: toolchain (the language toolchain or test runner is missing or not runnable), dependencies (it ran but the project's dependencies were missing), sandbox (the sandbox refused a path or device), network, service (a database, browser or credentialed API was needed), or other. Say what you could not run in summary or tests_run as well. Omit it when every check you wanted to run ran.`},
+	"checks_blocked":    {help: `checks_blocked (string, optional, one of ` + enumList(workflow.ChecksBlockedKinds) + `): when you could not run some or all of the project's checks, name the main reason: toolchain (the language toolchain or test runner is missing or not runnable), dependencies (it ran but the project's dependencies were missing), sandbox (the sandbox refused a path or device), network, service (a database, browser or credentialed API was needed), or other. Say what you could not run in summary or tests_run as well. Omit it when every check you wanted to run ran.`},
 }
 
 const resultDecisionHelp = "\nDecision semantics:\n- Use decision skipped only when the task itself had no work to do. Do not use skipped in a PR review to mean nothing to flag; use approved. - skipped is an abstention for quorum and verify. Vote still counts the skipped child's succeeded job state.\n"
@@ -179,12 +179,17 @@ func renderResultShape() string {
 	return `{"gitmoot_result":{` + strings.Join(parts, ",") + `}}`
 }
 
-// renderResultFieldHelp builds the prose help for the top-level result
-// fields that the example shape cannot express.
+// renderResultFieldHelp builds the prose help for the gitmoot_result fields
+// that the example shape cannot express.
+//
+// The header says WHERE they go because the help once called them "top-level"
+// fields and reviewers read that as top level of the envelope, writing
+// {"gitmoot_result":{...},"evidence":"executed"}; the parser now refuses that
+// placement, and this line is what keeps a reviewer from needing the repair.
 func renderResultFieldHelp() string {
 	var b strings.Builder
-	b.WriteString("\nResult fields:\n")
-	// severity is a top-level review field. It stays out of the generic example
+	b.WriteString("\nResult fields (each goes INSIDE the gitmoot_result object, beside decision and summary, never beside gitmoot_result itself):\n")
+	// severity is a review field. It stays out of the generic example
 	// shape because non-review results must not invent a review severity.
 	if h := resultFieldAnnotations["severity"].help; h != "" {
 		b.WriteString("- " + h + "\n")
@@ -227,7 +232,7 @@ func renderFile(shape, help string) string {
 	b.WriteString("// resultDecisionHelp documents semantic constraints that the decision enum alone\n")
 	b.WriteString("// cannot express. It is emitted beside the shape in job and repair prompts.\n")
 	b.WriteString("const resultDecisionHelp = " + goQuote(resultDecisionHelp) + "\n\n")
-	b.WriteString("// resultFieldHelp documents the top-level result fields the shape cannot\n")
+	b.WriteString("// resultFieldHelp documents the gitmoot_result fields the shape cannot\n")
 	b.WriteString("// express. Runtime agents only receive this prompt, not the gitmoot skill docs.\n")
 	b.WriteString("const resultFieldHelp = " + goQuote(help) + "\n")
 	return b.String()
