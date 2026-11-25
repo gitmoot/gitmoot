@@ -2,9 +2,9 @@
 // review before merge, a review after merge, or none (gitmoot/gitmoot#2265).
 //
 // Fixed rules come first and never call the model: gitmoot/gitmoot is always
-// reviewed, and a small set of paths (agent instructions, CI, deploy config,
-// dependency locks, migrations, Gitmoot's merge gate and credential gateway)
-// always is. Everything else is judged by JEV on the diff itself. Every failure
+// reviewed, and a small set of paths (CI workflows, migrations, dependency
+// lockfiles, Gitmoot's merge gate and credential gateway; never an example or
+// sample file) always is. Everything else is judged by JEV on the diff itself. Every failure
 // to judge decides "review before merge".
 package reviewlevel
 
@@ -56,8 +56,23 @@ func AlwaysReviewRepo(repo string) bool {
 	return false
 }
 
-// FixedPathPattern names paths whose change always needs review before merge.
-var FixedPathPattern = regexp.MustCompile(`(^|/)(AGENTS|CLAUDE)\.md$|^\.agents/|^skills/.*SKILL\.md$|^\.github/workflows/|(^|/)(fly|render|vercel|netlify)\.(toml|json|ya?ml)$|^deploy/|(^|/)go\.(mod|sum)$|(^|/)package(-lock)?\.json$|(^|/)(pnpm-lock\.yaml|yarn\.lock|Podfile\.lock|Package\.resolved|Cargo\.lock|poetry\.lock|uv\.lock)$|(^|/)migrations?/|^internal/workflow/merge_gate|^internal/credgw/|^internal/config/org\.go$`)
+// FixedPathPattern names paths whose change always needs review before merge,
+// without asking JEV: CI workflows, migrations, the merge gate and credential
+// code, and dependency lockfiles. Owner decision 2026-11-25 (#2752): deploy
+// config, package manifests, agent instructions and skills go to JEV instead,
+// whose rubric already forces review for deploy, CI, merge and review-rule
+// changes.
+var FixedPathPattern = regexp.MustCompile(`^\.github/workflows/|(^|/)migrations?/|^internal/workflow/merge_gate|^internal/credgw/|^internal/config/org\.go$|(^|/)(go\.sum|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Podfile\.lock|Package\.resolved|Cargo\.lock|poetry\.lock|uv\.lock)$`)
+
+// fixedPathExemptPattern names files that are never fixed paths wherever they
+// sit: an example or sample file configures nothing (#2752).
+var fixedPathExemptPattern = regexp.MustCompile(`\.(example|sample)$`)
+
+// IsFixedPath reports whether a change to path always needs review before
+// merge.
+func IsFixedPath(path string) bool {
+	return FixedPathPattern.MatchString(path) && !fixedPathExemptPattern.MatchString(path)
+}
 
 // File is one changed file. Patch is empty when GitHub omitted it (binary or
 // too large), which makes the diff incomplete.
@@ -260,7 +275,7 @@ func Decide(ctx context.Context, judge Judge, model string, in Input) Decision {
 	}
 	var fixed []string
 	for _, file := range in.Files {
-		if FixedPathPattern.MatchString(file.Path) {
+		if IsFixedPath(file.Path) {
 			fixed = append(fixed, file.Path)
 		}
 	}

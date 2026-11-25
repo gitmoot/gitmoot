@@ -164,10 +164,14 @@ status, and prints `level:`, `head:` and `reason:`:
   `--post-merge`; the command prints that request for you.
 - `level3_required`: review before merge.
 
-Some paths always need review before merge (agent instructions such as
-`AGENTS.md`, `SKILL.md` files under `skills/`, CI workflows, deploy config,
-dependency manifests and locks, migrations), and so does every pull request on
-`gitmoot/gitmoot`.
+Some paths always need review before merge without asking JEV: CI workflows
+(`.github/workflows/`), migrations, dependency lockfiles (`go.sum`,
+`package-lock.json`, `Cargo.lock`, ...) and Gitmoot's own merge gate and
+credential code. An `*.example` or `*.sample` file never does. Every pull
+request on `gitmoot/gitmoot` needs review too. Everything else, including
+deploy config, `package.json`, `go.mod`, `AGENTS.md` and skills, is judged by
+JEV, which asks for review before merge on deploy, CI, merge or review-rule
+changes.
 
 A pull request's level never drops: if an earlier head of it, or an earlier
 run on the same head, was judged higher, that level holds. `reason:` then says
