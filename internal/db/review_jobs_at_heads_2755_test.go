@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -59,11 +60,12 @@ func TestListReviewJobsAtHeadsMatchesRepoAndHeadsCaseInsensitively(t *testing.T)
 }
 
 // The read seeks idx_jobs_review_lower_repo_state (case-insensitive repo and
-// the succeeded state) instead of scanning a repo index, and needs no SQL sort.
+// the succeeded state) instead of scanning jobs, and needs no SQL sort; the
+// only scan is json_each over the bound array of heads.
 func TestListReviewJobsAtHeadsSeeksCaseInsensitiveRepoIndex(t *testing.T) {
 	ctx := context.Background()
 	store := openHeadlessTestStore(t)
-	rows, err := store.db.QueryContext(ctx, `EXPLAIN QUERY PLAN `+listReviewJobsAtHeadsSQL("?,?"), "o/r", "aaaa", "bbbb")
+	rows, err := store.db.QueryContext(ctx, `EXPLAIN QUERY PLAN `+listReviewJobsAtHeadsSQL, "o/r", `["aaaa","bbbb"]`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +84,30 @@ func TestListReviewJobsAtHeadsSeeksCaseInsensitiveRepoIndex(t *testing.T) {
 	}
 	joined := strings.Join(plan, "; ")
 	if !strings.Contains(joined, "SEARCH jobs USING INDEX idx_jobs_review_lower_repo_state") ||
-		strings.Contains(joined, "SCAN") || strings.Contains(joined, "TEMP B-TREE") {
-		t.Fatalf("query plan = %q, want a seek of idx_jobs_review_lower_repo_state without a scan or sort", joined)
+		strings.Contains(joined, "SCAN jobs") || strings.Contains(joined, "TEMP B-TREE") {
+		t.Fatalf("query plan = %q, want a seek of idx_jobs_review_lower_repo_state without a jobs scan or sort", joined)
+	}
+}
+
+// A pull request may carry more commits than SQLite binds variables (32,766):
+// the heads are one JSON array parameter, so a 40,000-commit read succeeds.
+func TestListReviewJobsAtHeadsReadsMoreHeadsThanSQLiteVariables(t *testing.T) {
+	ctx := context.Background()
+	store := openHeadlessTestStore(t)
+	heads := make([]string, 0, 40000)
+	for i := range 40000 {
+		heads = append(heads, fmt.Sprintf("%040x", i))
+	}
+	last := heads[len(heads)-1]
+	if err := store.CreateJob(ctx, Job{ID: "at-last-commit", Agent: "r", Type: "review", State: "succeeded",
+		Payload: `{"repo":"o/r","pull_request":6,"head_sha":"` + last + `"}`}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := store.ListReviewJobsAtHeads(ctx, "o/r", heads)
+	if err != nil {
+		t.Fatalf("ListReviewJobsAtHeads(40000 heads): %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != "at-last-commit" {
+		t.Fatalf("ListReviewJobsAtHeads(40000 heads) = %+v, want at-last-commit", jobs)
 	}
 }

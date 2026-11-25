@@ -610,10 +610,12 @@ func (s *Store) ListReviewJobsForPullRequest(ctx context.Context, repo string, p
 // the head JSON is evaluated only on those rows and the gate decodes only the
 // rows about those commits; a payload that is not JSON has no head and cannot
 // match. The few matching rows are ordered here rather than by a SQL sort.
+// The heads travel as one JSON array parameter read through json_each, so a
+// pull request of any length stays inside SQLite's bound-variable limit.
 func (s *Store) ListReviewJobsAtHeads(ctx context.Context, repo string, heads []string) ([]Job, error) {
 	repo = strings.ToLower(strings.TrimSpace(repo))
 	seen := make(map[string]struct{}, len(heads))
-	args := []any{repo}
+	wanted := make([]string, 0, len(heads))
 	for _, head := range heads {
 		head = strings.ToLower(strings.TrimSpace(head))
 		if head == "" {
@@ -623,13 +625,16 @@ func (s *Store) ListReviewJobsAtHeads(ctx context.Context, repo string, heads []
 			continue
 		}
 		seen[head] = struct{}{}
-		args = append(args, head)
+		wanted = append(wanted, head)
 	}
-	if repo == "" || len(seen) == 0 {
+	if repo == "" || len(wanted) == 0 {
 		return nil, nil
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(seen)), ",")
-	rows, err := s.db.QueryContext(ctx, listReviewJobsAtHeadsSQL(placeholders), args...)
+	headsJSON, err := json.Marshal(wanted)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, listReviewJobsAtHeadsSQL, repo, string(headsJSON))
 	if err != nil {
 		return nil, err
 	}
@@ -646,14 +651,12 @@ func (s *Store) ListReviewJobsAtHeads(ctx context.Context, repo string, heads []
 	return jobs, nil
 }
 
-// listReviewJobsAtHeadsSQL is ListReviewJobsAtHeads' exact query for
-// headPlaceholders head parameters, after the lowercased repo parameter.
-func listReviewJobsAtHeadsSQL(headPlaceholders string) string {
-	return `SELECT ` + jobColumns + ` FROM jobs
+// listReviewJobsAtHeadsSQL is ListReviewJobsAtHeads' exact query. Its
+// parameters are the lowercased repo and a JSON array of lowercased heads.
+const listReviewJobsAtHeadsSQL = `SELECT ` + jobColumns + ` FROM jobs
 		WHERE type = 'review' AND lower(repo) IN (?, '') AND state = 'succeeded'
 		AND CASE WHEN json_valid(payload) AND json_type(payload, '$.head_sha') = 'text'
-			THEN lower(trim(json_extract(payload, '$.head_sha'))) ELSE '' END IN (` + headPlaceholders + `)`
-}
+			THEN lower(trim(json_extract(payload, '$.head_sha'))) ELSE '' END IN (SELECT value FROM json_each(?))`
 
 // listRunningReviewJobsSQL is ListRunningReviewJobs' exact query. The literal
 // state predicate lets SQLite read the rows off the partial index

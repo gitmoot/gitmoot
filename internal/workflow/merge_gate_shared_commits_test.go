@@ -252,10 +252,46 @@ func TestMergeGateReadsCompleteRangeWhenCommitListIsCapped(t *testing.T) {
 			t.Fatalf("Evaluate: %v", err)
 		}
 		reason := decision.Reason.Render()
-		if decision.Merged || len(gh.merges) != 0 || !decision.Reason.IsGateMiss() || !strings.Contains(reason, "does not contain the head being merged") {
-			t.Fatalf("decision = %+v (reason %q) merges = %+v; want a held merge for a range without the head", decision, reason, gh.merges)
+		if decision.Merged || len(gh.merges) != 0 || !decision.Reason.IsGateMiss() || !strings.Contains(reason, "contains the head being merged") {
+			t.Fatalf("decision = %+v (reason %q) merges = %+v; want a held merge when neither the list nor the range has the head", decision, reason, gh.merges)
 		}
 	})
+}
+
+// A commit GitHub listed is never discarded for the pinned range: after a
+// same-head retarget the list may reflect a new base the range pinned to the
+// snapshotted base lacks, so the gate checks the union of both.
+func TestMergeGateChecksListedCommitsTheCompleteRangeLacks(t *testing.T) {
+	forEachSharedCommitGate(t, func(t *testing.T, store *db.Store, gh *fakeMergeGateGitHub, gate PolicyMergeGate, request MergeRequest) {
+		insertSharedCommitVerdict(t, store, "review-pr6-rejected", 6, sharedCommitRejected, "changes_requested", "2026-11-25 10:21:03")
+		gh.commits = append(cappedCommitList()[:pullRequestCommitListCap-1], sharedCommitRejected)
+		gh.rangeCommits = []string{sharedCommitOther, sharedCommitHead}
+
+		decision, err := gate.Evaluate(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if decision.Merged || len(gh.merges) != 0 || len(gh.rangeCalls) != 1 || !strings.Contains(decision.Reason.Render(), "review-pr6-rejected") {
+			t.Fatalf("decision = %+v (reason %q) range reads = %v; want the listed rejected commit held", decision, decision.Reason.Render(), gh.rangeCalls)
+		}
+	})
+}
+
+// The shared-commit check runs after low-risk eligibility: a hold label keeps
+// its own leave-open decision, and no commit list is read for it.
+func TestLowRiskHoldLabelLeavesOpenBeforeListingCommits(t *testing.T) {
+	_, gh, gate, request := sharedCommitGateFixture(t, true)
+	gh.pr.Labels = []github.PullRequestLabel{{Name: "hold"}}
+	gh.commitsErr = errors.New("github: 502 bad gateway")
+
+	decision, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	assertLowRiskLeftOpen(t, decision, gh, `hold label "hold"`)
+	if gh.commitCalls != 0 {
+		t.Fatalf("commit listings = %d; want none before low-risk eligibility passes", gh.commitCalls)
+	}
 }
 
 // A listing that contains the head but reaches the cap is not trusted either.
