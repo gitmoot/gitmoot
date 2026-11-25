@@ -3949,6 +3949,17 @@ type fakeMergeGateGitHub struct {
 	requiredKnown      bool
 	requiredCalls      int
 	requiredBranches   []string
+	// commits is the pull request's commit list (#2755); nil lists only the
+	// fixture's declared head, f.pr.HeadSHA. A case whose head moves through
+	// getPullRequest declares its list explicitly. commitsErr fails the listing.
+	commits     []string
+	commitsErr  error
+	commitCalls int
+	// rangeCommits answers ListCompareCommits (the complete base...head range);
+	// rangeErr fails it. rangeCalls records each base...head read.
+	rangeCommits []string
+	rangeErr     error
+	rangeCalls   []string
 }
 
 func (f *fakeMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
@@ -3957,6 +3968,37 @@ func (f *fakeMergeGateGitHub) GetPullRequest(context.Context, github.Repository,
 		return f.getPullRequest(f.getCalls)
 	}
 	return f.pr, nil
+}
+
+func (f *fakeMergeGateGitHub) ListPullRequestCommits(context.Context, github.Repository, int64) ([]github.PullRequestCommit, error) {
+	f.commitCalls++
+	if f.commitsErr != nil {
+		return nil, f.commitsErr
+	}
+	shas := f.commits
+	if shas == nil {
+		shas = []string{f.pr.HeadSHA}
+	}
+	return fakePullRequestCommits(shas), nil
+}
+
+func (f *fakeMergeGateGitHub) ListCompareCommits(_ context.Context, _ github.Repository, base string, head string) ([]github.PullRequestCommit, error) {
+	f.rangeCalls = append(f.rangeCalls, base+"..."+head)
+	if f.rangeErr != nil {
+		return nil, f.rangeErr
+	}
+	if f.rangeCommits == nil {
+		return nil, errors.New("fake: no complete commit range declared")
+	}
+	return fakePullRequestCommits(f.rangeCommits), nil
+}
+
+func fakePullRequestCommits(shas []string) []github.PullRequestCommit {
+	commits := make([]github.PullRequestCommit, 0, len(shas))
+	for _, sha := range shas {
+		commits = append(commits, github.PullRequestCommit{SHA: sha})
+	}
+	return commits
 }
 
 func (f *fakeMergeGateGitHub) ListPullRequestFiles(context.Context, github.Repository, int64) ([]github.PullRequestFile, error) {

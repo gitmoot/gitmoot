@@ -3501,4 +3501,13 @@ CREATE TABLE hub_writes (
 	ref TEXT NOT NULL DEFAULT ''
 );
 	`,
+	// #2755: the merge gate's shared-commit check (ListReviewJobsAtHeads)
+	// reads a repo's succeeded review verdicts on every merge evaluation. The
+	// repo match is case-insensitive (GitHub names are), which the BINARY
+	// idx_jobs_review_repo_pr cannot seek, so it scanned that index. This
+	// partial expression index seeks lower(repo) - '' for rows with no repo
+	// projection - and the succeeded state before any payload is read.
+	`
+CREATE INDEX IF NOT EXISTS idx_jobs_review_lower_repo_state ON jobs(lower(repo), state) WHERE type = 'review';
+	`,
 }

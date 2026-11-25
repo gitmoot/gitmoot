@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -598,6 +599,64 @@ func (s *Store) ListReviewJobsForPullRequest(ctx context.Context, repo string, p
 	}
 	return scanJobs(rows)
 }
+
+// ListReviewJobsAtHeads returns the succeeded review jobs of repo (compared
+// case-insensitively; rows whose repo projection is unset are included for the
+// caller to match by payload) whose payload head_sha is one of heads, compared
+// case-insensitively, oldest first. It serves the merge gate's shared-commit
+// check (#2755), which asks for verdicts on any pull request of the repo at the
+// commits the merging pull request carries. The read seeks
+// idx_jobs_review_lower_repo_state on lower(repo) and the succeeded state, so
+// the head JSON is evaluated only on those rows and the gate decodes only the
+// rows about those commits; a payload that is not JSON has no head and cannot
+// match. The few matching rows are ordered here rather than by a SQL sort.
+// The heads travel as one JSON array parameter read through json_each, so a
+// pull request of any length stays inside SQLite's bound-variable limit.
+func (s *Store) ListReviewJobsAtHeads(ctx context.Context, repo string, heads []string) ([]Job, error) {
+	repo = strings.ToLower(strings.TrimSpace(repo))
+	seen := make(map[string]struct{}, len(heads))
+	wanted := make([]string, 0, len(heads))
+	for _, head := range heads {
+		head = strings.ToLower(strings.TrimSpace(head))
+		if head == "" {
+			continue
+		}
+		if _, dup := seen[head]; dup {
+			continue
+		}
+		seen[head] = struct{}{}
+		wanted = append(wanted, head)
+	}
+	if repo == "" || len(wanted) == 0 {
+		return nil, nil
+	}
+	headsJSON, err := json.Marshal(wanted)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, listReviewJobsAtHeadsSQL, repo, string(headsJSON))
+	if err != nil {
+		return nil, err
+	}
+	jobs, err := scanJobs(rows)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(jobs, func(i, j int) bool {
+		if jobs[i].CreatedAt != jobs[j].CreatedAt {
+			return jobs[i].CreatedAt < jobs[j].CreatedAt
+		}
+		return jobs[i].ID < jobs[j].ID
+	})
+	return jobs, nil
+}
+
+// listReviewJobsAtHeadsSQL is ListReviewJobsAtHeads' exact query. Its
+// parameters are the lowercased repo and a JSON array of lowercased heads.
+const listReviewJobsAtHeadsSQL = `SELECT ` + jobColumns + ` FROM jobs
+		WHERE type = 'review' AND lower(repo) IN (?, '') AND state = 'succeeded'
+		AND CASE WHEN json_valid(payload) AND json_type(payload, '$.head_sha') = 'text'
+			THEN lower(trim(json_extract(payload, '$.head_sha'))) ELSE '' END IN (SELECT value FROM json_each(?))`
 
 // listRunningReviewJobsSQL is ListRunningReviewJobs' exact query. The literal
 // state predicate lets SQLite read the rows off the partial index

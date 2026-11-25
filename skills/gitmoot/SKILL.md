@@ -261,6 +261,11 @@ status. Read the gate's actual answer with `review status` or `/gitmoot merge`.
 - *No implement run recorded* (an attribution gap): run the `run record` from
   section 1, then `/gitmoot merge` again.
 - *No approval bound to the current head*: request a review of that head.
+- *Shared-commit review gate* (the pull request carries a commit that is the
+  head of another pull request's `changes_requested` review; the reason names
+  that pull request, its review job and the commit): get the other pull
+  request approved at that commit, or drop the commit from this pull request
+  and request a review of the new head.
 - *The repository requires GitHub's merge queue*: gitmoot cannot merge
   through it, so `/gitmoot merge` never succeeds there. Enqueue the approved
   head yourself, if your `merge_rule` allows you to merge:
