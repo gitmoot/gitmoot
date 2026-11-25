@@ -56,13 +56,17 @@ func AlwaysReviewRepo(repo string) bool {
 	return false
 }
 
-// FixedPathPattern names paths whose change always needs review before merge,
+// fixedPathPattern names paths whose change always needs review before merge,
 // without asking JEV: CI workflows, migrations, the merge gate and credential
 // code, and dependency lockfiles. Owner decision 2026-11-25 (#2752): deploy
 // config, package manifests, agent instructions and skills go to JEV instead,
 // whose rubric already forces review for deploy, CI, merge and review-rule
-// changes.
-var FixedPathPattern = regexp.MustCompile(`^\.github/workflows/|(^|/)migrations?/|^internal/workflow/merge_gate|^internal/credgw/|^internal/config/org\.go$|(^|/)(go\.sum|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Podfile\.lock|Package\.resolved|Cargo\.lock|poetry\.lock|uv\.lock)$`)
+// changes. Use IsFixedPath, which also applies the sample exemption.
+//
+// `migrations?/` keeps the singular directory on purpose: #2752 keeps
+// migrations forced, the pattern it narrowed already covered `migration/`,
+// and Flyway's default location is `db/migration/`.
+var fixedPathPattern = regexp.MustCompile(`^\.github/workflows/|(^|/)migrations?/|^internal/workflow/merge_gate|^internal/credgw/|^internal/config/org\.go$|(^|/)(go\.sum|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Podfile\.lock|Package\.resolved|Cargo\.lock|poetry\.lock|uv\.lock)$`)
 
 // fixedPathExemptPattern names files that are never fixed paths wherever they
 // sit: an example or sample file configures nothing (#2752).
@@ -71,7 +75,7 @@ var fixedPathExemptPattern = regexp.MustCompile(`\.(example|sample)$`)
 // IsFixedPath reports whether a change to path always needs review before
 // merge.
 func IsFixedPath(path string) bool {
-	return FixedPathPattern.MatchString(path) && !fixedPathExemptPattern.MatchString(path)
+	return fixedPathPattern.MatchString(path) && !fixedPathExemptPattern.MatchString(path)
 }
 
 // File is one changed file. Patch is empty when GitHub omitted it (binary or

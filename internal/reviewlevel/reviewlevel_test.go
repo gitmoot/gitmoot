@@ -63,6 +63,8 @@ func TestDecidePrecedence(t *testing.T) {
 		{"lockfile in a subdirectory is a fixed path", appInput(File{Path: "app/Cargo.lock", Patch: "+x"}), &fakeJudge{choice: LevelNoReview}, false, LevelRequired, "path", 0},
 		// #2752: kept fixed paths.
 		{"migration is a fixed path", appInput(File{Path: "app/migrations/001.sql", Patch: "+x"}), &fakeJudge{choice: LevelNoReview}, false, LevelRequired, "path", 0},
+		{"Flyway singular migration directory is a fixed path", appInput(File{Path: "src/main/resources/db/migration/V1__init.sql", Patch: "+x"}), &fakeJudge{choice: LevelNoReview}, false, LevelRequired, "path", 0},
+		{"workflow sample goes to JEV", appInput(File{Path: ".github/workflows/ci.yml.example", Patch: "+x"}), &fakeJudge{risk: 0.05, choice: LevelNoReview}, false, LevelNoReview, "jev", 1},
 		{"go.sum is a fixed path", appInput(File{Path: "go.sum", Patch: "+x"}), &fakeJudge{choice: LevelNoReview}, false, LevelRequired, "path", 0},
 		{"credential gateway is a fixed path", appInput(File{Path: "internal/credgw/lease.go", Patch: "+x"}), &fakeJudge{choice: LevelNoReview}, false, LevelRequired, "path", 0},
 		// #2752: handed to JEV.
