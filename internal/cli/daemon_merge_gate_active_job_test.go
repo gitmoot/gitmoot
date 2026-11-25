@@ -27,6 +27,10 @@ type activeJobMergeGateGitHub struct {
 	files       []github.PullRequestFile
 	mergeInputs []github.MergePullRequestInput
 	statuses    []github.CommitStatusInput
+	// commits is the pull request's commit list (#2755); nil lists only the
+	// head. commitsErr fails the listing.
+	commits    []string
+	commitsErr error
 }
 
 func (f *activeJobMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
@@ -35,6 +39,21 @@ func (f *activeJobMergeGateGitHub) GetPullRequest(context.Context, github.Reposi
 
 func (f *activeJobMergeGateGitHub) ListPullRequestFiles(context.Context, github.Repository, int64) ([]github.PullRequestFile, error) {
 	return append([]github.PullRequestFile(nil), f.files...), nil
+}
+
+func (f *activeJobMergeGateGitHub) ListPullRequestCommits(context.Context, github.Repository, int64) ([]github.PullRequestCommit, error) {
+	if f.commitsErr != nil {
+		return nil, f.commitsErr
+	}
+	shas := f.commits
+	if shas == nil {
+		shas = []string{f.pr.HeadSHA}
+	}
+	commits := make([]github.PullRequestCommit, 0, len(shas))
+	for _, sha := range shas {
+		commits = append(commits, github.PullRequestCommit{SHA: sha})
+	}
+	return commits, nil
 }
 
 func (f *activeJobMergeGateGitHub) GetCombinedStatus(context.Context, github.Repository, string) (github.CombinedStatus, error) {
@@ -1212,6 +1231,10 @@ func (r *terminalPollGitHubRunner) Run(_ context.Context, _ string, _ string, ar
 	}
 	joined := strings.Join(args, " ")
 	switch {
+	case strings.Contains(joined, "/pulls/1732/commits"):
+		// The shared-commit review gate (#2755) lists the pull request's
+		// commits: a head-only pull request carries nothing else.
+		return subprocess.Result{Stdout: `[{"sha":"head-1732"}]`}, nil
 	case strings.Contains(joined, "/pulls/1732"):
 		pr := r.poll.pr
 		if r.recoveryPR != nil {

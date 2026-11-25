@@ -3949,14 +3949,41 @@ type fakeMergeGateGitHub struct {
 	requiredKnown      bool
 	requiredCalls      int
 	requiredBranches   []string
+	// commits is the pull request's commit list (#2755); nil lists only the
+	// head last returned by GetPullRequest. commitsErr fails the listing.
+	commits     []string
+	commitsErr  error
+	commitCalls int
+	lastHead    string
 }
 
 func (f *fakeMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
 	f.getCalls++
 	if f.getPullRequest != nil {
-		return f.getPullRequest(f.getCalls)
+		pr, err := f.getPullRequest(f.getCalls)
+		if err == nil {
+			f.lastHead = pr.HeadSHA
+		}
+		return pr, err
 	}
+	f.lastHead = f.pr.HeadSHA
 	return f.pr, nil
+}
+
+func (f *fakeMergeGateGitHub) ListPullRequestCommits(context.Context, github.Repository, int64) ([]github.PullRequestCommit, error) {
+	f.commitCalls++
+	if f.commitsErr != nil {
+		return nil, f.commitsErr
+	}
+	shas := f.commits
+	if shas == nil {
+		shas = []string{f.lastHead}
+	}
+	commits := make([]github.PullRequestCommit, 0, len(shas))
+	for _, sha := range shas {
+		commits = append(commits, github.PullRequestCommit{SHA: sha})
+	}
+	return commits, nil
 }
 
 func (f *fakeMergeGateGitHub) ListPullRequestFiles(context.Context, github.Repository, int64) ([]github.PullRequestFile, error) {

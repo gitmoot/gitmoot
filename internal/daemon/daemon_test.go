@@ -2861,25 +2861,32 @@ func (f *fakeGitHub) GetPullRequest(_ context.Context, _ github.Repository, numb
 	if f.getPullRequestErr != nil {
 		return github.PullRequest{}, f.getPullRequestErr
 	}
+	if pull, ok := f.findPull(number); ok {
+		return pull, nil
+	}
+	return github.PullRequest{}, errors.New("not implemented")
+}
+
+func (f *fakeGitHub) findPull(number int64) (github.PullRequest, bool) {
 	if f.pullsByNumber != nil {
 		if pull, ok := f.pullsByNumber[number]; ok {
-			return pull, nil
+			return pull, true
 		}
 	}
 	for _, state := range []string{"open", "closed"} {
 		pulls := f.pullsByState[state]
 		for _, pull := range pulls {
 			if pull.Number == number {
-				return pull, nil
+				return pull, true
 			}
 		}
 	}
 	for _, pull := range f.pulls {
 		if pull.Number == number {
-			return pull, nil
+			return pull, true
 		}
 	}
-	return github.PullRequest{}, errors.New("not implemented")
+	return github.PullRequest{}, false
 }
 
 func (f *fakeGitHub) GetCombinedStatus(context.Context, github.Repository, string) (github.CombinedStatus, error) {
@@ -2906,7 +2913,12 @@ func (f *fakeGitHub) ListPullRequestFiles(context.Context, github.Repository, in
 	return append([]github.PullRequestFile(nil), f.pullRequestFiles...), nil
 }
 
-func (f *fakeGitHub) ListPullRequestCommits(context.Context, github.Repository, int64) ([]github.PullRequestCommit, error) {
+// ListPullRequestCommits lists the pull request's head as its only commit, so
+// the merge gate's shared-commit check (#2755) sees a head-only pull request.
+func (f *fakeGitHub) ListPullRequestCommits(_ context.Context, _ github.Repository, number int64) ([]github.PullRequestCommit, error) {
+	if pull, ok := f.findPull(number); ok && strings.TrimSpace(pull.HeadSHA) != "" {
+		return []github.PullRequestCommit{{SHA: pull.HeadSHA}}, nil
+	}
 	return nil, errors.New("not implemented")
 }
 

@@ -599,6 +599,44 @@ func (s *Store) ListReviewJobsForPullRequest(ctx context.Context, repo string, p
 	return scanJobs(rows)
 }
 
+// ListReviewJobsAtHeads returns the review jobs of repo (compared
+// case-insensitively; rows whose repo projection is unset are included for the
+// caller to match by payload) whose payload head_sha is one of heads, compared
+// case-insensitively, oldest first. It serves the merge gate's shared-commit
+// check (#2755), which asks for verdicts on any pull request of the repo at the
+// commits the merging pull request carries. The head filter runs in SQL so the
+// gate decodes only the rows about those commits, never the repo's whole review
+// history; a payload that is not JSON has no head and cannot match.
+func (s *Store) ListReviewJobsAtHeads(ctx context.Context, repo string, heads []string) ([]Job, error) {
+	repo = strings.ToLower(strings.TrimSpace(repo))
+	seen := make(map[string]struct{}, len(heads))
+	args := []any{repo}
+	for _, head := range heads {
+		head = strings.ToLower(strings.TrimSpace(head))
+		if head == "" {
+			continue
+		}
+		if _, dup := seen[head]; dup {
+			continue
+		}
+		seen[head] = struct{}{}
+		args = append(args, head)
+	}
+	if repo == "" || len(seen) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(seen)), ",")
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs
+		WHERE type = 'review' AND (lower(repo) = ? OR repo = '')
+		AND CASE WHEN json_valid(payload) AND json_type(payload, '$.head_sha') = 'text'
+			THEN lower(trim(json_extract(payload, '$.head_sha'))) ELSE '' END IN (`+placeholders+`)
+		ORDER BY created_at, id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
+}
+
 // listRunningReviewJobsSQL is ListRunningReviewJobs' exact query. The literal
 // state predicate lets SQLite read the rows off the partial index
 // idx_jobs_running_updated_at, and ordering by that index's own key (updated_at,

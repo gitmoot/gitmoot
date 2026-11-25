@@ -53,6 +53,16 @@ func TestMergeGateStoreAccessSurface(t *testing.T) {
 		//     that DID implement the change review it.
 		"JobIDsWithEventKind",
 		"ListJobs",
+		// ListReviewJobsAtHeads is a READ, added for #2755 (the shared-commit
+		// review gate). Its authority implications:
+		//
+		//   - it reads the DECISION plane: review job rows and their recorded
+		//     verdicts, the same evidence ListJobs already gives the review gate,
+		//     narrowed in SQL to the commits the merging pull request carries.
+		//     It returns no events, notes or proof artifacts.
+		//   - it can only ADD a hold, never remove one: a verdict it returns can
+		//     refuse a merge the other gates passed, and a read error refuses too.
+		"ListReviewJobsAtHeads",
 		"RecoverClaimedTaskState",
 		"ReleaseRetainedTaskStateClaim",
 		"ReleaseResourceLock",

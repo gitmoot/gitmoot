@@ -63,6 +63,10 @@ type MergeGateGitHub interface {
 	GetCombinedStatus(ctx context.Context, repo github.Repository, ref string) (github.CombinedStatus, error)
 	ListCheckRunsForRef(ctx context.Context, repo github.Repository, ref string) ([]github.PullRequestCheck, error)
 	ListPullRequestFiles(ctx context.Context, repo github.Repository, number int64) ([]github.PullRequestFile, error)
+	// ListPullRequestCommits lists every commit the pull request carries, so
+	// the gate can hold a merge that would land a commit another review
+	// rejected (#2755).
+	ListPullRequestCommits(ctx context.Context, repo github.Repository, number int64) ([]github.PullRequestCommit, error)
 	CompareCommits(ctx context.Context, repo github.Repository, base string, head string) (github.CompareResult, error)
 	ListPullRequestChecks(ctx context.Context, repo github.Repository, number int64) ([]github.PullRequestCheck, error)
 	CreateCommitStatus(ctx context.Context, input github.CommitStatusInput) (github.CommitStatus, error)
@@ -579,6 +583,10 @@ func (g PolicyMergeGate) gateMiss(reason MergeReason) MergeDecision {
 // to completion and at least one is missing, stale, or failed - the caller
 // escalates. Both zero-value means the gate is clean. baseRef is the pull
 // request's base branch; evaluateStatuses consults its protection (#2605).
+// The shared-commit review gate (#2755) runs with the review gate, so every
+// merge path through Evaluate - the ordinary gate, the per-repo low-risk gate
+// and a human merge request - holds a pull request carrying a commit another
+// review rejected.
 func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Repository, request MergeRequest, baseRef string, headSHA string) (pendingDecision MergeDecision, isPending bool, reason MergeReason, err error) {
 	var miss MergeReason
 	if reviewErr := g.ensureFinalReviewCaptured(ctx, request, headSHA); reviewErr != nil {
@@ -605,7 +613,65 @@ func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Re
 			return MergeDecision{}, false, MergeReason{}, missErr
 		}
 	}
+	if sharedErr := g.ensureNoUnresolvedSharedChangesRequested(ctx, repo, request, headSHA); sharedErr != nil {
+		var pending mergePending
+		if errors.As(sharedErr, &pending) {
+			// An unreadable commit list holds the merge as pending only when it
+			// is the sole refusal: a review or CI miss already holds it and
+			// names its own remedy, which a retry notice must not displace.
+			if miss.IsZero() {
+				decision, dErr := g.pending(ctx, request, headSHA, pending.reason)
+				return decision, true, MergeReason{}, dErr
+			}
+		} else {
+			var missErr error
+			miss, missErr = miss.WithGateMiss(SharedCommitReviewGate, sharedErr.Error(), headSHA)
+			if missErr != nil {
+				return MergeDecision{}, false, MergeReason{}, missErr
+			}
+		}
+	}
 	return MergeDecision{}, false, miss, nil
+}
+
+// ensureNoUnresolvedSharedChangesRequested holds a merge of the pull request
+// while any commit it carries is the head of an unanswered changes_requested
+// verdict (#2755; unresolvedSharedChangesRequested owns the semantics). It
+// fails closed: a commit list that cannot be read is a pending hold retried on
+// the next poll, and a list that does not contain the head being merged (the
+// head moved while reading, or GitHub's 250-commit cap truncated it) cannot
+// vouch for the carried commits, so it refuses.
+func (g PolicyMergeGate) ensureNoUnresolvedSharedChangesRequested(ctx context.Context, repo github.Repository, request MergeRequest, headSHA string) error {
+	listed, err := g.GitHub.ListPullRequestCommits(ctx, repo, int64(request.PullRequest))
+	if err != nil {
+		return mergePending{reason: fmt.Sprintf("cannot list the commits of pull request #%d to check them against changes_requested reviews (%v); holding the merge until they can be read", request.PullRequest, err)}
+	}
+	commits := make([]string, 0, len(listed))
+	headListed := false
+	for _, commit := range listed {
+		sha := normalizedSHA(commit.SHA)
+		if sha == normalizedSHA(headSHA) {
+			headListed = true
+		}
+		commits = append(commits, sha)
+	}
+	if !headListed {
+		return fmt.Errorf("the commit list of pull request #%d (%d commits) does not contain the head being merged, so its carried commits cannot be checked against changes_requested reviews (the head moved, or GitHub's 250-commit list cap truncated it)", request.PullRequest, len(listed))
+	}
+	// #2755: a READ of decision-plane rows, review verdicts and their heads,
+	// the same evidence the review gate reads through ListJobs.
+	jobs, err := g.Store.ListReviewJobsAtHeads(ctx, request.Repo, commits)
+	if err != nil {
+		return fmt.Errorf("read review verdicts at the commits of pull request #%d: %w", request.PullRequest, err)
+	}
+	held, err := unresolvedSharedChangesRequested(jobs, request.Repo, request.PullRequest, headSHA, commits, request.ReviewBlockingSeverity)
+	if err != nil {
+		return err
+	}
+	if len(held) > 0 {
+		return errors.New(sharedChangesRequestedCause(held, request.PullRequest))
+	}
+	return nil
 }
 
 // executePullRequestMergeFenced durably claims the task's expected state before
