@@ -734,30 +734,34 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // today, which is why that case is real traffic. The arms are pinned in
 // stale_verdict_head_test.go.
 //
+// It also returns the observed head when it refuses. A refusal is not yet a
+// verdict that the objection is stale: the observed row is written by the repo
+// poll and can trail the verdict's head (#2759), so the caller holds a fresh
+// refusal and settles only one that outlives staleObjectionSettleWindow.
+//
 // ACCEPTED LIMITATION: when the ONLY objection on a PR is bound to a superseded
-// head, this arm strands it. The task does not transition and nothing here
-// re-drives anything - the PR waits for a review at the current head. That is
-// deliberate, and it is the reason the refusal is terminal rather than retried.
-func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayload) (bool, string, error) {
+// head, a settled refusal strands it. The task does not transition and nothing
+// re-drives anything - the PR waits for a review at the current head.
+func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayload) (bool, string, string, error) {
 	objectionHead := strings.TrimSpace(payload.HeadSHA)
 	if objectionHead == "" || payload.PullRequest <= 0 {
 		// Checked before any store read: an unbound objection claims nothing about
 		// any commit, and a PR-less review is already terminal earlier in the
 		// advance path.
-		return true, "", nil
+		return true, "", "", nil
 	}
 	pr, err := e.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return true, "", nil
+			return true, "", "", nil
 		}
-		return false, "", err
+		return false, "", "", err
 	}
 	currentHead := strings.TrimSpace(pr.HeadSHA)
 	if currentHead == "" || currentHead == objectionHead {
-		return true, "", nil
+		return true, "", "", nil
 	}
-	return false, fmt.Sprintf(
+	return false, currentHead, fmt.Sprintf(
 		"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the PR is not transitioned and no fix leg is dispatched",
 		objectionHead, currentHead), nil
 }
@@ -776,19 +780,13 @@ const staleObjectionSettleWindow = 15 * time.Minute
 // No such event means the age is unknown, and the objection settles as stale,
 // which is the behavior before #2759 rather than an unbounded hold.
 func (e Engine) staleObjectionStillSettling(ctx context.Context, job db.Job) (bool, error) {
-	events, err := e.Store.ListJobEvents(ctx, job.ID)
-	if err != nil {
+	event, found, err := e.Store.GetEarliestJobEventByKind(ctx, job.ID, job.State)
+	if err != nil || !found {
 		return false, err
 	}
-	for _, event := range events {
-		if event.Kind != job.State {
-			continue
-		}
-		settledAt, ok := parseStoredJobTime(event.CreatedAt)
-		if !ok {
-			return false, nil
-		}
-		return e.now().Sub(settledAt) < staleObjectionSettleWindow, nil
+	settledAt, ok := parseStoredJobTime(event.CreatedAt)
+	if !ok {
+		return false, nil
 	}
-	return false, nil
+	return e.now().Sub(settledAt) < staleObjectionSettleWindow, nil
 }

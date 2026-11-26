@@ -388,7 +388,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// legitimate objection on a PR the daemon has not polled yet, which is
 			// the CLI-dispatch path, and would make the engine's cheapest
 			// transition the one demanding the most evidence.
-			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
+			bound, observedHead, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
 			if err != nil {
 				return err
 			}
@@ -406,7 +406,10 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				if hold {
 					// An error leaves the advancement unreconciled, so the daemon's
 					// advance-retry re-drives it; recordAdvanceRetryOnce keeps one row.
-					return fmt.Errorf("review objection held: %s", unboundReason)
+					// The terminal skip reason is not reused: it says the branch moved
+					// past the reviewed commit, which in the row-lag case is backwards.
+					return fmt.Errorf("review objection held: the objection is bound to head %s and the observed pull request head is %s; waiting for the repo poll to update the observed head before deciding whether the objection is current",
+						strings.TrimSpace(payload.HeadSHA), observedHead)
 				}
 				return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_stale_head", Message: unboundReason})
 			}
