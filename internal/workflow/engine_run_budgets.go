@@ -393,6 +393,21 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				return err
 			}
 			if !bound {
+				// #2759: the observed head can be the one BEFORE the verdict's,
+				// because the repo poll writes it and a review often finishes inside
+				// one poll interval - the same inversion #2150 fixed on the approval
+				// side. Over 30 days, 742 of 831 skipped objections named an older
+				// head as current. So a fresh mismatch is held and retried; only one
+				// that outlives the settle window is settled as stale.
+				hold, err := e.staleObjectionStillSettling(ctx, job)
+				if err != nil {
+					return err
+				}
+				if hold {
+					// An error leaves the advancement unreconciled, so the daemon's
+					// advance-retry re-drives it; recordAdvanceRetryOnce keeps one row.
+					return fmt.Errorf("review objection held: %s", unboundReason)
+				}
 				return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_stale_head", Message: unboundReason})
 			}
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {

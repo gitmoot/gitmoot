@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
@@ -759,4 +760,35 @@ func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayl
 	return false, fmt.Sprintf(
 		"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the PR is not transitioned and no fix leg is dispatched",
 		objectionHead, currentHead), nil
+}
+
+// staleObjectionSettleWindow bounds how long an objection whose head disagrees
+// with the observed pull request row is held for the row to catch up (#2759).
+// The repo poll lag measured on jerryfane/fleetup#166 was 59s; the window is far
+// above that, and short enough that a genuinely superseded objection - 4 in 30
+// days - is re-driven only briefly before it settles.
+const staleObjectionSettleWindow = 15 * time.Minute
+
+// staleObjectionStillSettling reports whether a head-mismatched objection is
+// young enough to hold for the observed row to catch up. The verdict time is the
+// job's first terminal-state event, not jobs.updated_at: a payload rewrite bumps
+// updated_at, so it could restart the window on every retry and never settle.
+// No such event means the age is unknown, and the objection settles as stale,
+// which is the behavior before #2759 rather than an unbounded hold.
+func (e Engine) staleObjectionStillSettling(ctx context.Context, job db.Job) (bool, error) {
+	events, err := e.Store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if event.Kind != job.State {
+			continue
+		}
+		settledAt, ok := parseStoredJobTime(event.CreatedAt)
+		if !ok {
+			return false, nil
+		}
+		return e.now().Sub(settledAt) < staleObjectionSettleWindow, nil
+	}
+	return false, nil
 }
