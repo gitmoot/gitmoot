@@ -94,22 +94,6 @@ func (e Engine) publishCleanupArtifacts(ctx context.Context, jobID string) (cont
 	if err != nil {
 		return ctx, err
 	}
-	// A capture that failed in the non-blocking way set its own retry deadline.
-	// Honor it before calling the collector again: an advancement that is itself
-	// retried every tick (an approval or objection hold) re-enters here, and a
-	// capture can take up to 45s and pushes the deadline forward when it fails
-	// again (#2760 review). Only CleanupReasonTerminalDeferred qualifies: the
-	// branch below writes it for a capture already reported as non-blocking, and
-	// every other writer is a skip-style deferral, never a failure. A hard
-	// preservation failure is recorded as "unknown", keeps calling the collector
-	// and keeps its blocking error. The first attempt is unaffected: a fresh
-	// obligation is pending, not retryable.
-	if obligation.State == db.CleanupObligationRetryable && obligation.Reason == db.CleanupReasonTerminalDeferred &&
-		obligation.LifecycleGeneration == job.LifecycleGeneration {
-		if due, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt); err == nil && due.After(e.now()) {
-			return ctx, fmt.Errorf("%w: an earlier evidence capture failed; next attempt at %s", ErrPreservationDeferred, obligation.NextAttemptAt)
-		}
-	}
 	if reason := e.cleanupRuntimeRefusal(ctx, jobID, payload.WorktreePath); reason != "" {
 		return ctx, fmt.Errorf("producer artifact preservation refused: %s", reason)
 	}
@@ -123,14 +107,8 @@ func (e Engine) publishCleanupArtifacts(ctx context.Context, jobID string) (cont
 			// the cleanup has been pending (#2517); transient gates elsewhere
 			// keep the one-minute retry.
 			now := e.now().UTC()
-			// Reusing the existing reason rather than adding one avoids rebuilding
-			// the cleanup_obligations table for its reason CHECK.
-			reason := db.CleanupReasonTerminalDeferred
-			if classified := db.ClassifyCleanupObligationFailure("preserve", err); classified == db.CleanupReasonContextInterrupted {
-				reason = classified
-			}
 			_, deferErr := e.Store.DeferCleanupObligation(context.WithoutCancel(ctx), jobID, payload.WorktreePath,
-				reason, now, now.Add(PreservationDeferredRetryDelay(obligation.CreatedAt, now)))
+				db.ClassifyCleanupObligationFailure("preserve", err), now, now.Add(PreservationDeferredRetryDelay(obligation.CreatedAt, now)))
 			return ctx, errors.Join(err, deferErr)
 		}
 		return ctx, errors.Join(err, e.deferDelegationCleanupFailure(ctx, jobID, payload.WorktreePath, "preserve", err))

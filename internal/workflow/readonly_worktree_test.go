@@ -119,87 +119,11 @@ func TestDeferredPreservationKeepsWorktreeWithoutFailingAdvance(t *testing.T) {
 		t.Fatalf("kept worktree recorded no reason: %+v", events)
 	}
 
-	// The retry runs once the deferral is due, which is when the collector is
-	// called again.
-	world.engine.Now = func() time.Time { return time.Now().UTC().Add(time.Hour) }
 	world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
 		return errors.Join(fmt.Errorf("%w: diff", ErrPreservationDeferred), errors.New("pipeline artifact publish failed"))
 	}
 	if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err == nil {
 		t.Fatal("a real publication failure beside a deferred one did not fail")
-	}
-	world.assertPreserved(t)
-}
-
-// #2760 review: an advancement that is itself retried every tick (an approval
-// or objection hold) re-enters cleanup each time. After a capture failed and
-// deferred the obligation, a replay before the deadline must not run the
-// collector again - production capture can take 45s - nor push the deadline
-// forward. Once the deadline passes, the collector runs again.
-func TestDeferredPreservationReplayHonorsRetryDeadline(t *testing.T) {
-	world := newProducerCleanupFixture(t, true)
-	ctx := context.Background()
-	captures := 0
-	world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
-		captures++
-		return fmt.Errorf("%w: read-only worktree diff not captured: signal: killed", ErrPreservationDeferred)
-	}
-	if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err != nil {
-		t.Fatalf("first deferred preservation failed the advance: %v", err)
-	}
-	resource := db.CleanupObligationResourceID(world.jobID, world.payload.WorktreePath)
-	deferred, err := world.store.GetCleanupObligation(ctx, resource)
-	if err != nil || deferred.State != db.CleanupObligationRetryable {
-		t.Fatalf("first failure left no retryable obligation: %+v %v", deferred, err)
-	}
-
-	if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err != nil {
-		t.Fatalf("replay before the deadline failed the advance: %v", err)
-	}
-	if captures != 1 {
-		t.Fatalf("collector ran %d times before the retry deadline, want 1", captures)
-	}
-	replayed, err := world.store.GetCleanupObligation(ctx, resource)
-	if err != nil || replayed.NextAttemptAt != deferred.NextAttemptAt || replayed.AttemptCount != deferred.AttemptCount {
-		t.Fatalf("replay moved the deferral: before %+v after %+v %v", deferred, replayed, err)
-	}
-	world.assertPreserved(t)
-
-	world.engine.Now = func() time.Time { return time.Now().UTC().Add(time.Hour) }
-	if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err != nil {
-		t.Fatalf("due retry failed the advance: %v", err)
-	}
-	if captures != 2 {
-		t.Fatalf("collector ran %d times after the deadline, want 2", captures)
-	}
-}
-
-// #2760 review round 2: a HARD preservation failure also defers the obligation
-// with a future deadline, but it must not be turned into a non-blocking
-// deferral on replay. Reporting it as deferred converts it to nil, the advance
-// records advance_retried, and the failed preservation is never retried by
-// advancement. A replay before the deadline must call the collector again and
-// keep failing.
-func TestHardPreservationFailureReplayStillFails(t *testing.T) {
-	world := newProducerCleanupFixture(t, true)
-	ctx := context.Background()
-	captures := 0
-	world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
-		captures++
-		return errors.New("persist diff metadata: database is locked")
-	}
-	for attempt := 1; attempt <= 2; attempt++ {
-		if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err == nil {
-			t.Fatalf("attempt %d: hard preservation failure did not fail the advance", attempt)
-		}
-	}
-	if captures != 2 {
-		t.Fatalf("collector ran %d times for two hard-failure attempts, want 2", captures)
-	}
-	resource := db.CleanupObligationResourceID(world.jobID, world.payload.WorktreePath)
-	obligation, err := world.store.GetCleanupObligation(ctx, resource)
-	if err != nil || obligation.Reason == db.CleanupReasonTerminalDeferred {
-		t.Fatalf("hard failure was recorded as a non-blocking deferral: %+v %v", obligation, err)
 	}
 	world.assertPreserved(t)
 }
