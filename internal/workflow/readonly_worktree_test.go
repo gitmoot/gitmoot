@@ -174,6 +174,36 @@ func TestDeferredPreservationReplayHonorsRetryDeadline(t *testing.T) {
 	}
 }
 
+// #2760 review round 2: a HARD preservation failure also defers the obligation
+// with a future deadline, but it must not be turned into a non-blocking
+// deferral on replay. Reporting it as deferred converts it to nil, the advance
+// records advance_retried, and the failed preservation is never retried by
+// advancement. A replay before the deadline must call the collector again and
+// keep failing.
+func TestHardPreservationFailureReplayStillFails(t *testing.T) {
+	world := newProducerCleanupFixture(t, true)
+	ctx := context.Background()
+	captures := 0
+	world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
+		captures++
+		return errors.New("persist diff metadata: database is locked")
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err == nil {
+			t.Fatalf("attempt %d: hard preservation failure did not fail the advance", attempt)
+		}
+	}
+	if captures != 2 {
+		t.Fatalf("collector ran %d times for two hard-failure attempts, want 2", captures)
+	}
+	resource := db.CleanupObligationResourceID(world.jobID, world.payload.WorktreePath)
+	obligation, err := world.store.GetCleanupObligation(ctx, resource)
+	if err != nil || obligation.Reason == db.CleanupReasonTerminalDeferred {
+		t.Fatalf("hard failure was recorded as a non-blocking deferral: %+v %v", obligation, err)
+	}
+	world.assertPreserved(t)
+}
+
 func TestReclaimReadOnlyWorktreeRejectsUnownedPath(t *testing.T) {
 	world := newProducerCleanupFixture(t, true)
 	ctx := context.Background()
