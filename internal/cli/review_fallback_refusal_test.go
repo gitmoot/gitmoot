@@ -32,6 +32,34 @@ const (
 	multilineRefusal               = "omp turn failed (stopReason error): Codex error event: This content was flagged for possible cybersecurity risk.\nIf this seems wrong, try rephrasing your request. (code=cyber_policy): remote command exited with code 1: exit status 1"
 )
 
+// codexModelNotFound is verbatim from job
+// local-review-review-router-18eb712586553bda-1 (2026-11-26), one of 13 routed
+// reviews in 8 days that failed on it with fallback models behind them.
+const codexModelNotFound = "omp turn failed (stopReason error): Codex error event: The 'gpt-6.2-sol' model is not supported when using Codex with a ChatGPT account. (code=model_not_found): exit status 1"
+
+func TestProviderModelNotFoundClassifiesAsModelUnavailable(t *testing.T) {
+	const notFound = "omp turn failed (stopReason error): Codex error event: The 'gpt-6-sol' model is not supported when using Codex with a ChatGPT account. (code=model_not_found)"
+	// The live suffix shapes across all 13 live failures.
+	for _, text := range []string{
+		codexModelNotFound,
+		notFound,
+		notFound + ": remote command exited with code 1: exit status 1",
+	} {
+		got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(text)}, time.Now())
+		if !ok || got.Class != blockerClassModelUnavailable || !got.RetryAt.IsZero() {
+			t.Fatalf("classifyOperationalBlocker(%q) = %+v, %v; want class %s with zero RetryAt", text, got, ok, blockerClassModelUnavailable)
+		}
+	}
+	// A quoted code is not the provider's, and the two codes keep their classes.
+	quoted := "omp turn failed (stopReason error): Codex error event: the fixture names (code=model_not_found)\nwhile the provider says (code=invalid_request_error): exit status 1"
+	if got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(quoted)}, time.Now()); ok && got.Class == blockerClassModelUnavailable {
+		t.Fatalf("classifyOperationalBlocker(%q) = %s, want no model_unavailable", quoted, got.Class)
+	}
+	if got, _ := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(codexCyberPolicyRefusal)}, time.Now()); got.Class != blockerClassModelRefused {
+		t.Fatalf("cyber_policy classified %s, want %s", got.Class, blockerClassModelRefused)
+	}
+}
+
 func TestProviderContentRefusalClassifiesAsModelRefused(t *testing.T) {
 	const flagged = "omp turn failed (stopReason error): Codex error event: This content was flagged for possible cybersecurity risk. (code=cyber_policy)"
 	// The live suffix shapes (all 20 live failures), plus a multi-line message.
@@ -112,6 +140,7 @@ func TestPerModelFailureAdvancesReviewPoolOrStaysTerminal(t *testing.T) {
 	}{
 		{"unknown model", unknownModelFailure, blockerClassModelUnavailable},
 		{"content refusal", codexCyberPolicyRefusal, blockerClassModelRefused},
+		{"provider model not found", codexModelNotFound, blockerClassModelUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Run("next pool entry", func(t *testing.T) {

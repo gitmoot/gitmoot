@@ -405,7 +405,12 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 		// either advances a routed review's pool or leaves the failure terminal.
 		return blockerClassification{Class: blockerClassModelUnavailable, Detail: detail}, true
 	}
-	if providerContentRefusalRe.MatchString(strings.ToLower(text)) {
+	switch providerTerminalCode(text) {
+	case "model_not_found":
+		// The provider will not serve this model to this account: the same fact
+		// as omp's "Unknown model", one level further down.
+		return blockerClassification{Class: blockerClassModelUnavailable, Detail: detail}, true
+	case "cyber_policy":
 		// Same routing as model_unavailable: RetryAt stays zero, so the seam
 		// advances a routed review's pool or leaves the failure terminal.
 		return blockerClassification{Class: blockerClassModelRefused, Detail: detail}, true
@@ -496,28 +501,47 @@ var billingExhaustionRe = regexp.MustCompile(
 var providerCapacityRe = regexp.MustCompile(
 	`\bcode"?\s*[=:]\s*"?[a-z_]*rate_limit_exceeded\b`)
 
-// providerContentRefusalRe matches a provider's content-policy refusal as omp
-// renders it: omp appends the provider's code after the WHOLE message, so the
-// refusal is the `(code=cyber_policy)` group that ENDS the error, followed
-// only by the runtime's own exit wrappers (`: exit status N`, optionally
-// preceded by `: remote command exited with code N`) and trailing space. The
-// message itself may span lines. Measured on all 20 live failures
-// (2026-11-24). A message that quotes the group anywhere before the
-// provider's real code does not match, whatever punctuation or newline
-// follows the quote, nor does a different code value or another key
-// (`diagnostic-code`).
+// providerTerminalCodeRe matches a per-model provider refusal as omp renders
+// it: omp appends the provider's code after the WHOLE message, so the refusal
+// is the `(code=<code>)` group that ENDS the error, followed only by the
+// runtime's own exit wrappers (`: exit status N`, optionally preceded by
+// `: remote command exited with code N`) and trailing space. The message
+// itself may span lines. A message that quotes the group anywhere before the
+// provider's real code does not match, whatever punctuation or newline follows
+// the quote, nor does another key (`diagnostic-code`).
+//
+// Only two codes route, both facts about one pool entry:
+//   - cyber_policy: a content-policy refusal (model_refused). Measured on all
+//     20 live failures (2026-11-24).
+//   - model_not_found: the provider will not serve this model to this account
+//     (model_unavailable). Measured on all 13 live failures (2026-11-18 to
+//     2026-11-26), intermittent per account while other reviews on the same
+//     model succeed. The stored failed-event text of one of them carries a
+//     "\nstderr tail:" section, appended at terminal time
+//     (terminalMessageWithDiagnostics), after this classifier has run.
 //
 // KNOWN LIMIT (#2751): omp delivers the code only inside its rendered
 // errorMessage (ompStreamMessage has errorStatus but no code field), and
 // appends nothing when the provider sends no code. A code-less provider error
-// whose own message ends in this literal is therefore indistinguishable here
-// and also advances the pool. The cost is one unneeded fallback to the next
-// model, never a changed verdict; routing on a typed code needs omp to emit it.
+// whose own message ends in one of these literals is therefore
+// indistinguishable here and also advances the pool. The cost is one unneeded
+// fallback to the next model, never a changed verdict; routing on a typed code
+// needs omp to emit it.
 //
 //	Codex error event: This content was flagged for possible cybersecurity
 //	risk. ... (code=cyber_policy): exit status 1
-var providerContentRefusalRe = regexp.MustCompile(
-	`(?s)codex error event: .*\(code=cyber_policy\)(?:: remote command exited with code \d+)?(?:: exit status \d+)?\s*\z`)
+//	Codex error event: The 'gpt-6.2-sol' model is not supported when using
+//	Codex with a ChatGPT account. (code=model_not_found): exit status 1
+var providerTerminalCodeRe = regexp.MustCompile(
+	`(?s)codex error event: .*\(code=(cyber_policy|model_not_found)\)(?:: remote command exited with code \d+)?(?:: exit status \d+)?\s*\z`)
+
+// providerTerminalCode returns the routed provider code that ends text, or "".
+func providerTerminalCode(text string) string {
+	if match := providerTerminalCodeRe.FindStringSubmatch(strings.ToLower(text)); match != nil {
+		return match[1]
+	}
+	return ""
+}
 
 // entitlementRevokedRe matches a provider saying the account is no longer
 // ALLOWED to use this product, as distinct from being unable to pay for it.
