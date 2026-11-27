@@ -294,8 +294,10 @@ func janitorDeviceOf(path string) (uint64, error) {
 // parent, the repository's registered checkout (its .git takes worktree
 // metadata and objects), and a configured [worktrees] root that is local. A
 // [worktrees] root on a verified network mount is not host disk; its own mount
-// preflight governs it.
-func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, repo string, knownCheckouts ...string) ([]string, config.WorktreeRoot, error) {
+// preflight governs it. Retired roots take no new work, so they are never added;
+// the returned descriptors still let janitorHostDevices skip paths on their
+// sshfs mounts (#2763).
+func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, repo string, knownCheckouts ...string) ([]string, config.WorktreeRoots, error) {
 	out := []string{paths.Home, seatTempParent()}
 	// Checkouts the caller already resolved (a first dispatch to an unregistered
 	// repo has no database row yet) count as much as registered ones.
@@ -309,7 +311,7 @@ func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, 
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 		case err != nil:
-			return nil, config.WorktreeRoot{}, fmt.Errorf("resolve checkout of %s: %w", repo, err)
+			return nil, config.WorktreeRoots{}, fmt.Errorf("resolve checkout of %s: %w", repo, err)
 		default:
 			// The worker may self-heal to the primary checkout, so both count, and
 			// so does each one's git storage (a linked worktree's .git lives elsewhere).
@@ -318,14 +320,14 @@ func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, 
 			}
 		}
 	}
-	root, err := config.LoadWorktreeRoot(paths)
+	roots, err := config.LoadWorktreeRoots(paths)
 	if err != nil {
-		return nil, root, err
+		return nil, config.WorktreeRoots{}, err
 	}
-	if root.Configured() && (!root.HasMount() || root.MountFSType != "fuse.sshfs") {
+	if root := roots.Active; root.Configured() && (!root.HasMount() || root.MountFSType != "fuse.sshfs") {
 		out = append(out, root.Root)
 	}
-	return out, root, nil
+	return out, roots, nil
 }
 
 // appendJanitorCheckout adds a checkout, its .git (stat follows a symlinked or
@@ -366,21 +368,31 @@ func janitorGitStorage(checkout string) []string {
 	return out
 }
 
-func janitorHostDevices(hostPaths []string, root config.WorktreeRoot) (map[uint64]string, error) {
+// janitorHostDevices resolves hostPaths to devices, skipping a path on the sshfs mount declared by
+// any [worktrees] descriptor, the active root or a retired one (#2763): a move of the active root
+// to local disk must not turn every checkout still on that mount into an unmeasured host device.
+// Each declared mount is proven on its own; one that cannot be proven leaves the path measured.
+func janitorHostDevices(hostPaths []string, roots config.WorktreeRoots) (map[uint64]string, error) {
+	var network []config.WorktreeRoot
+	for _, root := range append([]config.WorktreeRoot{roots.Active}, roots.Retired...) {
+		if root.Configured() && root.HasMount() && root.MountFSType == "fuse.sshfs" {
+			network = append(network, root)
+		}
+	}
 	devices := make(map[uint64]string, len(hostPaths))
 	for _, path := range hostPaths {
 		var dev uint64
-		var network bool
+		var onNetwork bool
 		var err error
-		if root.Configured() && root.HasMount() && root.MountFSType == "fuse.sshfs" {
-			dev, network, err = workflow.WorktreeStorageDevice(path, root)
+		if len(network) > 0 {
+			dev, onNetwork, err = workflow.WorktreeStorageDevice(path, network...)
 		} else {
 			dev, err = janitorDeviceOf(path)
 		}
 		if err != nil {
 			return nil, err
 		}
-		if network {
+		if onNetwork {
 			continue
 		}
 		if _, seen := devices[dev]; !seen {

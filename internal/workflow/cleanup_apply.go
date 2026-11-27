@@ -40,7 +40,7 @@ func (e Engine) ApplyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 	}
 	policy.BudgetGate = CleanupBudgetGateEnforced
 	result, err := e.applyProducerCleanup(ctx, jobID, resourceID, token, policy, true)
-	if err == nil && result.TrashPath != "" {
+	if err == nil && result.State == "removed" && result.TrashPath != "" {
 		err = e.DisposeCleanupTrash(context.WithoutCancel(ctx), result.trashRecord(jobID))
 	}
 	return result, err
@@ -240,6 +240,12 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 		}
 	}
 	completed, err := e.finishProducerCleanupReceipt(ctx, *receipt)
+	if errors.Is(err, ErrWorktreeRootUnavailable) {
+		// The root lost its mount after the checks above: nothing is recorded removed, and the
+		// refusal is retried like an inspection-time one, without spending the failure budget.
+		result.State, result.Decision = "refused", current.refuse(CleanupRefusalWorktreeRootUnavailable)
+		return result, nil
+	}
 	if err != nil {
 		return result, err
 	}
@@ -315,7 +321,7 @@ func (e Engine) cleanupProducerAutomatically(ctx context.Context, jobID string, 
 		return false, err
 	}
 	result, err := e.applyProducerCleanup(context.WithoutCancel(ctx), jobID, "", "", policy, false)
-	if err == nil && result.TrashPath != "" {
+	if err == nil && result.State == "removed" && result.TrashPath != "" {
 		// The worktree is already gone from its path and its receipt says so;
 		// a failed deletion here is retried by the trash sweep, never by
 		// failing the cleanup that already happened.

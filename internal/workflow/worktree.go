@@ -20,7 +20,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
@@ -507,14 +506,13 @@ func ValidateDelegationCleanupTarget(home, jobID, jobType string, payload JobPay
 	// #2375: a worktree keeps the identity of the root it was created under. The legacy
 	// <home>/worktrees layout is always recognised (existing worktrees are never moved); the
 	// configured root and every [[worktrees.retired]] root (#2763) are recognised too, but each
-	// only while it is proven to be on its own mount, so an absent mount can never look like an
-	// already-removed worktree.
+	// only after its own preflight proves it on its mount, so an absent mount can never look like
+	// an already-removed worktree.
 	placement, err := ResolveWorktreePlacement(home)
 	if err != nil {
 		return err
 	}
-	roots := append([]config.WorktreeRoot{{Root: placement.Legacy}}, placement.existingRoots()...)
-	for i, root := range roots {
+	for _, root := range placement.existingRoots() {
 		expected, err := expectedDelegationCleanupPaths(root.Root, jobID, jobType, payload)
 		if err != nil {
 			return err
@@ -523,10 +521,8 @@ func ValidateDelegationCleanupTarget(home, jobID, jobType string, payload JobPay
 			if path != filepath.Clean(candidate) {
 				continue
 			}
-			if i > 0 {
-				if err := PreflightWorktreeRoot(root); err != nil {
-					return err
-				}
+			if _, err := root.preflight(); err != nil {
+				return err
 			}
 			return cleanupPathContained(root.Root, path)
 		}

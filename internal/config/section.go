@@ -1,6 +1,9 @@
 package config
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // sectionHeader classifies one already-trimmed, comment-stripped config line as
 // a TOML section header.
@@ -79,6 +82,119 @@ func malformedHeaderTargets(line, section string) bool {
 	body := strings.TrimSpace(strings.TrimPrefix(line, "["))
 	for _, segment := range strings.Split(body, ".") {
 		if strings.TrimSpace(segment) == section {
+			return true
+		}
+	}
+	return false
+}
+
+// tableHeader is one config line read as a TOML table header, for the loaders
+// whose section name is a dotted key path ([worktrees], [[worktrees.retired]]),
+// which a raw-text comparison misreads (#2763 review).
+type tableHeader struct {
+	// path is the key path with every key unquoted, joined by "."; empty when
+	// the header is malformed.
+	path string
+	// array reports the [[...]] array-of-tables form.
+	array bool
+	// loose is a best-effort reading of the keys of a malformed header, so a
+	// loader can tell whether the broken line was meant for its own table.
+	loose []string
+}
+
+// parseTableHeader reads a line that sectionHeader classified as a boundary as
+// a TOML table header: [path] or [[path]], where path is keys joined by dots
+// with optional whitespace around them, each key bare (A-Za-z0-9_-), "basic"
+// or 'literal'. Anything else (unclosed, an extra ], text after the closing
+// bracket, an empty or invalid key) is malformed and has no path.
+func parseTableHeader(line string) tableHeader {
+	h := tableHeader{array: strings.HasPrefix(line, "[[")}
+	rest := strings.TrimPrefix(line, "[")
+	if h.array {
+		rest = strings.TrimPrefix(rest, "[")
+	}
+	var keys []string
+	for {
+		rest = strings.TrimLeft(rest, " \t")
+		key, tail, ok := tableHeaderKey(rest)
+		if !ok {
+			return malformedTableHeader(line, h.array)
+		}
+		keys = append(keys, key)
+		rest = strings.TrimLeft(tail, " \t")
+		if !strings.HasPrefix(rest, ".") {
+			break
+		}
+		rest = rest[1:]
+	}
+	closer := "]"
+	if h.array {
+		closer = "]]"
+	}
+	if rest != closer {
+		return malformedTableHeader(line, h.array)
+	}
+	h.path = strings.Join(keys, ".")
+	return h
+}
+
+// tableHeaderKey reads one key at the start of s and returns it unquoted with
+// the text after it.
+func tableHeaderKey(s string) (key, rest string, ok bool) {
+	switch {
+	case strings.HasPrefix(s, `"`):
+		for i := 1; i < len(s); i++ {
+			switch s[i] {
+			case '\\':
+				i++
+			case '"':
+				key, err := strconv.Unquote(s[:i+1])
+				return key, s[i+1:], err == nil
+			}
+		}
+		return "", "", false
+	case strings.HasPrefix(s, "'"):
+		end := strings.IndexByte(s[1:], '\'')
+		if end < 0 {
+			return "", "", false
+		}
+		return s[1 : end+1], s[end+2:], true
+	}
+	end := 0
+	for end < len(s) && (s[end] >= 'A' && s[end] <= 'Z' || s[end] >= 'a' && s[end] <= 'z' ||
+		s[end] >= '0' && s[end] <= '9' || s[end] == '_' || s[end] == '-') {
+		end++
+	}
+	return s[:end], s[end:], end > 0
+}
+
+func malformedTableHeader(line string, array bool) tableHeader {
+	body := strings.TrimLeft(line, "[ \t")
+	if end := strings.IndexByte(body, ']'); end >= 0 {
+		body = body[:end]
+	}
+	var loose []string
+	for _, segment := range strings.Split(body, ".") {
+		loose = append(loose, strings.Trim(segment, " \t\"'"))
+	}
+	return tableHeader{array: array, loose: loose}
+}
+
+// malformedTargets reports whether a malformed header was meant for the table
+// at path: its loose keys contain path's keys as a consecutive run, the
+// per-segment rule of malformedHeaderTargets extended to dotted paths. A
+// malformed header aimed elsewhere ([disk_guard) leaves the loader alone.
+func (h tableHeader) malformedTargets(path string) bool {
+	if h.path != "" {
+		return false
+	}
+	want := strings.Split(path, ".")
+	for start := 0; start+len(want) <= len(h.loose); start++ {
+		match := true
+		for i, key := range want {
+			match = match && h.loose[start+i] == key
+		}
+		if match {
 			return true
 		}
 	}

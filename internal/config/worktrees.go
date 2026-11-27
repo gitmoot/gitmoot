@@ -36,15 +36,20 @@ import (
 // A retired root is validated like root and is only ever used to recognise an EXISTING worktree
 // (reopening its job, cleaning it up, doctor accounting), after the same preflight against its own
 // mount keys. New worktrees are never created under it. [[worktrees.retired]] needs no [worktrees]
-// section (moving back to <home>/worktrees); it may not repeat root, <home>/worktrees (always
-// recognised) or another retired root.
+// section (moving back to <home>/worktrees). No two of root, <home>/worktrees (always recognised)
+// and the retired roots may overlap (be equal or nested), so every existing worktree path has one
+// owning root and one preflight.
 type WorktreeRoot struct {
 	Root        string
 	MountPoint  string
 	MountSource string
 	MountFSType string
-	// Retired holds the [[worktrees.retired]] roots of a loaded config; it is never set on a
-	// retired root itself.
+}
+
+// WorktreeRoots is the loaded [worktrees] configuration: Active places new worktrees (zero for the
+// default <home>/worktrees), Retired only identifies existing ones.
+type WorktreeRoots struct {
+	Active  WorktreeRoot
 	Retired []WorktreeRoot
 }
 
@@ -56,73 +61,104 @@ func (w WorktreeRoot) HasMount() bool { return w.MountPoint != "" }
 
 var worktreeRootKeys = []string{"root", "mount_point", "mount_source", "mount_fstype"}
 
-// LoadWorktreeRoot parses [worktrees] and every [[worktrees.retired]]. A missing config file or
-// section is the default layout.
-func LoadWorktreeRoot(paths Paths) (WorktreeRoot, error) {
-	values, err := loadSingleSectionValues(paths, "worktrees")
-	if err != nil {
-		return WorktreeRoot{}, err
+// LoadWorktreeRoots parses [worktrees] and every [[worktrees.retired]] from one read of the config
+// file. A missing config file or section is the default layout.
+func LoadWorktreeRoots(paths Paths) (WorktreeRoots, error) {
+	content, err := readConfigContent(paths)
+	if err != nil || content == "" {
+		return WorktreeRoots{}, err
 	}
-	retired, err := loadArrayTableValues(paths, "worktrees.retired")
+	values, err := singleSectionValues(content, "worktrees")
 	if err != nil {
-		return WorktreeRoot{}, err
+		return WorktreeRoots{}, err
 	}
-	var w WorktreeRoot
+	retired, err := arrayTableValues(content, "worktrees.retired")
+	if err != nil {
+		return WorktreeRoots{}, err
+	}
+	var roots WorktreeRoots
+	type owner struct{ label, root string }
+	var owners []owner
+	claim := func(label, root string) error {
+		for _, o := range owners {
+			if worktreeRootsOverlap(o.root, root) {
+				return fmt.Errorf("%s: root %q overlaps %s root %q; a worktree under both would have two owners", label, root, o.label, o.root)
+			}
+		}
+		owners = append(owners, owner{label, root})
+		return nil
+	}
+	if home := strings.TrimSpace(paths.Home); home != "" {
+		owners = append(owners, owner{"<home>/worktrees (always recognised)", filepath.Join(filepath.Clean(home), "worktrees")})
+	}
 	if values != nil {
-		if w, err = buildWorktreeRoot("[worktrees]", values); err != nil {
-			return WorktreeRoot{}, err
+		if roots.Active, err = buildWorktreeRoot("[worktrees]", values); err != nil {
+			return WorktreeRoots{}, err
+		}
+		if err := claim("[worktrees]", roots.Active.Root); err != nil {
+			return WorktreeRoots{}, err
 		}
 	}
-	legacy := ""
-	if home := strings.TrimSpace(paths.Home); home != "" {
-		legacy = filepath.Join(filepath.Clean(home), "worktrees")
-	}
-	seen := map[string]bool{}
 	for i, entry := range retired {
 		label := fmt.Sprintf("[[worktrees.retired]] #%d", i+1)
 		r, err := buildWorktreeRoot(label, entry)
 		if err != nil {
-			return WorktreeRoot{}, err
+			return WorktreeRoots{}, err
 		}
-		switch {
-		case r.Root == w.Root:
-			return WorktreeRoot{}, fmt.Errorf("%s: root %q is the current [worktrees] root", label, r.Root)
-		case r.Root == legacy:
-			return WorktreeRoot{}, fmt.Errorf("%s: root %q is <home>/worktrees, which is always recognised", label, r.Root)
-		case seen[r.Root]:
-			return WorktreeRoot{}, fmt.Errorf("%s: root %q is retired twice", label, r.Root)
+		if err := claim(label, r.Root); err != nil {
+			return WorktreeRoots{}, err
 		}
-		seen[r.Root] = true
-		w.Retired = append(w.Retired, r)
+		roots.Retired = append(roots.Retired, r)
 	}
-	return w, nil
+	return roots, nil
 }
 
-// loadSingleSectionValues returns the raw key = value pairs of a top-level
-// [name] section that may appear at most once, or nil when the file or the
-// section is absent. Duplicate sections or keys and malformed headers that
-// target name are errors; values are returned unparsed.
-func loadSingleSectionValues(paths Paths, name string) (map[string]string, error) {
+// worktreeRootsOverlap reports whether two clean absolute roots are equal or one contains the other.
+func worktreeRootsOverlap(a, b string) bool {
+	sep := string(filepath.Separator)
+	return a == b || strings.HasPrefix(b, a+sep) || strings.HasPrefix(a, b+sep)
+}
+
+// readConfigContent returns the config file's text, or "" when it does not exist.
+func readConfigContent(paths Paths) (string, error) {
 	content, err := os.ReadFile(paths.ConfigFile)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return "", nil
 	}
-	if err != nil {
+	return string(content), err
+}
+
+// loadSingleSectionValues reads the config file and returns singleSectionValues of it.
+func loadSingleSectionValues(paths Paths, name string) (map[string]string, error) {
+	content, err := readConfigContent(paths)
+	if err != nil || content == "" {
 		return nil, err
 	}
+	return singleSectionValues(content, name)
+}
+
+// singleSectionValues returns the raw key = value pairs of a top-level [name] table that may
+// appear at most once, or nil when it is absent. Headers are read as TOML key paths, so
+// [ name ], ["name"] and ['name'] all open it. Duplicate tables or keys, [[name]], and malformed
+// headers that target name are errors; values are returned unparsed.
+func singleSectionValues(content, name string) (map[string]string, error) {
 	var values map[string]string
 	inSection := false
-	for _, raw := range strings.Split(string(content), "\n") {
+	for _, raw := range strings.Split(content, "\n") {
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if line == "" {
 			continue
 		}
-		if section, ok := sectionHeader(line); ok {
-			if section == "" && malformedHeaderTargets(line, name) {
-				return nil, fmt.Errorf("parse %s section: missing closing ]", name)
+		if _, ok := sectionHeader(line); ok {
+			header := parseTableHeader(line)
+			if header.malformedTargets(name) {
+				return nil, fmt.Errorf("parse %s: malformed header %q", name, line)
 			}
-			inSection = strings.TrimSpace(section) == name
+			inSection = header.path == name
 			if inSection {
+				if header.array {
+					return nil, fmt.Errorf("parse %s: header %q must be written [%s]", name, line, name)
+				}
 				if values != nil {
 					return nil, fmt.Errorf("parse %s: [%s] appears twice", name, name)
 				}
@@ -146,37 +182,31 @@ func loadSingleSectionValues(paths Paths, name string) (map[string]string, error
 	return values, nil
 }
 
-// loadArrayTableValues returns the raw key = value pairs of every [[name]] array-of-tables entry,
-// in file order, or nil when the file or the entries are absent. A header that names name in any
-// other bracket form ([name], or an unclosed one) is an error, as are duplicate keys in an entry.
-func loadArrayTableValues(paths Paths, name string) ([]map[string]string, error) {
-	content, err := os.ReadFile(paths.ConfigFile)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
+// arrayTableValues returns the raw key = value pairs of every [[name]] array-of-tables entry, in
+// file order, or nil when there are none. Headers are read as TOML key paths, so
+// [[ worktrees . retired ]] and [[worktrees."retired"]] are entries too. The table form [name]
+// in any spelling, a malformed header that targets name, and duplicate keys in an entry are
+// errors.
+func arrayTableValues(content, name string) ([]map[string]string, error) {
 	var entries []map[string]string
 	var current map[string]string
-	for _, raw := range strings.Split(string(content), "\n") {
+	for _, raw := range strings.Split(content, "\n") {
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[[") && strings.HasSuffix(line, "]]") {
+		if _, ok := sectionHeader(line); ok {
+			header := parseTableHeader(line)
 			current = nil
-			if strings.TrimSpace(line[2:len(line)-2]) == name {
+			switch {
+			case header.malformedTargets(name):
+				return nil, fmt.Errorf("parse %s: malformed header %q", name, line)
+			case header.path == name && !header.array:
+				return nil, fmt.Errorf("parse %s: header %q must be written [[%s]]", name, line, name)
+			case header.path == name:
 				current = map[string]string{}
 				entries = append(entries, current)
 			}
-			continue
-		}
-		if _, ok := sectionHeader(line); ok {
-			if strings.TrimSpace(strings.Trim(line, "[]")) == name {
-				return nil, fmt.Errorf("parse %s: header %q must be written [[%s]]", name, line, name)
-			}
-			current = nil
 			continue
 		}
 		if current == nil {

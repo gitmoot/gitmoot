@@ -198,7 +198,7 @@ func TestWorktreeStorageDeviceKeepsUnverifiedAndLocalMounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := placement.config
+	cfg := placement.active
 	for _, tc := range []struct {
 		name, point, fstype, source string
 		delta                       uint64
@@ -232,7 +232,7 @@ func TestWorktreeStoragePinsIdentityAcrossPathAndConfigReplacement(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := placement.config
+	cfg := placement.active
 	local, err := os.MkdirTemp("/dev/shm", "gm-device-")
 	if err != nil {
 		t.Skipf("separate local mount unavailable: %v", err)
@@ -277,7 +277,7 @@ func TestWorktreeStoragePinsIdentityAcrossPathAndConfigReplacement(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, network, err := WorktreeStorageDevice(alias, updated.config); err != nil || network {
+	if _, network, err := WorktreeStorageDevice(alias, updated.active); err != nil || network {
 		t.Fatalf("new mismatched config did not fail closed: network=%v err=%v", network, err)
 	}
 	// An unrelated local path does not require cfg.Root to be accessible.
