@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"testing"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/agyaddon"
@@ -20,11 +22,69 @@ const pluginAgy = "agy"
 
 // Injectable seams for unit tests.
 var (
-	agyHookInput    io.Reader = os.Stdin
-	agyFindAncestor           = func() (int, uint64, error) { return agyaddon.FindAncestorAgyPID(os.Getppid()) }
-	agyVerifyPort             = agyaddon.VerifyPIDOwnsLoopbackPort
-	agyVerifyMeta   agyaddon.MetadataVerifier
+	agyHookInput      io.Reader = os.Stdin
+	agyFindAncestor             = func() (int, uint64, error) { return agyaddon.FindAncestorAgyPID(os.Getppid()) }
+	agyVerifyPort               = agyaddon.VerifyPIDOwnsLoopbackPort
+	agyVerifyMeta     agyaddon.MetadataVerifier
+	agyPlatformCheck            = agyaddon.PlatformSupported
+	agyAutoRegisterMu sync.Mutex
+	agyAutoRegCmd     string
+	agyAutoRegDone    bool
 )
+
+func runWithAgyAutoRegisterContext(cmdName string, fn func() int) int {
+	agyAutoRegisterMu.Lock()
+	prev := agyAutoRegCmd
+	agyAutoRegCmd = cmdName
+	agyAutoRegisterMu.Unlock()
+	defer func() {
+		agyAutoRegisterMu.Lock()
+		agyAutoRegCmd = prev
+		agyAutoRegisterMu.Unlock()
+	}()
+	return fn()
+}
+
+// maybeRegisterAgyForPaths performs best-effort opportunistic registration once
+// per CLI process using the command's already-parsed home paths (never parsing
+// raw argv). Skipped in go test binaries and read-only inspection commands.
+func maybeRegisterAgyForPaths(paths config.Paths) {
+	if testing.Testing() {
+		return
+	}
+	if strings.TrimSpace(os.Getenv(agyaddon.EnvLSAddress)) == "" ||
+		strings.TrimSpace(os.Getenv(agyaddon.EnvCSRFToken)) == "" ||
+		strings.TrimSpace(os.Getenv(agyaddon.EnvConversationID)) == "" {
+		return
+	}
+	agyAutoRegisterMu.Lock()
+	if agyAutoRegDone {
+		agyAutoRegisterMu.Unlock()
+		return
+	}
+	switch agyAutoRegCmd {
+	case "", "plugin", "doctor", "version", "config":
+		agyAutoRegisterMu.Unlock()
+		return
+	}
+	agyAutoRegDone = true
+	agyAutoRegisterMu.Unlock()
+
+	registryDir, err := absAgyRegistryDir(paths)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _ = agyaddon.RegisterFromEnv(ctx, agyaddon.RegisterOptions{
+		RegistryDir: registryDir,
+		PruneDead:   true,
+	})
+}
+
+func absAgyRegistryDir(paths config.Paths) (string, error) {
+	return filepath.Abs(paths.AgyRuntimeDir())
+}
 
 type agyPluginLocation struct {
 	paths       config.Paths
@@ -47,6 +107,17 @@ func parseAgyPluginArgs(args []string, fs *flag.FlagSet, commandName string, std
 		fmt.Fprintf(stderr, "%s: %v\n", commandName, err)
 		return agyPluginLocation{}, false, false
 	}
+	absHome, err := filepath.Abs(paths.Home)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", commandName, err)
+		return agyPluginLocation{}, false, false
+	}
+	paths.Home = absHome
+	registryDir, err := absAgyRegistryDir(paths)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", commandName, err)
+		return agyPluginLocation{}, false, false
+	}
 	pluginDir, err := agyaddon.PluginDir(filepath.Dir(paths.Home), os.Getenv)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", commandName, err)
@@ -55,7 +126,7 @@ func parseAgyPluginArgs(args []string, fs *flag.FlagSet, commandName string, std
 	return agyPluginLocation{
 		paths:       paths,
 		pluginDir:   pluginDir,
-		registryDir: paths.AgyRuntimeDir(),
+		registryDir: registryDir,
 		gitmootBin:  resolveGitmootBinary(),
 	}, true, false
 }
@@ -114,7 +185,7 @@ func runPluginDoctorAgy(args []string, stdout, stderr io.Writer) int {
 	}
 
 	runtime := pluginDoctorRuntime{Runtime: pluginAgy, Path: loc.pluginDir}
-	runtime.Checks = append(runtime.Checks, checkHome(loc.paths.Home), checkAgyPlugin(loc), checkAgyRegistryDir(loc.registryDir))
+	runtime.Checks = append(runtime.Checks, checkHome(loc.paths.Home), checkAgyPlatform(), checkAgyPlugin(loc), checkAgyRegistryDir(loc.registryDir))
 	agyPath, err := pluginLookPath(pluginAgy)
 	if err != nil {
 		runtime.Checks = append(runtime.Checks, failCheck("runtime-cli", "agy was not found on PATH", true))
@@ -137,6 +208,13 @@ func runPluginDoctorAgy(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func checkAgyPlatform() pluginCheck {
+	if err := agyPlatformCheck(); err != nil {
+		return failCheck("platform", err.Error(), true)
+	}
+	return okCheck("platform", "linux procfs process/socket inspection available", true)
 }
 
 func checkAgyPlugin(loc agyPluginLocation) pluginCheck {
@@ -196,8 +274,13 @@ func runPluginAgyRegister(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "plugin agy-register: %v\n", err)
 		return 1
 	}
+	registryDir, err := absAgyRegistryDir(paths)
+	if err != nil {
+		fmt.Fprintf(stderr, "plugin agy-register: %v\n", err)
+		return 1
+	}
 	wrote, err := agyaddon.RegisterFromEnv(context.Background(), agyaddon.RegisterOptions{
-		RegistryDir:    paths.AgyRuntimeDir(),
+		RegistryDir:    registryDir,
 		FindAncestor:   agyFindAncestor,
 		VerifyPort:     agyVerifyPort,
 		VerifyMetadata: agyVerifyMeta,
@@ -208,7 +291,7 @@ func runPluginAgyRegister(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if wrote {
-		writeLine(stdout, "registered agy session in %s", paths.AgyRuntimeDir())
+		writeLine(stdout, "registered agy session in %s", registryDir)
 	} else if strings.TrimSpace(os.Getenv(agyaddon.EnvLSAddress)) == "" {
 		writeLine(stdout, "not inside an agy run_command session; nothing registered")
 	} else {
@@ -218,8 +301,9 @@ func runPluginAgyRegister(args []string, stdout, stderr io.Writer) int {
 }
 
 // runPluginAgyHook handles Antigravity SessionStart and PreInvocation hook
-// calls. It updates <registry>/<pid>.conv.json when the owning agy process is
-// already registered, and always prints `{}` and exits 0 so hooks never block.
+// calls. It updates <registry>/<pid>.conv.json only when the owning agy process
+// is already registered and the conversation is verified as an interactive
+// top-level conversation (nestingDepth == 0). Always prints `{}` and exits 0.
 func runPluginAgyHook(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("plugin agy-hook", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -233,9 +317,13 @@ func runPluginAgyHook(args []string, stdout, stderr io.Writer) int {
 	}
 
 	dir := strings.TrimSpace(*registryDir)
-	if dir == "" {
-		if paths, err := pathsFromFlag(*home); err == nil {
-			dir = paths.AgyRuntimeDir()
+	if dir != "" {
+		if abs, err := filepath.Abs(dir); err == nil {
+			dir = abs
+		}
+	} else if paths, err := pathsFromFlag(*home); err == nil {
+		if abs, err := absAgyRegistryDir(paths); err == nil {
+			dir = abs
 		}
 	}
 
@@ -254,68 +342,19 @@ func runPluginAgyHook(args []string, stdout, stderr io.Writer) int {
 	}
 	if dir != "" && convID != "" {
 		if pid, startTime, err := agyFindAncestor(); err == nil {
-			_, _ = agyaddon.RecordHookConversation(dir, pid, startTime, convID, payload.HookEventName, time.Now())
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, _ = agyaddon.RecordHookConversation(ctx, agyaddon.HookConversationOptions{
+				RegistryDir:    dir,
+				PID:            pid,
+				StartTimeTicks: startTime,
+				ConversationID: convID,
+				Event:          payload.HookEventName,
+				VerifyPort:     agyVerifyPort,
+				VerifyMetadata: agyVerifyMeta,
+			})
+			cancel()
 		}
 	}
 	_, _ = io.WriteString(stdout, "{}\n")
 	return 0
-}
-
-// MaybeRegisterAgyFromEnv performs best-effort, silent opportunistic
-// registration when `gitmoot` is executed from inside an interactive `agy`
-// `run_command` subprocess. It is called from cmd/gitmoot/main.go (never from
-// unit-test cli.Run calls) and respects any `--home` flag in args.
-func MaybeRegisterAgyFromEnv(args []string) {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		return
-	}
-	for _, arg := range args {
-		if arg == "--" {
-			break
-		}
-		if arg == "-h" || arg == "--help" {
-			return
-		}
-	}
-	if strings.TrimSpace(os.Getenv(agyaddon.EnvLSAddress)) == "" ||
-		strings.TrimSpace(os.Getenv(agyaddon.EnvCSRFToken)) == "" ||
-		strings.TrimSpace(os.Getenv(agyaddon.EnvConversationID)) == "" {
-		return
-	}
-	if len(args) >= 2 && args[0] == "plugin" && (args[1] == "agy-register" || args[1] == "agy-hook") {
-		return
-	}
-	home := extractHomeArg(args)
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_, _ = agyaddon.RegisterFromEnv(ctx, agyaddon.RegisterOptions{
-		RegistryDir: paths.AgyRuntimeDir(),
-		PruneDead:   true,
-	})
-}
-
-func extractHomeArg(args []string) string {
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--" {
-			break
-		}
-		if arg == "--home" || arg == "-home" {
-			if i+1 < len(args) {
-				return args[i+1]
-			}
-			return ""
-		}
-		if v, ok := strings.CutPrefix(arg, "--home="); ok {
-			return v
-		}
-		if v, ok := strings.CutPrefix(arg, "-home="); ok {
-			return v
-		}
-	}
-	return ""
 }

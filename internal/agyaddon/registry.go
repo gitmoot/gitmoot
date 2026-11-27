@@ -10,7 +10,8 @@
 //     writing `<registry>/<pid>.json` (mode 0600 inside a mode 0700 dir).
 //  2. A native Antigravity plugin (`~/.gemini/config/plugins/gitmoot/`) whose
 //     `SessionStart` and `PreInvocation` hooks keep `<registry>/<pid>.conv.json`
-//     pinned to the active conversation across `/new` and `/resume` switches.
+//     pinned to the active interactive top-level conversation across `/new`
+//     and `/resume` switches.
 package agyaddon
 
 import (
@@ -21,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,8 +66,8 @@ type Registration struct {
 	UpdatedAt      string `json:"updatedAt"`
 }
 
-// ConversationPin records the most recent conversationId observed by an `agy`
-// lifecycle hook for a registered `agy` process.
+// ConversationPin records the most recent verified interactive top-level
+// conversationId observed by an `agy` lifecycle hook for a registered `agy` process.
 type ConversationPin struct {
 	Version        int    `json:"version"`
 	PID            int    `json:"pid"`
@@ -73,6 +75,24 @@ type ConversationPin struct {
 	ConversationID string `json:"conversationId"`
 	Event          string `json:"event,omitempty"`
 	UpdatedAt      string `json:"updatedAt"`
+}
+
+// ValidateLoopbackAddress verifies that addr is host:port pointing strictly at
+// localhost, 127.0.0.1, or ::1 with a valid non-zero port.
+func ValidateLoopbackAddress(addr string) (string, uint16, error) {
+	host, portStr, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid lsAddress %q: %w", addr, err)
+	}
+	lowerHost := strings.ToLower(strings.TrimSpace(host))
+	if lowerHost != "localhost" && lowerHost != "127.0.0.1" && lowerHost != "::1" {
+		return "", 0, fmt.Errorf("lsAddress %q is not loopback", addr)
+	}
+	portNum, err := strconv.Atoi(portStr)
+	if err != nil || portNum <= 0 || portNum > 65535 {
+		return "", 0, fmt.Errorf("invalid port in lsAddress %q", addr)
+	}
+	return lowerHost, uint16(portNum), nil
 }
 
 // RegistrationPath returns the canonical path for pid's registration file.
@@ -232,13 +252,17 @@ func PruneDeadRegistrationsWith(dir string, alive func(int) bool, startTime func
 // as reported by the local Antigravity language server.
 type MetadataVerifier func(ctx context.Context, lsAddress, csrfToken, conversationID string) (interactionMode string, nestingDepth int, err error)
 
+// PortOwnerVerifier verifies that pid owns lsAddress and returns the concrete
+// numeric loopback address (`127.0.0.1:<port>` or `[::1]:<port>`) bound by pid.
+type PortOwnerVerifier func(pid int, lsAddress string) (string, error)
+
 // RegisterOptions configures RegisterFromEnv. Nil function fields use defaults.
 type RegisterOptions struct {
 	RegistryDir    string
 	AgyBin         string
 	Getenv         func(string) string
 	FindAncestor   func() (pid int, startTime uint64, err error)
-	VerifyPort     func(pid int, lsAddress string) error
+	VerifyPort     PortOwnerVerifier
 	VerifyMetadata MetadataVerifier
 	Now            func() time.Time
 	PruneDead      bool
@@ -259,7 +283,8 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 	if lsAddress == "" || csrfToken == "" || convID == "" {
 		return false, nil
 	}
-	if _, _, err := ValidateLoopbackAddress(lsAddress); err != nil {
+	_, port, err := ValidateLoopbackAddress(lsAddress)
+	if err != nil {
 		return false, err
 	}
 	findAncestor := opts.FindAncestor
@@ -282,7 +307,7 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 		if existing.Version == RegistrationVersion &&
 			existing.PID == pid &&
 			existing.StartTimeTicks == startTime &&
-			existing.LSAddress == lsAddress &&
+			sameLoopbackPort(existing.LSAddress, port) &&
 			existing.CSRFToken == csrfToken &&
 			existing.ConversationID == convID &&
 			existing.HerdrPaneID == paneID {
@@ -294,7 +319,11 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 	if verifyPort == nil {
 		verifyPort = VerifyPIDOwnsLoopbackPort
 	}
-	if err := verifyPort(pid, lsAddress); err != nil {
+	concreteAddr, err := verifyPort(pid, lsAddress)
+	if err != nil {
+		return false, err
+	}
+	if _, _, err := ValidateLoopbackAddress(concreteAddr); err != nil {
 		return false, err
 	}
 
@@ -308,7 +337,7 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 			return DefaultVerifyMetadata(callCtx, agyBin, addr, token, id)
 		}
 	}
-	mode, depth, err := verifyMeta(ctx, lsAddress, csrfToken, convID)
+	mode, depth, err := verifyMeta(ctx, concreteAddr, csrfToken, convID)
 	if err != nil {
 		return false, err
 	}
@@ -333,7 +362,7 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 		Version:        RegistrationVersion,
 		PID:            pid,
 		StartTimeTicks: startTime,
-		LSAddress:      lsAddress,
+		LSAddress:      concreteAddr,
 		CSRFToken:      csrfToken,
 		ConversationID: convID,
 		HerdrPaneID:    paneID,
@@ -350,15 +379,38 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 	return true, nil
 }
 
+func sameLoopbackPort(existingAddr string, wantPort uint16) bool {
+	host, port, err := ValidateLoopbackAddress(existingAddr)
+	if err != nil || port != wantPort {
+		return false
+	}
+	// Only fast-path when the stored address is already concrete numeric IP.
+	return host == "127.0.0.1" || host == "::1"
+}
+
+// HookConversationOptions configures RecordHookConversation.
+type HookConversationOptions struct {
+	RegistryDir    string
+	PID            int
+	StartTimeTicks uint64
+	ConversationID string
+	Event          string
+	AgyBin         string
+	VerifyPort     PortOwnerVerifier
+	VerifyMetadata MetadataVerifier
+	Now            func() time.Time
+}
+
 // RecordHookConversation updates <registry>/<pid>.conv.json when pid already
-// has a trusted registration matching startTime. Unregistered processes (such
-// as print-mode `agy -p` or subagents) are ignored cleanly.
-func RecordHookConversation(registryDir string, pid int, startTime uint64, conversationID, event string, now time.Time) (bool, error) {
-	conversationID = strings.TrimSpace(conversationID)
-	if registryDir == "" || pid <= 0 || startTime == 0 || conversationID == "" {
+// has a trusted registration matching startTime AND conversationID is verified
+// as an interactive top-level conversation (nestingDepth == 0) on pid's owned
+// language server. Subagents and print-mode hooks are ignored cleanly.
+func RecordHookConversation(ctx context.Context, opts HookConversationOptions) (bool, error) {
+	conversationID := strings.TrimSpace(opts.ConversationID)
+	if opts.RegistryDir == "" || opts.PID <= 0 || opts.StartTimeTicks == 0 || conversationID == "" {
 		return false, nil
 	}
-	regPath := RegistrationPath(registryDir, pid)
+	regPath := RegistrationPath(opts.RegistryDir, opts.PID)
 	reg, info, err := ReadRegistration(regPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -369,26 +421,60 @@ func RecordHookConversation(registryDir string, pid int, startTime uint64, conve
 	if err := CheckPrivateEntry(info, 0); err != nil {
 		return false, err
 	}
-	if reg.Version != RegistrationVersion || reg.PID != pid || reg.StartTimeTicks != startTime {
+	if reg.Version != RegistrationVersion || reg.PID != opts.PID || reg.StartTimeTicks != opts.StartTimeTicks {
 		return false, nil
 	}
-	if err := EnsureRegistryDir(registryDir); err != nil {
+
+	verifyPort := opts.VerifyPort
+	if verifyPort == nil {
+		verifyPort = VerifyPIDOwnsLoopbackPort
+	}
+	concreteAddr, err := verifyPort(opts.PID, reg.LSAddress)
+	if err != nil {
 		return false, err
+	}
+
+	verifyMeta := opts.VerifyMetadata
+	if verifyMeta == nil {
+		agyBin := opts.AgyBin
+		if agyBin == "" {
+			agyBin = "agy"
+		}
+		verifyMeta = func(callCtx context.Context, addr, token, id string) (string, int, error) {
+			return DefaultVerifyMetadata(callCtx, agyBin, addr, token, id)
+		}
+	}
+	mode, depth, err := verifyMeta(ctx, concreteAddr, reg.CSRFToken, conversationID)
+	if err != nil {
+		return false, err
+	}
+	if mode != InteractiveMode || depth != 0 {
+		// Subagents (nestingDepth > 0) and non-interactive runs fire hooks under
+		// the parent agy PID; never let them retarget the pane's active conversation.
+		return false, nil
+	}
+
+	if err := EnsureRegistryDir(opts.RegistryDir); err != nil {
+		return false, err
+	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
 	}
 	pin := ConversationPin{
 		Version:        RegistrationVersion,
-		PID:            pid,
-		StartTimeTicks: startTime,
+		PID:            opts.PID,
+		StartTimeTicks: opts.StartTimeTicks,
 		ConversationID: conversationID,
-		Event:          strings.TrimSpace(event),
-		UpdatedAt:      now.UTC().Format(time.RFC3339Nano),
+		Event:          strings.TrimSpace(opts.Event),
+		UpdatedAt:      now().UTC().Format(time.RFC3339Nano),
 	}
 	data, err := json.Marshal(pin)
 	if err != nil {
 		return false, err
 	}
 	data = append(data, '\n')
-	if err := writeFileAtomic(ConvPinPath(registryDir, pid), data, 0o600); err != nil {
+	if err := writeFileAtomic(ConvPinPath(opts.RegistryDir, opts.PID), data, 0o600); err != nil {
 		return false, err
 	}
 	return true, nil

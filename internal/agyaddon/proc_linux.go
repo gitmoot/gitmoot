@@ -16,6 +16,12 @@ import (
 
 const maxAncestorWalkDepth = 10
 
+// PlatformSupported reports whether this OS supports agy process inspection
+// and push notification delivery.
+func PlatformSupported() error {
+	return nil
+}
+
 // ProcessAlive reports whether pid currently exists.
 func ProcessAlive(pid int) bool {
 	if pid <= 0 {
@@ -93,29 +99,81 @@ func readProcStat(pid int) (comm string, ppid int, startTime uint64, err error) 
 }
 
 // VerifyPIDOwnsLoopbackPort confirms that lsAddress is strictly loopback and
-// that pid currently holds a TCP LISTEN socket bound to that loopback port.
-// This prevents a stale registration from sending a CSRF token to an unrelated
-// process that later bound the same ephemeral port.
-func VerifyPIDOwnsLoopbackPort(pid int, lsAddress string) error {
+// that pid currently holds a TCP LISTEN socket on that concrete loopback
+// address and port. It returns the exact numeric host:port (`127.0.0.1:<port>`
+// or `[::1]:<port>`) owned by pid so callers dial the verified endpoint rather
+// than re-resolving "localhost".
+func VerifyPIDOwnsLoopbackPort(pid int, lsAddress string) (string, error) {
 	if pid <= 0 {
-		return fmt.Errorf("invalid pid %d", pid)
+		return "", fmt.Errorf("invalid pid %d", pid)
 	}
-	_, port, err := ValidateLoopbackAddress(lsAddress)
+	host, port, err := ValidateLoopbackAddress(lsAddress)
 	if err != nil {
-		return err
+		return "", err
 	}
-	inodes, err := listeningLoopbackInodes(port)
+	pidInodes, err := readPIDSockets(pid)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if len(inodes) == 0 {
-		return fmt.Errorf("no loopback listener on %s", lsAddress)
+	if len(pidInodes) == 0 {
+		return "", fmt.Errorf("pid %d holds no sockets for %s", pid, lsAddress)
 	}
+
+	type candidate struct {
+		concreteHost string
+		procNetPath  string
+		addrHexes    map[string]bool
+	}
+	var candidates []candidate
+	switch host {
+	case "127.0.0.1":
+		candidates = []candidate{
+			{concreteHost: "127.0.0.1", procNetPath: "/proc/net/tcp", addrHexes: map[string]bool{"0100007F": true}},
+			{concreteHost: "127.0.0.1", procNetPath: "/proc/net/tcp6", addrHexes: map[string]bool{"0000000000000000FFFF00000100007F": true}},
+		}
+	case "::1":
+		candidates = []candidate{
+			{concreteHost: "::1", procNetPath: "/proc/net/tcp6", addrHexes: map[string]bool{"00000000000000000000000001000000": true}},
+		}
+	case "localhost":
+		candidates = []candidate{
+			{concreteHost: "127.0.0.1", procNetPath: "/proc/net/tcp", addrHexes: map[string]bool{"0100007F": true}},
+			{concreteHost: "127.0.0.1", procNetPath: "/proc/net/tcp6", addrHexes: map[string]bool{"0000000000000000FFFF00000100007F": true}},
+			{concreteHost: "::1", procNetPath: "/proc/net/tcp6", addrHexes: map[string]bool{"00000000000000000000000001000000": true}},
+		}
+	}
+
+	var firstErr error
+	parsedAny := false
+	for _, cand := range candidates {
+		inodes := make(map[string]bool)
+		err := collectLoopbackListenInodes(cand.procNetPath, cand.addrHexes, port, inodes)
+		if err != nil {
+			if firstErr == nil && !errors.Is(err, os.ErrNotExist) {
+				firstErr = err
+			}
+			continue
+		}
+		parsedAny = true
+		for inode := range inodes {
+			if pidInodes[inode] {
+				return net.JoinHostPort(cand.concreteHost, strconv.Itoa(int(port))), nil
+			}
+		}
+	}
+	if !parsedAny && firstErr != nil {
+		return "", firstErr
+	}
+	return "", fmt.Errorf("pid %d does not own loopback listener %s", pid, lsAddress)
+}
+
+func readPIDSockets(pid int) (map[string]bool, error) {
 	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
 	entries, err := os.ReadDir(fdDir)
 	if err != nil {
-		return fmt.Errorf("inspect %s: %w", fdDir, err)
+		return nil, fmt.Errorf("inspect %s: %w", fdDir, err)
 	}
+	inodes := make(map[string]bool)
 	for _, entry := range entries {
 		target, err := os.Readlink(filepath.Join(fdDir, entry.Name()))
 		if err != nil {
@@ -124,43 +182,7 @@ func VerifyPIDOwnsLoopbackPort(pid int, lsAddress string) error {
 		if !strings.HasPrefix(target, "socket:[") || !strings.HasSuffix(target, "]") {
 			continue
 		}
-		inode := target[len("socket:[") : len(target)-1]
-		if inodes[inode] {
-			return nil
-		}
-	}
-	return fmt.Errorf("pid %d does not own loopback listener %s", pid, lsAddress)
-}
-
-func listeningLoopbackInodes(port uint16) (map[string]bool, error) {
-	inodes := make(map[string]bool)
-	var firstErr error
-	parsedAny := false
-	for _, spec := range []struct {
-		path      string
-		loopbacks map[string]bool
-	}{
-		{
-			path:      "/proc/net/tcp",
-			loopbacks: map[string]bool{"0100007F": true},
-		},
-		{
-			path: "/proc/net/tcp6",
-			loopbacks: map[string]bool{
-				"00000000000000000000000001000000": true,
-				"0000000000000000FFFF00000100007F": true,
-			},
-		},
-	} {
-		err := collectLoopbackListenInodes(spec.path, spec.loopbacks, port, inodes)
-		if err == nil {
-			parsedAny = true
-		} else if firstErr == nil && !errors.Is(err, os.ErrNotExist) {
-			firstErr = err
-		}
-	}
-	if !parsedAny && firstErr != nil {
-		return nil, firstErr
+		inodes[target[len("socket:["):len(target)-1]] = true
 	}
 	return inodes, nil
 }
@@ -200,22 +222,4 @@ func collectLoopbackListenInodes(procNetPath string, loopbacks map[string]bool, 
 		}
 	}
 	return scanner.Err()
-}
-
-// ValidateLoopbackAddress verifies that addr is host:port pointing strictly at
-// localhost, 127.0.0.1, or ::1 with a valid non-zero port.
-func ValidateLoopbackAddress(addr string) (string, uint16, error) {
-	host, portStr, err := net.SplitHostPort(strings.TrimSpace(addr))
-	if err != nil {
-		return "", 0, fmt.Errorf("invalid lsAddress %q: %w", addr, err)
-	}
-	lowerHost := strings.ToLower(strings.TrimSpace(host))
-	if lowerHost != "localhost" && lowerHost != "127.0.0.1" && lowerHost != "::1" {
-		return "", 0, fmt.Errorf("lsAddress %q is not loopback", addr)
-	}
-	portNum, err := strconv.Atoi(portStr)
-	if err != nil || portNum <= 0 || portNum > 65535 {
-		return "", 0, fmt.Errorf("invalid port in lsAddress %q", addr)
-	}
-	return lowerHost, uint16(portNum), nil
 }

@@ -101,7 +101,7 @@ func (c *Cockpit) AgentNotify(ctx context.Context, target NotificationTarget, pr
 	if c == nil {
 		return false, false, fmt.Errorf("cockpit is nil")
 	}
-	return c.client.agentNotifyWithDirs(ctx, c.ompRuntimeDir, c.agyRuntimeDir, target, prompt)
+	return c.client.agentNotify(ctx, c.ompRuntimeDir, c.agyRuntimeDir, target, prompt)
 }
 
 // ResolvePaneByLabel resolves a registered recipient from an explicit agent:name

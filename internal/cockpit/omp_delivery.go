@@ -369,14 +369,11 @@ func (c herdrClient) paneForegroundPIDs(ctx context.Context, paneID string) ([]i
 	return pids, nil
 }
 
-// agentNotify delivers to the OMP inbox add-on of the process running in the
-// recipient's pane. It never types into the pane: unsupported runtimes and
+// agentNotify delivers to the notification endpoint of the process running in
+// the recipient's pane (OMP inbox add-on or registered Antigravity `agy`
+// language server). It never types into the pane: unsupported runtimes and
 // unregistered processes stay deferred.
-func (c herdrClient) agentNotify(ctx context.Context, registryDir string, target NotificationTarget, content string) (delivered bool, uncertain bool, err error) {
-	return c.agentNotifyWithDirs(ctx, registryDir, "", target, content)
-}
-
-func (c herdrClient) agentNotifyWithDirs(ctx context.Context, ompRegistryDir, agyRegistryDir string, target NotificationTarget, content string) (delivered bool, uncertain bool, err error) {
+func (c herdrClient) agentNotify(ctx context.Context, ompRegistryDir, agyRegistryDir string, target NotificationTarget, content string) (delivered bool, uncertain bool, err error) {
 	if target.Machine != "" {
 		return false, false, &NotificationDeferred{Reason: NotificationRemotePending}
 	}

@@ -87,7 +87,11 @@ func agyRuntimeDir(home string) string {
 	if configFile == "" {
 		return ""
 	}
-	return config.Paths{Home: filepath.Dir(configFile)}.AgyRuntimeDir()
+	dir := config.Paths{Home: filepath.Dir(configFile)}.AgyRuntimeDir()
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
 }
 
 // resolveConfigFile resolves the gitmoot config.toml for a `home` that may be
