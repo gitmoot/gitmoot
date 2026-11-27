@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
@@ -717,8 +718,9 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 	return nil
 }
 
-// objectionBindsToCurrentHead answers whether a changes_requested verdict may
-// transition the task (#1524).
+// observedHeadContradictingObjection returns the observed pull request head when
+// it contradicts the objection's head, and "" when the objection may transition
+// the task (#1524).
 //
 // THE DEFECT: a verdict is evidence about a COMMIT, not about the branch. This
 // arm transitioned the task unconditionally, so an objection bound to a
@@ -733,30 +735,55 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // today, which is why that case is real traffic. The arms are pinned in
 // stale_verdict_head_test.go.
 //
+// A contradiction is not yet a verdict that the objection is stale: the
+// observed row is written by the repo poll and can trail the verdict's head
+// (#2759), so the caller holds a fresh one and settles only one that outlives
+// staleObjectionSettleWindow, formatting its diagnostic after that decision.
+//
 // ACCEPTED LIMITATION: when the ONLY objection on a PR is bound to a superseded
-// head, this arm strands it. The task does not transition and nothing here
-// re-drives anything - the PR waits for a review at the current head. That is
-// deliberate, and it is the reason the refusal is terminal rather than retried.
-func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayload) (bool, string, error) {
-	objectionHead := strings.TrimSpace(payload.HeadSHA)
+// head, a settled refusal strands it. The task does not transition and nothing
+// re-drives anything - the PR waits for a review at the current head.
+func (e Engine) observedHeadContradictingObjection(ctx context.Context, payload JobPayload, objectionHead string) (string, error) {
 	if objectionHead == "" || payload.PullRequest <= 0 {
 		// Checked before any store read: an unbound objection claims nothing about
 		// any commit, and a PR-less review is already terminal earlier in the
 		// advance path.
-		return true, "", nil
+		return "", nil
 	}
 	pr, err := e.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return true, "", nil
+			return "", nil
 		}
-		return false, "", err
+		return "", err
 	}
-	currentHead := strings.TrimSpace(pr.HeadSHA)
-	if currentHead == "" || currentHead == objectionHead {
-		return true, "", nil
+	if currentHead := strings.TrimSpace(pr.HeadSHA); currentHead != objectionHead {
+		return currentHead, nil
 	}
-	return false, fmt.Sprintf(
-		"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the PR is not transitioned and no fix leg is dispatched",
-		objectionHead, currentHead), nil
+	return "", nil
+}
+
+// staleObjectionSettleWindow bounds how long an objection whose head disagrees
+// with the observed pull request row is held for the row to catch up (#2759).
+// The repo poll lag measured on jerryfane/fleetup#166 was 59s; the window is far
+// above that, and short enough that a genuinely superseded objection - 4 in 30
+// days - is re-driven only briefly before it settles.
+const staleObjectionSettleWindow = 15 * time.Minute
+
+// staleObjectionStillSettling reports whether a head-mismatched objection is
+// young enough to hold for the observed row to catch up. The verdict time is the
+// job's first terminal-state event, not jobs.updated_at: a payload rewrite bumps
+// updated_at, so it could restart the window on every retry and never settle.
+// No such event means the age is unknown, and the objection settles as stale,
+// which is the behavior before #2759 rather than an unbounded hold.
+func (e Engine) staleObjectionStillSettling(ctx context.Context, job db.Job) (bool, error) {
+	event, found, err := e.Store.GetEarliestJobEventByKind(ctx, job.ID, job.State)
+	if err != nil || !found {
+		return false, err
+	}
+	settledAt, ok := parseStoredJobTime(event.CreatedAt)
+	if !ok {
+		return false, nil
+	}
+	return e.now().Sub(settledAt) < staleObjectionSettleWindow, nil
 }

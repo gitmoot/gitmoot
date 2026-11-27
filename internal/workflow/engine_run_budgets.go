@@ -388,12 +388,33 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// legitimate objection on a PR the daemon has not polled yet, which is
 			// the CLI-dispatch path, and would make the engine's cheapest
 			// transition the one demanding the most evidence.
-			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
+			objectionHead := strings.TrimSpace(payload.HeadSHA)
+			observedHead, err := e.observedHeadContradictingObjection(ctx, payload, objectionHead)
 			if err != nil {
 				return err
 			}
-			if !bound {
-				return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_stale_head", Message: unboundReason})
+			if observedHead != "" {
+				// #2759: the observed head can be the one BEFORE the verdict's,
+				// because the repo poll writes it and a review often finishes inside
+				// one poll interval - the same inversion #2150 fixed on the approval
+				// side. Over 30 days, 742 of 831 skipped objections named an older
+				// head as current. So a fresh mismatch is held and retried; only one
+				// that outlives the settle window is settled as stale.
+				hold, err := e.staleObjectionStillSettling(ctx, job)
+				if err != nil {
+					return err
+				}
+				if hold {
+					// An error leaves the advancement unreconciled, so the daemon's
+					// advance-retry re-drives it; recordAdvanceRetryOnce keeps one row.
+					// The terminal skip reason is not reused: it says the branch moved
+					// past the reviewed commit, which in the row-lag case is backwards.
+					return fmt.Errorf("review objection held: the objection is bound to head %s and the observed pull request head is %s; waiting for the repo poll to update the observed head before deciding whether the objection is current",
+						objectionHead, observedHead)
+				}
+				return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_stale_head", Message: fmt.Sprintf(
+					"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the PR is not transitioned and no fix leg is dispatched",
+					objectionHead, observedHead)})
 			}
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err

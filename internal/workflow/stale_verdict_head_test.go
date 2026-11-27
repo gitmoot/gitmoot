@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 )
@@ -31,6 +32,49 @@ func staleHeadSkipReason(t *testing.T, store *db.Store, jobID string) string {
 	return ""
 }
 
+// The fixtures stamp the verdict with the store clock (now), so these arms run
+// the engine clock past the settle window to reach the settled-as-stale outcome.
+func pastStaleObjectionWindow() time.Time {
+	return time.Now().UTC().Add(staleObjectionSettleWindow + time.Hour)
+}
+
+// #2759: THE ROW-LAG ARM. The observed row is written by the repo poll, so a
+// review that finishes inside one poll interval sees the PREVIOUS head there
+// while its own head is the real current one (jerryfane/fleetup#166: skipped at
+// 22:09:12, row caught up at 22:10:11). A fresh mismatch must be held and
+// retried, not settled; once the row reaches the verdict's head the objection
+// transitions the task like any current-head objection.
+func TestObjectionHeldWhileObservedRowLagsThenRequestsChanges(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	seedObservedPullRequest(t, store, "head-previous")
+	seedImplementAttribution(t, store)
+	engine, _ := wedgeEngine(t, store)
+
+	seedReviewJob(t, store, "review-row-lag", "auditor", "head-current", "changes_requested", JobSucceeded)
+
+	err := engine.AdvanceJob(ctx, "review-row-lag")
+	if err == nil || !strings.Contains(err.Error(), "review objection held") {
+		t.Fatalf("AdvanceJob error = %v, want a retryable objection hold", err)
+	}
+	if reason := staleHeadSkipReason(t, store, "review-row-lag"); reason != "" {
+		t.Fatalf("a fresh mismatch was settled as stale: %q", reason)
+	}
+	assertTaskState(t, store, "task-9", TaskReadyToMerge)
+
+	seedObservedPullRequest(t, store, "head-current")
+	if err := engine.AdvanceJob(ctx, "review-row-lag"); err != nil {
+		t.Fatalf("retried AdvanceJob returned error: %v", err)
+	}
+	assertTaskState(t, store, "task-9", TaskChangesRequested)
+}
+
 // THE DEFECT ARM: an objection bound to a superseded head must transition the
 // task NEITHER way. Before this change the objection arm called
 // setTaskState(TaskChangesRequested) unconditionally, so a stale objection could
@@ -50,6 +94,7 @@ func TestObjectionAtSupersededHeadTransitionsNothing(t *testing.T) {
 	seedObservedPullRequest(t, store, "head-new")
 	seedImplementAttribution(t, store)
 	engine, _ := wedgeEngine(t, store)
+	engine.Now = pastStaleObjectionWindow
 
 	seedReviewJob(t, store, "review-stale-objection", "auditor", "head-old", "changes_requested", JobSucceeded)
 
@@ -122,6 +167,7 @@ func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 	seedObservedPullRequest(t, store, "head-new")
 	seedImplementAttribution(t, store)
 	engine, _ := wedgeEngine(t, store)
+	engine.Now = pastStaleObjectionWindow
 
 	before, err := store.ListJobs(ctx)
 	if err != nil {
