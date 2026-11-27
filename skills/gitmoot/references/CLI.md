@@ -73,9 +73,12 @@ disagrees, trust its live `--help`.
 - [gitmoot plugin](#gitmoot-plugin)
 - [gitmoot plugin build](#gitmoot-plugin-build)
 - [gitmoot plugin doctor](#gitmoot-plugin-doctor)
+- [gitmoot plugin doctor omp](#gitmoot-plugin-doctor-omp)
 - [gitmoot plugin install](#gitmoot-plugin-install)
+- [gitmoot plugin install agy](#gitmoot-plugin-install-agy)
 - [gitmoot plugin install omp](#gitmoot-plugin-install-omp)
 - [gitmoot plugin path](#gitmoot-plugin-path)
+- [gitmoot plugin path agy](#gitmoot-plugin-path-agy)
 - [gitmoot plugin path omp](#gitmoot-plugin-path-omp)
 - [gitmoot pr](#gitmoot-pr)
 - [gitmoot pr dismiss](#gitmoot-pr-dismiss)
@@ -966,9 +969,9 @@ A reason that is a single flag-like word, such as --help or -x, is refused.
 ```text
 Usage:
   gitmoot plugin build codex|claude
-  gitmoot plugin install codex|claude|omp
-  gitmoot plugin path codex|claude|omp
-  gitmoot plugin doctor [codex|claude|omp]
+  gitmoot plugin install codex|claude|omp|agy
+  gitmoot plugin path codex|claude|omp|agy
+  gitmoot plugin doctor [codex|claude|omp|agy]
 ```
 
 ## gitmoot plugin build
@@ -993,6 +996,18 @@ Usage of plugin doctor:
     	print doctor output as JSON
 ```
 
+## gitmoot plugin doctor omp
+
+```text
+Usage of plugin doctor omp:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print doctor output as JSON
+  -live
+    	start omp in a throwaway session with a local model and check probe, idle delivery and deferral
+```
+
 ## gitmoot plugin install
 
 ```text
@@ -1003,6 +1018,14 @@ Usage of plugin install:
     	home directory to use instead of the current user's home
   -scope string
     	Claude plugin scope: user, project, or local (default "user")
+```
+
+## gitmoot plugin install agy
+
+```text
+Usage of plugin install agy:
+  -home string
+    	home directory to use instead of the current user's home
 ```
 
 ## gitmoot plugin install omp
@@ -1017,6 +1040,14 @@ Usage of plugin install omp:
 
 ```text
 Usage of plugin path:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot plugin path agy
+
+```text
+Usage of plugin path agy:
   -home string
     	home directory to use instead of the current user's home
 ```

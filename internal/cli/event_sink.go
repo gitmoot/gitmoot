@@ -64,7 +64,7 @@ func resolveDaemonEventSinkWithRules(store *db.Store, home string, rules []db.Ev
 	sink := &eventRuleSink{
 		store: store,
 		home:  home,
-		wake:  cockpit.New(cockpit.Options{HerdrBin: "herdr", OMPRuntimeDir: ompRuntimeDir(home)}),
+		wake:  cockpit.New(cockpit.Options{HerdrBin: "herdr", OMPRuntimeDir: ompRuntimeDir(home), AgyRuntimeDir: agyRuntimeDir(home)}),
 	}
 	eventSinkCache.rules[key] = sink
 	return sink
@@ -78,6 +78,16 @@ func ompRuntimeDir(home string) string {
 		return ""
 	}
 	return config.Paths{Home: filepath.Dir(configFile)}.OMPRuntimeDir()
+}
+
+// agyRuntimeDir is the Antigravity CLI notification registry of the home whose
+// config the daemon routes by.
+func agyRuntimeDir(home string) string {
+	configFile := resolveConfigFile(home)
+	if configFile == "" {
+		return ""
+	}
+	return config.Paths{Home: filepath.Dir(configFile)}.AgyRuntimeDir()
 }
 
 // resolveConfigFile resolves the gitmoot config.toml for a `home` that may be

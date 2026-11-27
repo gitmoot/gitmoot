@@ -26,17 +26,20 @@ const (
 )
 
 // Options configures the herdr client. HerdrBin is the herdr binary name or
-// path; empty defaults to "herdr". OMPRuntimeDir is the Gitmoot home's OMP
-// inbox add-on registry (config.Paths.OMPRuntimeDir); empty disables delivery.
+// path; empty defaults to "herdr". OMPRuntimeDir and AgyRuntimeDir are the
+// Gitmoot home's runtime notification registries (config.Paths.OMPRuntimeDir
+// and config.Paths.AgyRuntimeDir); an empty dir disables delivery for that kind.
 type Options struct {
 	HerdrBin      string
 	OMPRuntimeDir string
+	AgyRuntimeDir string
 }
 
 // Cockpit is the timeout-bounded herdr client.
 type Cockpit struct {
 	client        herdrClient
 	ompRuntimeDir string
+	agyRuntimeDir string
 
 	// availMu guards the memoized availability check; see availableTTL.
 	availMu     sync.Mutex
@@ -59,6 +62,7 @@ func New(opts Options) *Cockpit {
 			lookPath: exec.LookPath,
 		},
 		ompRuntimeDir: opts.OMPRuntimeDir,
+		agyRuntimeDir: opts.AgyRuntimeDir,
 		now:           time.Now,
 	}
 }
@@ -97,7 +101,7 @@ func (c *Cockpit) AgentNotify(ctx context.Context, target NotificationTarget, pr
 	if c == nil {
 		return false, false, fmt.Errorf("cockpit is nil")
 	}
-	return c.client.agentNotify(ctx, c.ompRuntimeDir, target, prompt)
+	return c.client.agentNotifyWithDirs(ctx, c.ompRuntimeDir, c.agyRuntimeDir, target, prompt)
 }
 
 // ResolvePaneByLabel resolves a registered recipient from an explicit agent:name

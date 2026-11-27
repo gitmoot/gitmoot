@@ -67,7 +67,7 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer client.Close()
-	notifier := cockpit.New(cockpit.Options{HerdrBin: "herdr", OMPRuntimeDir: ompRuntimeDir(*home)})
+	notifier := cockpit.New(cockpit.Options{HerdrBin: "herdr", OMPRuntimeDir: ompRuntimeDir(*home), AgyRuntimeDir: agyRuntimeDir(*home)})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	for {

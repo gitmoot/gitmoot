@@ -69,7 +69,9 @@ inline (`echo '...'`). Reviewers still registered on a removed runtime are
 refused; register them again with `--runtime omp`.
 
 `gitmoot plugin install omp` installs the omp add-on that delivers messages
-to omp sessions. The `codex` and `claude` plugins
+to omp sessions, and `gitmoot plugin install agy` installs the Antigravity CLI
+(`agy`) plugin that tracks active conversations alongside automatic `agy`
+session registration. The `codex` and `claude` plugins
 (`gitmoot plugin install codex`, `gitmoot plugin install claude`) give seats
 running in those apps this skill and a hook that collects their messages; they
 are not runtimes for runs.
