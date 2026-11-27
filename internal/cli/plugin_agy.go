@@ -139,7 +139,7 @@ func runPluginInstallAgy(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	writeLine(stdout, "installed agy plugin")
-	writeLine(stdout, "Running agy seats register automatically on their next gitmoot command (or run `gitmoot plugin agy-register`).")
+	writeLine(stdout, "Running agy seats register automatically after a successful `gitmoot message inbox|show|send|reply` (or run `gitmoot plugin agy-register`).")
 	return 0
 }
 

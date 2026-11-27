@@ -5,8 +5,9 @@
 // `PreToolUse`, `PostToolUse`) inherit `ANTIGRAVITY_CONVERSATION_ID`, but only
 // `run_command` subprocesses inherit `ANTIGRAVITY_LS_ADDRESS` and
 // `ANTIGRAVITY_CSRF_TOKEN`. Gitmoot therefore combines:
-//  1. Opportunistic registration (`RegisterFromEnv`) whenever a `gitmoot` CLI
-//     command runs inside an interactive top-level `agy` `run_command` shell,
+//  1. Opportunistic registration (`RegisterFromEnv`) after a successful
+//     `gitmoot message inbox|show|send|reply` inside an interactive top-level
+//     `agy` `run_command` shell (or explicitly via `gitmoot plugin agy-register`),
 //     writing `<registry>/<pid>.json` (mode 0600 inside a mode 0700 dir).
 //  2. A native Antigravity plugin (`~/.gemini/config/plugins/gitmoot/`) whose
 //     `SessionStart` and `PreInvocation` hooks keep `<registry>/<pid>.conv.json`
@@ -103,6 +104,10 @@ func RegistrationPath(dir string, pid int) string {
 // ConvPinPath returns the canonical path for pid's hook-tracked conversation pin.
 func ConvPinPath(dir string, pid int) string {
 	return filepath.Join(filepath.Clean(dir), fmt.Sprintf("%d%s", pid, ConvPinSuffix))
+}
+
+func registryLockPath(dir string) string {
+	return filepath.Join(filepath.Clean(dir), ".registry.lock")
 }
 
 // EnsureRegistryDir creates dir with mode 0700 and verifies it is a private
@@ -283,6 +288,14 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 	if lsAddress == "" || csrfToken == "" || convID == "" {
 		return false, nil
 	}
+	nowFn := opts.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	// Capture observation time before metadata verification so a slow command
+	// completing after a newer pane switch cannot supersede the newer pin.
+	observedAt := nowFn().UTC()
+
 	if _, _, err := ValidateLoopbackAddress(lsAddress); err != nil {
 		return false, err
 	}
@@ -353,29 +366,63 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 	if opts.PruneDead {
 		PruneDeadRegistrations(opts.RegistryDir)
 	}
-	now := opts.Now
-	if now == nil {
-		now = time.Now
-	}
-	record := Registration{
-		Version:        RegistrationVersion,
-		PID:            pid,
-		StartTimeTicks: startTime,
-		LSAddress:      concreteAddr,
-		CSRFToken:      csrfToken,
-		ConversationID: convID,
-		HerdrPaneID:    paneID,
-		UpdatedAt:      now().UTC().Format(time.RFC3339Nano),
-	}
-	data, err := json.Marshal(record)
+	wrote := false
+	err = withLockFile(registryLockPath(opts.RegistryDir), func() error {
+		effectiveConv := convID
+		effectiveTime := observedAt
+
+		// If a newer registration for this same live process already committed,
+		// preserve its conversation and timestamp; refresh only endpoint/token/pane if changed.
+		if existing, info, err := ReadRegistration(regPath); err == nil && CheckPrivateEntry(info, 0) == nil {
+			if existing.Version == RegistrationVersion && existing.PID == pid && existing.StartTimeTicks == startTime {
+				if existingTime, err := time.Parse(time.RFC3339Nano, existing.UpdatedAt); err == nil && !observedAt.After(existingTime) {
+					if existing.LSAddress == concreteAddr && existing.CSRFToken == csrfToken && existing.HerdrPaneID == paneID {
+						return nil
+					}
+					effectiveConv = existing.ConversationID
+					effectiveTime = existingTime
+				}
+			}
+		}
+
+		// Never let an older command registration supersede a newer hook pin
+		// that committed while this metadata probe was in flight.
+		if existingPin, pinInfo, err := ReadConvPin(ConvPinPath(opts.RegistryDir, pid)); err == nil && CheckPrivateEntry(pinInfo, 0) == nil {
+			if existingPin.Version == RegistrationVersion &&
+				existingPin.PID == pid &&
+				existingPin.StartTimeTicks == startTime &&
+				strings.TrimSpace(existingPin.ConversationID) != "" {
+				if pinTime, err := time.Parse(time.RFC3339Nano, existingPin.UpdatedAt); err == nil && !effectiveTime.After(pinTime) {
+					effectiveConv = strings.TrimSpace(existingPin.ConversationID)
+				}
+			}
+		}
+
+		record := Registration{
+			Version:        RegistrationVersion,
+			PID:            pid,
+			StartTimeTicks: startTime,
+			LSAddress:      concreteAddr,
+			CSRFToken:      csrfToken,
+			ConversationID: effectiveConv,
+			HerdrPaneID:    paneID,
+			UpdatedAt:      effectiveTime.Format(time.RFC3339Nano),
+		}
+		data, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		data = append(data, '\n')
+		if err := writeFileAtomic(regPath, data, 0o600); err != nil {
+			return err
+		}
+		wrote = true
+		return nil
+	})
 	if err != nil {
 		return false, err
 	}
-	data = append(data, '\n')
-	if err := writeFileAtomic(regPath, data, 0o600); err != nil {
-		return false, err
-	}
-	return true, nil
+	return wrote, nil
 }
 
 // HookConversationOptions configures RecordHookConversation.
@@ -455,9 +502,8 @@ func RecordHookConversation(ctx context.Context, opts HookConversationOptions) (
 	if err := EnsureRegistryDir(opts.RegistryDir); err != nil {
 		return false, err
 	}
-	lockPath := filepath.Join(filepath.Clean(opts.RegistryDir), fmt.Sprintf(".%d.conv.lock", opts.PID))
 	wrote := false
-	err = withLockFile(lockPath, func() error {
+	err = withLockFile(registryLockPath(opts.RegistryDir), func() error {
 		// Re-check registration and existing pin under lock to reject out-of-order
 		// writes from a hook whose metadata probe finished after a newer event.
 		latestReg, regInfo, err := ReadRegistration(regPath)

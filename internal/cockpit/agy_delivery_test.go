@@ -553,3 +553,94 @@ func TestAgyNotifyRealProcVerificationEndToEnd(t *testing.T) {
 		t.Fatalf("sendMessage received addr %q, want concrete %q", dialedAddr, strings.TrimPrefix(srv.URL, "http://"))
 	}
 }
+
+func TestAgyRegistrationDoesNotSupersedeNewerHook(t *testing.T) {
+	baseTime := time.Date(2026, 11, 27, 8, 0, 0, 0, time.UTC)
+	dir := newAgyRegistry(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ConversationID string `json:"conversationId"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"` + body.ConversationID + `","state":{"runState":"RUN_STATE_IDLE"}}`))
+	}))
+	defer srv.Close()
+	lsAddr := strings.TrimPrefix(srv.URL, "http://")
+
+	// Initial registration at t=0.
+	_, err := agyaddon.RegisterFromEnv(context.Background(), agyaddon.RegisterOptions{
+		RegistryDir: dir,
+		Getenv: func(k string) string {
+			return map[string]string{
+				agyaddon.EnvLSAddress:      lsAddr,
+				agyaddon.EnvCSRFToken:      "tok",
+				agyaddon.EnvConversationID: "initial-conv",
+			}[k]
+		},
+		FindAncestor:   func() (int, uint64, error) { return testPID, 888, nil },
+		VerifyPort:     func(int, string) (string, error) { return lsAddr, nil },
+		VerifyMetadata: func(context.Context, string, string, string) (string, int, error) { return agyaddon.InteractiveMode, 0, nil },
+		Now:            func() time.Time { return baseTime },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate an older run_command registration starting at t+1m whose metadata
+	// probe pauses while a newer pane hook commits "newer-pane" at t+2m.
+	_, err = agyaddon.RegisterFromEnv(context.Background(), agyaddon.RegisterOptions{
+		RegistryDir: dir,
+		Getenv: func(k string) string {
+			return map[string]string{
+				agyaddon.EnvLSAddress:      lsAddr,
+				agyaddon.EnvCSRFToken:      "tok",
+				agyaddon.EnvConversationID: "older-command",
+			}[k]
+		},
+		FindAncestor: func() (int, uint64, error) { return testPID, 888, nil },
+		VerifyPort:   func(int, string) (string, error) { return lsAddr, nil },
+		VerifyMetadata: func(ctx context.Context, _, _, _ string) (string, int, error) {
+			// While older-command is in verification, newer-pane hook commits at t+2m.
+			wrote, hookErr := agyaddon.RecordHookConversation(ctx, agyaddon.HookConversationOptions{
+				RegistryDir:    dir,
+				PID:            testPID,
+				StartTimeTicks: 888,
+				ConversationID: "newer-pane",
+				Event:          "SessionStart",
+				VerifyPort:     func(int, string) (string, error) { return lsAddr, nil },
+				VerifyMetadata: func(context.Context, string, string, string) (string, int, error) { return agyaddon.InteractiveMode, 0, nil },
+				Now:            func() time.Time { return baseTime.Add(2 * time.Minute) },
+			})
+			if hookErr != nil || !wrote {
+				t.Errorf("concurrent newer hook failed: wrote=%v err=%v", wrote, hookErr)
+			}
+			return agyaddon.InteractiveMode, 0, nil
+		},
+		Now: func() time.Time { return baseTime.Add(1 * time.Minute) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Delivery MUST target "newer-pane", never "older-command".
+	var deliveredConv string
+	deps := agyNotifyDeps{
+		processStartTime: func(int) (uint64, error) { return 888, nil },
+		verifyPortOwner:  func(int, string) (string, error) { return lsAddr, nil },
+		verifyMetadata:   func(context.Context, string, string, string) (string, int, error) { return agyaddon.InteractiveMode, 0, nil },
+		httpClient:       srv.Client(),
+		sendMessage: func(_ context.Context, _, _, conv, _, _ string) agySendResult {
+			deliveredConv = conv
+			return agySendResult{stdout: []byte(`{"response":{"sendMessage":{"recipientId":"` + conv + `"}}}`)}
+		},
+	}
+	delivered, uncertain, err := paneProcesses(t, testPane, testPID).agentNotifyAgy(context.Background(), dir, agyTestTarget(), "ping", deps)
+	if !delivered || uncertain || err != nil {
+		t.Fatalf("delivered=%v uncertain=%v err=%v", delivered, uncertain, err)
+	}
+	if deliveredConv != "newer-pane" {
+		t.Fatalf("late registration superseded newer hook pin: delivered to %q, want %q", deliveredConv, "newer-pane")
+	}
+}
