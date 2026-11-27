@@ -51,3 +51,10 @@ func PathsForHome(home string) Paths {
 func (p Paths) OMPRuntimeDir() string {
 	return filepath.Join(p.Home, "run", "omp")
 }
+
+// AgyRuntimeDir is where Gitmoot records each running interactive Antigravity
+// CLI (`agy`) runtime (registration JSON with its local language-server
+// endpoint and CSRF token, plus hook-tracked active conversation JSON). Mode 0700.
+func (p Paths) AgyRuntimeDir() string {
+	return filepath.Join(p.Home, "run", "agy")
+}

@@ -179,7 +179,7 @@ func TestOMPNotifyReceiptDecidesOutcome(t *testing.T) {
 			addon := startFakeOMPAddon(t, dir, "rt1", testPID, tc.reply)
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancel()
-			delivered, uncertain, err := paneProcesses(t, testPane, 99, testPID).agentNotify(ctx, dir, ompTestTarget(), "review PR 7")
+			delivered, uncertain, err := paneProcesses(t, testPane, 99, testPID).agentNotify(ctx, dir, "", ompTestTarget(), "review PR 7")
 			if delivered != tc.delivered || uncertain != tc.uncertain || (delivered && err != nil) || (!delivered && err == nil) {
 				t.Fatalf("delivered=%v uncertain=%v err=%v; want delivered=%v uncertain=%v", delivered, uncertain, err, tc.delivered, tc.uncertain)
 			}
@@ -209,7 +209,7 @@ func TestOMPNotifyUnreachableEndpointIsDeferred(t *testing.T) {
 	if err := addon.listener.Close(); err != nil {
 		t.Fatal(err)
 	}
-	delivered, uncertain, err := paneProcesses(t, testPane, testPID).agentNotify(context.Background(), dir, ompTestTarget(), "hello")
+	delivered, uncertain, err := paneProcesses(t, testPane, testPID).agentNotify(context.Background(), dir, "", ompTestTarget(), "hello")
 	var deferred *NotificationDeferred
 	if delivered || uncertain || !errors.As(err, &deferred) {
 		t.Fatalf("delivered=%v uncertain=%v err=%v; a connect failure wrote nothing and must stay retryable", delivered, uncertain, err)
@@ -282,7 +282,7 @@ func TestOMPNotifyRefusesUntrustedRegistry(t *testing.T) {
 				return `{"v":1,"id":"` + id + `","status":"accepted","mode":"idle"}`
 			})
 			registry := tc.setup(t, addon)
-			delivered, uncertain, err := paneProcesses(t, testPane, testPID).agentNotify(context.Background(), registry, ompTestTarget(), "hello")
+			delivered, uncertain, err := paneProcesses(t, testPane, testPID).agentNotify(context.Background(), registry, "", ompTestTarget(), "hello")
 			var deferred *NotificationDeferred
 			if delivered || uncertain || !errors.As(err, &deferred) || !strings.HasPrefix(deferred.Reason, NotificationCapabilityUnavailable) {
 				t.Fatalf("delivered=%v uncertain=%v err=%v; want capability-unavailable deferral", delivered, uncertain, err)
@@ -307,7 +307,7 @@ func TestOMPNotifyTargetsOnlyThePaneForegroundRuntime(t *testing.T) {
 		dir := newOMPRegistry(t)
 		old := startFakeOMPAddon(t, dir, "old", 1111, accept)
 		current := startFakeOMPAddon(t, dir, "new", testPID, accept)
-		delivered, uncertain, err := paneProcesses(t, testPane, testPID).agentNotify(context.Background(), dir, ompTestTarget(), "hello")
+		delivered, uncertain, err := paneProcesses(t, testPane, testPID).agentNotify(context.Background(), dir, "", ompTestTarget(), "hello")
 		if !delivered || uncertain || err != nil {
 			t.Fatalf("delivered=%v uncertain=%v err=%v", delivered, uncertain, err)
 		}
@@ -336,7 +336,7 @@ func TestOMPNotifyTargetsOnlyThePaneForegroundRuntime(t *testing.T) {
 			for index, pid := range tc.addons {
 				addons = append(addons, startFakeOMPAddon(t, dir, fmt.Sprintf("rt%d", index), pid, accept))
 			}
-			delivered, uncertain, err := tc.client(t).agentNotify(context.Background(), dir, ompTestTarget(), "hello")
+			delivered, uncertain, err := tc.client(t).agentNotify(context.Background(), dir, "", ompTestTarget(), "hello")
 			var deferred *NotificationDeferred
 			if delivered || uncertain || !errors.As(err, &deferred) {
 				t.Fatalf("delivered=%v uncertain=%v err=%v; want deferral", delivered, uncertain, err)
@@ -372,7 +372,7 @@ func TestOMPNotifyIgnoresLeftoverRegistrationForTheSamePID(t *testing.T) {
 				t.Fatal(err)
 			}
 			current := startFakeOMPAddon(t, dir, "new", testPID, accept)
-			delivered, uncertain, err := paneProcesses(t, testPane, testPID).agentNotify(context.Background(), dir, ompTestTarget(), "hello")
+			delivered, uncertain, err := paneProcesses(t, testPane, testPID).agentNotify(context.Background(), dir, "", ompTestTarget(), "hello")
 			if !delivered || uncertain || err != nil {
 				t.Fatalf("delivered=%v uncertain=%v err=%v; a leftover registration blocked the live runtime", delivered, uncertain, err)
 			}
@@ -401,7 +401,7 @@ func TestOMPNotifyNeverDialsOtherRuntimes(t *testing.T) {
 			}}
 			target := ompTestTarget()
 			target.Kind = kind
-			delivered, uncertain, err := client.agentNotify(context.Background(), dir, target, "hello")
+			delivered, uncertain, err := client.agentNotify(context.Background(), dir, "", target, "hello")
 			var deferred *NotificationDeferred
 			if delivered || uncertain || !errors.As(err, &deferred) || deferred.Reason != reason {
 				t.Fatalf("delivered=%v uncertain=%v err=%v; want deferral %q", delivered, uncertain, err, reason)

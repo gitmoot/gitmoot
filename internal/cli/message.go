@@ -237,6 +237,9 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 	}
 	request := messageRequest{action: action, id: id, args: args, workflowID: workflowID, before: before, limit: limit, thread: thread}
 	if handled, code := runMessageViaHub(*home, *roleFlag, request, *jsonOutput, stdout, stderr); handled {
+		if code == 0 {
+			maybeRegisterAgyForHome(*home)
+		}
 		return code
 	}
 	err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
@@ -284,6 +287,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "message:", err)
 		return 1
 	}
+	maybeRegisterAgyForHome(*home)
 	return 0
 }
 

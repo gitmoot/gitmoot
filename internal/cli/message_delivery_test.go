@@ -144,3 +144,29 @@ func TestMessageDaemonHoldsRemoteBoundRecipientPending(t *testing.T) {
 		t.Fatalf("durable inbox lost: %v", err)
 	}
 }
+
+func TestMessageDaemonNotifiesAgyRecipient(t *testing.T) {
+	ctx := context.Background()
+	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}, {"worker", "agent:worker"}})
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+		States:       map[string]org.RoleLiveState{"worker": {State: org.StateWorking}},
+		PaneBindings: map[string]org.PaneBinding{"worker": {PaneID: "w1:p4"}},
+		Sessions:     map[string]org.SessionActivity{"worker": {PaneID: "w1:p4", Agent: "agy"}},
+	}})
+	wake.labelToPane = map[string]string{"agent:worker": "w1:p4"}
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID:      "safety",
+		Author:          "owner",
+		Body:            "[org:message to=worker from=owner wf=safety] ping agy",
+		AddressedTarget: "worker",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	worker := defaultJobWorker(store, io.Discard, home)
+	installReplyWakeProductionSink(t, worker, sink.sink)
+	var diagnostic bytes.Buffer
+	runReplyWakeOutboxDrainOnce(ctx, store, worker, &diagnostic, time.Now().UTC().Add(time.Hour), nil)
+	if wake.promptCalls != 1 || wake.pane != "w1:p4" {
+		t.Fatalf("agy recipient was not dispatched: calls=%d pane=%q log=%s", wake.promptCalls, wake.pane, diagnostic.String())
+	}
+}

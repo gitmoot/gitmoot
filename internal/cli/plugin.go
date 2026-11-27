@@ -60,6 +60,10 @@ func runPlugin(args []string, stdout, stderr io.Writer) int {
 		return runPluginDoctor(args[1:], stdout, stderr)
 	case "hook-context":
 		return runPluginHookContext(args[1:], stdout, stderr)
+	case "agy-hook":
+		return runPluginAgyHook(args[1:], stdout, stderr)
+	case "agy-register":
+		return runPluginAgyRegister(args[1:], stdout, stderr)
 	case "install":
 		return runPluginInstall(args[1:], stdout, stderr)
 	default:
@@ -72,9 +76,9 @@ func runPlugin(args []string, stdout, stderr io.Writer) int {
 func printPluginUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot plugin build codex|claude")
-	fmt.Fprintln(w, "  gitmoot plugin install codex|claude|omp")
-	fmt.Fprintln(w, "  gitmoot plugin path codex|claude|omp")
-	fmt.Fprintln(w, "  gitmoot plugin doctor [codex|claude|omp]")
+	fmt.Fprintln(w, "  gitmoot plugin install codex|claude|omp|agy")
+	fmt.Fprintln(w, "  gitmoot plugin path codex|claude|omp|agy")
+	fmt.Fprintln(w, "  gitmoot plugin doctor [codex|claude|omp|agy]")
 }
 
 func runPluginHookContext(_ []string, stdout, stderr io.Writer) int {
@@ -103,6 +107,9 @@ func runPluginHookContext(_ []string, stdout, stderr io.Writer) int {
 func runPluginInstall(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == pluginOMP {
 		return runPluginInstallOMP(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == pluginAgy {
+		return runPluginInstallAgy(args[1:], stdout, stderr)
 	}
 	fs := flag.NewFlagSet("plugin install", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -232,6 +239,9 @@ func runPluginPath(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == pluginOMP {
 		return runPluginPathOMP(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == pluginAgy {
+		return runPluginPathAgy(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("plugin path", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
@@ -255,6 +265,9 @@ func runPluginPath(args []string, stdout, stderr io.Writer) int {
 func runPluginDoctor(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == pluginOMP {
 		return runPluginDoctorOMP(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == pluginAgy {
+		return runPluginDoctorAgy(args[1:], stdout, stderr)
 	}
 	fs := flag.NewFlagSet("plugin doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)

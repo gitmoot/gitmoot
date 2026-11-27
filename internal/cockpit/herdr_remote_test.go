@@ -178,7 +178,7 @@ func TestAgentNotifyNeverReachesARemotePane(t *testing.T) {
 		return "", nil
 	}}
 	target := NotificationTarget{Selector: studioID + "/mac-studio", PaneID: studioID + "/w1:p9", Kind: "omp", Machine: studioID}
-	delivered, uncertain, err := client.agentNotify(context.Background(), t.TempDir(), target, "hello")
+	delivered, uncertain, err := client.agentNotify(context.Background(), t.TempDir(), "", target, "hello")
 	var deferred *NotificationDeferred
 	if delivered || uncertain || !errors.As(err, &deferred) || deferred.Reason != NotificationRemotePending {
 		t.Fatalf("agentNotify = %v, %v, %v; want deferred with %q", delivered, uncertain, err, NotificationRemotePending)

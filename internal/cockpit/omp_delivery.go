@@ -47,11 +47,12 @@ const (
 )
 
 // NotificationCapability reports why a Herdr agent kind cannot receive a direct
-// notification. The empty string means the kind is OMP, whose Gitmoot inbox
-// add-on admits notifications itself.
+// notification. The empty string means the kind supports direct runtime
+// notification (OMP via its inbox add-on, or Antigravity CLI `agy` via its
+// registered local language server).
 func NotificationCapability(kind string) string {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "omp":
+	case "omp", "agy":
 		return ""
 	case "claude", "codex":
 		return NotificationAwaitingNextTurn
@@ -368,26 +369,32 @@ func (c herdrClient) paneForegroundPIDs(ctx context.Context, paneID string) ([]i
 	return pids, nil
 }
 
-// agentNotify delivers to the OMP inbox add-on of the process running in the
-// recipient's pane. It never types into the pane: unsupported runtimes and
+// agentNotify delivers to the notification endpoint of the process running in
+// the recipient's pane (OMP inbox add-on or registered Antigravity `agy`
+// language server). It never types into the pane: unsupported runtimes and
 // unregistered processes stay deferred.
-func (c herdrClient) agentNotify(ctx context.Context, registryDir string, target NotificationTarget, content string) (delivered bool, uncertain bool, err error) {
+func (c herdrClient) agentNotify(ctx context.Context, ompRegistryDir, agyRegistryDir string, target NotificationTarget, content string) (delivered bool, uncertain bool, err error) {
 	if target.Machine != "" {
 		return false, false, &NotificationDeferred{Reason: NotificationRemotePending}
 	}
 	if reason := NotificationCapability(target.Kind); reason != "" {
 		return false, false, &NotificationDeferred{Reason: reason}
 	}
-	if target.PaneID == "" || registryDir == "" {
-		return false, false, capabilityUnavailable("")
+	switch strings.ToLower(strings.TrimSpace(target.Kind)) {
+	case "agy":
+		return c.agentNotifyAgy(ctx, agyRegistryDir, target, content, agyNotifyDeps{})
+	default:
+		if target.PaneID == "" || ompRegistryDir == "" {
+			return false, false, capabilityUnavailable("")
+		}
+		pids, err := c.paneForegroundPIDs(ctx, target.PaneID)
+		if err != nil {
+			return false, false, &NotificationDeferred{Reason: "recipient process unavailable: " + err.Error()}
+		}
+		registration, err := findOMPRegistration(ctx, ompRegistryDir, pids)
+		if err != nil {
+			return false, false, err
+		}
+		return deliverOMPNotification(ctx, registration, content)
 	}
-	pids, err := c.paneForegroundPIDs(ctx, target.PaneID)
-	if err != nil {
-		return false, false, &NotificationDeferred{Reason: "recipient process unavailable: " + err.Error()}
-	}
-	registration, err := findOMPRegistration(ctx, registryDir, pids)
-	if err != nil {
-		return false, false, err
-	}
-	return deliverOMPNotification(ctx, registration, content)
 }
