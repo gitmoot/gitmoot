@@ -69,9 +69,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, cmd := range rootCommands {
 		if cmd.name == name {
-			return runWithAgyAutoRegisterContext(name, func() int {
-				return cmd.run(args[1:], stdout, stderr)
-			})
+			return cmd.run(args[1:], stdout, stderr)
 		}
 	}
 
@@ -331,18 +329,8 @@ func repoCheckoutDoctorChecks(paths config.Paths) []doctor.Check {
 }
 
 func pathsFromFlag(home string) (config.Paths, error) {
-	var (
-		paths config.Paths
-		err   error
-	)
 	if home != "" {
-		paths = config.PathsForHome(home)
-	} else {
-		paths, err = config.DefaultPaths()
-		if err != nil {
-			return config.Paths{}, err
-		}
+		return config.PathsForHome(home), nil
 	}
-	maybeRegisterAgyForPaths(paths)
-	return paths, nil
+	return config.DefaultPaths()
 }

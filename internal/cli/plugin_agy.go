@@ -28,27 +28,13 @@ var (
 	agyVerifyMeta     agyaddon.MetadataVerifier
 	agyPlatformCheck            = agyaddon.PlatformSupported
 	agyAutoRegisterMu sync.Mutex
-	agyAutoRegCmd     string
 	agyAutoRegDone    bool
 )
 
-func runWithAgyAutoRegisterContext(cmdName string, fn func() int) int {
-	agyAutoRegisterMu.Lock()
-	prev := agyAutoRegCmd
-	agyAutoRegCmd = cmdName
-	agyAutoRegisterMu.Unlock()
-	defer func() {
-		agyAutoRegisterMu.Lock()
-		agyAutoRegCmd = prev
-		agyAutoRegisterMu.Unlock()
-	}()
-	return fn()
-}
-
-// maybeRegisterAgyForPaths performs best-effort opportunistic registration once
-// per CLI process using the command's already-parsed home paths (never parsing
-// raw argv). Skipped in go test binaries and read-only inspection commands.
-func maybeRegisterAgyForPaths(paths config.Paths) {
+// maybeRegisterAgyForHome performs best-effort opportunistic registration once
+// per CLI process after a command has validated its request and selected its
+// home. Skipped in go test binaries so tests never touch the operator's home.
+func maybeRegisterAgyForHome(home string) {
 	if testing.Testing() {
 		return
 	}
@@ -62,14 +48,13 @@ func maybeRegisterAgyForPaths(paths config.Paths) {
 		agyAutoRegisterMu.Unlock()
 		return
 	}
-	switch agyAutoRegCmd {
-	case "", "plugin", "doctor", "version", "config":
-		agyAutoRegisterMu.Unlock()
-		return
-	}
 	agyAutoRegDone = true
 	agyAutoRegisterMu.Unlock()
 
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return
+	}
 	registryDir, err := absAgyRegistryDir(paths)
 	if err != nil {
 		return

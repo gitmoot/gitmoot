@@ -127,12 +127,12 @@ func TestAgyNotifyPreFlightAndDelivery(t *testing.T) {
 			wantDeferredContains: "agy CLI launch failed",
 		},
 		{
-			name:                 "structured unauthenticated JSON error defers without leaking token",
-			probeStatus:          http.StatusOK,
-			probeBody:            `{"id":"conv-live-0001","state":{"runState":"RUN_STATE_IDLE"}}`,
-			sendRes:              agySendResult{stdout: []byte(`{"response":{},"error":"rpc error: code = Unauthenticated desc = missing CSRF token ` + wantToken + `"}`)},
-			wantSendCalls:        1,
-			wantDeferredContains: "runtime notification refused",
+			name:          "post-launch JSON error stays uncertain without leaking token",
+			probeStatus:   http.StatusOK,
+			probeBody:     `{"id":"conv-live-0001","state":{"runState":"RUN_STATE_IDLE"}}`,
+			sendRes:       agySendResult{stdout: []byte(`{"response":{},"error":"rpc error: code = Unauthenticated desc = missing CSRF token ` + wantToken + `"}`)},
+			wantSendCalls: 1,
+			wantUncertain: true,
 		},
 		{
 			name:          "free-form substring in stdout error stays uncertain",

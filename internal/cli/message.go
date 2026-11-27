@@ -235,6 +235,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "inbox requires --before >= 0 and --limit 1–100")
 		return 2
 	}
+	maybeRegisterAgyForHome(*home)
 	request := messageRequest{action: action, id: id, args: args, workflowID: workflowID, before: before, limit: limit, thread: thread}
 	if handled, code := runMessageViaHub(*home, *roleFlag, request, *jsonOutput, stdout, stderr); handled {
 		return code

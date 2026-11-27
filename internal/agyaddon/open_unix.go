@@ -48,3 +48,16 @@ func CheckPrivateEntry(info fs.FileInfo, want fs.FileMode) error {
 	}
 	return nil
 }
+
+func withLockFile(path string, fn func() error) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	return fn()
+}

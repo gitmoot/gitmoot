@@ -131,13 +131,35 @@ func TestRegisterFromEnvValidationAndFastPath(t *testing.T) {
 		t.Fatalf("unexpected registration: %+v", reg)
 	}
 
-	// Second call hits fast path without re-verifying port/metadata.
+	// Second call hits fast path without re-verifying metadata once port owner matches concrete address.
 	wrote, err = RegisterFromEnv(context.Background(), opts)
 	if err != nil || wrote {
 		t.Fatalf("second RegisterFromEnv = (%v, %v), want (false, nil)", wrote, err)
 	}
-	if metaCalls != 1 || portCalls != 1 {
-		t.Fatalf("fast path should not re-verify: meta=%d port=%d", metaCalls, portCalls)
+	if metaCalls != 1 || portCalls != 2 {
+		t.Fatalf("fast path should check concrete port and skip metadata: meta=%d port=%d", metaCalls, portCalls)
+	}
+
+	// Same port moving from IPv4 to IPv6 must NOT be treated as unchanged.
+	v6Opts := opts
+	v6Opts.VerifyPort = func(pid int, addr string) (string, error) {
+		portCalls++
+		return "[::1]:43883", nil
+	}
+	v6Opts.VerifyMetadata = func(_ context.Context, addr, _, _ string) (string, int, error) {
+		metaCalls++
+		if addr != "[::1]:43883" {
+			t.Errorf("expected concrete IPv6 addr, got %q", addr)
+		}
+		return InteractiveMode, 0, nil
+	}
+	wrote, err = RegisterFromEnv(context.Background(), v6Opts)
+	if err != nil || !wrote {
+		t.Fatalf("IPv4->IPv6 endpoint change = (%v, %v), want (true, nil)", wrote, err)
+	}
+	reg, _, err = ReadRegistration(RegistrationPath(registryDir, 4242))
+	if err != nil || reg.LSAddress != "[::1]:43883" {
+		t.Fatalf("expected updated IPv6 lsAddress, got %+v err=%v", reg, err)
 	}
 
 	// Subagent (nestingDepth > 0) is refused.
@@ -196,7 +218,8 @@ func TestRecordHookConversationRejectsUnregisteredAndSubagents(t *testing.T) {
 		t.Fatalf("unregistered hook = (%v, %v), want (false, nil)", wrote, err)
 	}
 
-	// Register PID 4242.
+	// Register PID 4242 at baseTime.
+	baseTime := time.Date(2026, 11, 27, 8, 0, 0, 0, time.UTC)
 	_, err = RegisterFromEnv(context.Background(), RegisterOptions{
 		RegistryDir: registryDir,
 		Getenv: func(k string) string {
@@ -209,6 +232,7 @@ func TestRecordHookConversationRejectsUnregisteredAndSubagents(t *testing.T) {
 		FindAncestor:   func() (int, uint64, error) { return 4242, 999001, nil },
 		VerifyPort:     func(int, string) (string, error) { return "127.0.0.1:43883", nil },
 		VerifyMetadata: func(context.Context, string, string, string) (string, int, error) { return InteractiveMode, 0, nil },
+		Now:            func() time.Time { return baseTime },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -267,6 +291,25 @@ func TestRecordHookConversationRejectsUnregisteredAndSubagents(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 || pin.ConversationID != "conv-2" || pin.Event != "PreInvocation" {
 		t.Fatalf("unexpected pin: %+v mode=%04o", pin, info.Mode().Perm())
+	}
+
+	// An older hook event finishing after a newer one must NOT overwrite the newer pin.
+	wrote, err = RecordHookConversation(context.Background(), HookConversationOptions{
+		RegistryDir:    registryDir,
+		PID:            4242,
+		StartTimeTicks: 999001,
+		ConversationID: "conv-stale-late",
+		Event:          "SessionStart",
+		VerifyPort:     func(int, string) (string, error) { return "127.0.0.1:43883", nil },
+		VerifyMetadata: func(context.Context, string, string, string) (string, int, error) { return InteractiveMode, 0, nil },
+		Now:            func() time.Time { return baseTime.Add(2 * time.Minute) }, // older than 8:05 conv-2
+	})
+	if err != nil || wrote {
+		t.Fatalf("stale out-of-order hook = (%v, %v), want (false, nil)", wrote, err)
+	}
+	pin, _, err = ReadConvPin(ConvPinPath(registryDir, 4242))
+	if err != nil || pin.ConversationID != "conv-2" {
+		t.Fatalf("stale hook overwrote newer pin: %+v err=%v", pin, err)
 	}
 }
 

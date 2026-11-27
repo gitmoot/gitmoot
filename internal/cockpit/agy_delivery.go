@@ -252,12 +252,9 @@ func deliverAgyNotification(ctx context.Context, reg agyaddon.Registration, conv
 		}
 		return false, true, fmt.Errorf("agy send-message receipt recipientId=%q does not match %q", parsed.Response.SendMessage.RecipientID, reg.ConversationID)
 	}
-	// Only classify a post-launch error as a pre-write deferral when the call
-	// did not time out/cancel AND the CLI returned a structured documented
-	// pre-write rejection.
-	if ctx.Err() == nil && sendCtx.Err() == nil && parsedOK && parsed.Error != "" && isStructuredPreWriteAgyError(parsed.Error) {
-		return false, false, &NotificationDeferred{Reason: "runtime notification refused: " + sanitizeAgyError(parsed.Error, reg.CSRFToken)}
-	}
+	// Once the child process started, any non-confirming outcome is uncertain:
+	// pre-flight GetConversation already handles pre-write auth/reachability
+	// checks, so post-launch errors must never be auto-retried as pending.
 	if parsedOK && parsed.Error != "" {
 		return false, true, fmt.Errorf("agy send-message error: %s", sanitizeAgyError(parsed.Error, reg.CSRFToken))
 	}
@@ -361,22 +358,6 @@ func envWithAgyCredentials(base []string, lsAddress, csrfToken string) []string 
 	}
 	out = append(out, agyaddon.EnvLSAddress+"="+lsAddress, agyaddon.EnvCSRFToken+"="+csrfToken)
 	return out
-}
-
-// isStructuredPreWriteAgyError matches only Antigravity's documented, exact
-// pre-write RPC rejection strings so ambiguous failures remain uncertain.
-func isStructuredPreWriteAgyError(msg string) bool {
-	trimmed := strings.TrimSpace(msg)
-	if trimmed == "ANTIGRAVITY_LS_ADDRESS is not set" {
-		return true
-	}
-	if strings.HasPrefix(trimmed, "rpc error: code = Unauthenticated") {
-		return true
-	}
-	if strings.HasPrefix(trimmed, "rpc error: code = Unavailable") && strings.Contains(strings.ToLower(trimmed), "connection refused") {
-		return true
-	}
-	return false
 }
 
 func sanitizeAgyError(msg, csrfToken string) string {

@@ -37,3 +37,7 @@ func CheckPrivateEntry(info fs.FileInfo, want fs.FileMode) error {
 	}
 	return nil
 }
+
+func withLockFile(_ string, fn func() error) error {
+	return fn()
+}

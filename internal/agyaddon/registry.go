@@ -283,8 +283,7 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 	if lsAddress == "" || csrfToken == "" || convID == "" {
 		return false, nil
 	}
-	_, port, err := ValidateLoopbackAddress(lsAddress)
-	if err != nil {
+	if _, _, err := ValidateLoopbackAddress(lsAddress); err != nil {
 		return false, err
 	}
 	findAncestor := opts.FindAncestor
@@ -301,20 +300,6 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 		return false, errors.New("agy process start time unavailable")
 	}
 
-	regPath := RegistrationPath(opts.RegistryDir, pid)
-	paneID := strings.TrimSpace(getenv(EnvHerdrPaneID))
-	if existing, info, err := ReadRegistration(regPath); err == nil && CheckPrivateEntry(info, 0) == nil {
-		if existing.Version == RegistrationVersion &&
-			existing.PID == pid &&
-			existing.StartTimeTicks == startTime &&
-			sameLoopbackPort(existing.LSAddress, port) &&
-			existing.CSRFToken == csrfToken &&
-			existing.ConversationID == convID &&
-			existing.HerdrPaneID == paneID {
-			return false, nil
-		}
-	}
-
 	verifyPort := opts.VerifyPort
 	if verifyPort == nil {
 		verifyPort = VerifyPIDOwnsLoopbackPort
@@ -325,6 +310,20 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 	}
 	if _, _, err := ValidateLoopbackAddress(concreteAddr); err != nil {
 		return false, err
+	}
+
+	regPath := RegistrationPath(opts.RegistryDir, pid)
+	paneID := strings.TrimSpace(getenv(EnvHerdrPaneID))
+	if existing, info, err := ReadRegistration(regPath); err == nil && CheckPrivateEntry(info, 0) == nil {
+		if existing.Version == RegistrationVersion &&
+			existing.PID == pid &&
+			existing.StartTimeTicks == startTime &&
+			existing.LSAddress == concreteAddr &&
+			existing.CSRFToken == csrfToken &&
+			existing.ConversationID == convID &&
+			existing.HerdrPaneID == paneID {
+			return false, nil
+		}
 	}
 
 	verifyMeta := opts.VerifyMetadata
@@ -379,15 +378,6 @@ func RegisterFromEnv(ctx context.Context, opts RegisterOptions) (bool, error) {
 	return true, nil
 }
 
-func sameLoopbackPort(existingAddr string, wantPort uint16) bool {
-	host, port, err := ValidateLoopbackAddress(existingAddr)
-	if err != nil || port != wantPort {
-		return false
-	}
-	// Only fast-path when the stored address is already concrete numeric IP.
-	return host == "127.0.0.1" || host == "::1"
-}
-
 // HookConversationOptions configures RecordHookConversation.
 type HookConversationOptions struct {
 	RegistryDir    string
@@ -404,12 +394,20 @@ type HookConversationOptions struct {
 // RecordHookConversation updates <registry>/<pid>.conv.json when pid already
 // has a trusted registration matching startTime AND conversationID is verified
 // as an interactive top-level conversation (nestingDepth == 0) on pid's owned
-// language server. Subagents and print-mode hooks are ignored cleanly.
+// language server. The event timestamp is captured before metadata verification
+// and serialized under a per-PID lock so an older hook finishing late never
+// overwrites a newer conversation pin or registration.
 func RecordHookConversation(ctx context.Context, opts HookConversationOptions) (bool, error) {
 	conversationID := strings.TrimSpace(opts.ConversationID)
 	if opts.RegistryDir == "" || opts.PID <= 0 || opts.StartTimeTicks == 0 || conversationID == "" {
 		return false, nil
 	}
+	nowFn := opts.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	observedAt := nowFn().UTC()
+
 	regPath := RegistrationPath(opts.RegistryDir, opts.PID)
 	reg, info, err := ReadRegistration(regPath)
 	if err != nil {
@@ -457,27 +455,60 @@ func RecordHookConversation(ctx context.Context, opts HookConversationOptions) (
 	if err := EnsureRegistryDir(opts.RegistryDir); err != nil {
 		return false, err
 	}
-	now := opts.Now
-	if now == nil {
-		now = time.Now
-	}
-	pin := ConversationPin{
-		Version:        RegistrationVersion,
-		PID:            opts.PID,
-		StartTimeTicks: opts.StartTimeTicks,
-		ConversationID: conversationID,
-		Event:          strings.TrimSpace(opts.Event),
-		UpdatedAt:      now().UTC().Format(time.RFC3339Nano),
-	}
-	data, err := json.Marshal(pin)
+	lockPath := filepath.Join(filepath.Clean(opts.RegistryDir), fmt.Sprintf(".%d.conv.lock", opts.PID))
+	wrote := false
+	err = withLockFile(lockPath, func() error {
+		// Re-check registration and existing pin under lock to reject out-of-order
+		// writes from a hook whose metadata probe finished after a newer event.
+		latestReg, regInfo, err := ReadRegistration(regPath)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if err := CheckPrivateEntry(regInfo, 0); err != nil {
+			return err
+		}
+		if latestReg.Version != RegistrationVersion || latestReg.PID != opts.PID || latestReg.StartTimeTicks != opts.StartTimeTicks {
+			return nil
+		}
+		if regTime, err := time.Parse(time.RFC3339Nano, latestReg.UpdatedAt); err == nil && !observedAt.After(regTime) {
+			return nil
+		}
+		pinPath := ConvPinPath(opts.RegistryDir, opts.PID)
+		if existingPin, pinInfo, err := ReadConvPin(pinPath); err == nil && CheckPrivateEntry(pinInfo, 0) == nil {
+			if existingPin.Version == RegistrationVersion &&
+				existingPin.PID == opts.PID &&
+				existingPin.StartTimeTicks == opts.StartTimeTicks {
+				if existingTime, err := time.Parse(time.RFC3339Nano, existingPin.UpdatedAt); err == nil && !observedAt.After(existingTime) {
+					return nil
+				}
+			}
+		}
+		pin := ConversationPin{
+			Version:        RegistrationVersion,
+			PID:            opts.PID,
+			StartTimeTicks: opts.StartTimeTicks,
+			ConversationID: conversationID,
+			Event:          strings.TrimSpace(opts.Event),
+			UpdatedAt:      observedAt.Format(time.RFC3339Nano),
+		}
+		data, err := json.Marshal(pin)
+		if err != nil {
+			return err
+		}
+		data = append(data, '\n')
+		if err := writeFileAtomic(pinPath, data, 0o600); err != nil {
+			return err
+		}
+		wrote = true
+		return nil
+	})
 	if err != nil {
 		return false, err
 	}
-	data = append(data, '\n')
-	if err := writeFileAtomic(ConvPinPath(opts.RegistryDir, opts.PID), data, 0o600); err != nil {
-		return false, err
-	}
-	return true, nil
+	return wrote, nil
 }
 
 // DefaultVerifyMetadata runs `<agyBin> agentapi get-conversation-metadata <id>`
