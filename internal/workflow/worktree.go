@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
@@ -505,18 +506,16 @@ func ValidateDelegationCleanupTarget(home, jobID, jobType string, payload JobPay
 	}
 	// #2375: a worktree keeps the identity of the root it was created under. The legacy
 	// <home>/worktrees layout is always recognised (existing worktrees are never moved); the
-	// configured root is recognised too, but only while it is proven to be on its mount, so an
-	// absent mount can never look like an already-removed worktree.
+	// configured root and every [[worktrees.retired]] root (#2763) are recognised too, but each
+	// only while it is proven to be on its own mount, so an absent mount can never look like an
+	// already-removed worktree.
 	placement, err := ResolveWorktreePlacement(home)
 	if err != nil {
 		return err
 	}
-	roots := []string{placement.Legacy}
-	if placement.External() {
-		roots = append(roots, placement.Root)
-	}
-	for _, root := range roots {
-		expected, err := expectedDelegationCleanupPaths(root, jobID, jobType, payload)
+	roots := append([]config.WorktreeRoot{{Root: placement.Legacy}}, placement.existingRoots()...)
+	for i, root := range roots {
+		expected, err := expectedDelegationCleanupPaths(root.Root, jobID, jobType, payload)
 		if err != nil {
 			return err
 		}
@@ -524,12 +523,12 @@ func ValidateDelegationCleanupTarget(home, jobID, jobType string, payload JobPay
 			if path != filepath.Clean(candidate) {
 				continue
 			}
-			if root != placement.Legacy {
-				if err := placement.Preflight(); err != nil {
+			if i > 0 {
+				if err := PreflightWorktreeRoot(root); err != nil {
 					return err
 				}
 			}
-			return cleanupPathContained(root, path)
+			return cleanupPathContained(root.Root, path)
 		}
 	}
 	return fmt.Errorf("cleanup path %q does not match the job's derived managed path", path)

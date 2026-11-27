@@ -78,6 +78,38 @@ func TestInspectDelegationWorktreeUsageClassifiesOwnersAndSize(t *testing.T) {
 	}
 }
 
+// #2763: doctor scans an available [[worktrees.retired]] root next to the others and reports an
+// unavailable one (warning) instead of counting it as empty.
+func TestInspectDelegationWorktreeUsageScansRetiredRoots(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	retired := filepath.Join(t.TempDir(), "worktrees")
+	orphan := filepath.Join(retired, "owner--repo", "delegations", "parent", "orphan")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "gone", "worktrees")
+	cfg := fmt.Sprintf("[[worktrees.retired]]\nroot = %q\n\n[[worktrees.retired]]\nroot = %q\n", retired, missing)
+	if err := os.WriteFile(paths.ConfigFile, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := inspectDelegationWorktreeUsage(context.Background(), paths, store, time.Now().UTC(), 72*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.ConfigError != "" || len(usage.Roots) != 2 || usage.Roots[1] != retired || usage.Unproven != 1 {
+		t.Fatalf("usage = %+v, want the retired root scanned with its orphan", usage)
+	}
+	if len(usage.UnavailableRetiredRoots) != 1 || usage.UnavailableRetiredRoots[0] != missing || !strings.Contains(usage.Summary, missing) {
+		t.Fatalf("unavailable retired root not reported: %+v", usage)
+	}
+	if check := buildDelegationWorktreeDoctorCheck(usage); check.OK {
+		t.Fatalf("an unavailable retired root must warn: %+v", check)
+	}
+}
+
 func TestBuildDelegationWorktreeDoctorCheckThresholds(t *testing.T) {
 	ok := buildDelegationWorktreeDoctorCheck(delegationWorktreeUsage{Stale: 1, Pinned: 1, Size: "10 B", Summary: "1 stale worktree / 10 B under /tmp/home/worktrees"})
 	if !ok.OK || ok.Required || !strings.Contains(ok.Detail, "1 pinned") {

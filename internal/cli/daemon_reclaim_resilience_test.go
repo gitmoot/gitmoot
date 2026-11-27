@@ -554,6 +554,72 @@ func TestDelegationCleanupDefersWhileWorktreeRootUnavailable(t *testing.T) {
 	}
 }
 
+// #2763: after [worktrees] root moves, a worktree under the old root, listed as a
+// [[worktrees.retired]] root, is still reclaimed; while that retired root fails its own
+// preflight, cleanup defers instead of quarantining it as unmanaged.
+func TestDelegationCleanupReclaimsUnderRetiredWorktreeRoot(t *testing.T) {
+	resetDelegationReclaimAccountingForTest(t)
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	paths := config.PathsForHome(home)
+	box := t.TempDir()
+	old := filepath.Join(box, "worktrees")
+	current := filepath.Join(t.TempDir(), "worktrees")
+	path := filepath.Join(old, "owner--repo", "delegations", "moved", "pool-isolation")
+	for _, dir := range []string{filepath.Dir(path), current} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setRetired := func(entry string) {
+		t.Helper()
+		section := fmt.Sprintf("\n[worktrees]\nroot = %q\n\n[[worktrees.retired]]\n%s", current, entry)
+		if err := os.WriteFile(paths.ConfigFile, append(append([]byte{}, base...), []byte(section)...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// box is not a mount point, so the retired root's mount preflight fails as for a stopped mount.
+	setRetired(fmt.Sprintf("root = %q\nmount_point = %q\nmount_source = \"user@host:share\"\nmount_fstype = \"fuse.sshfs\"\n", old, box))
+	realNow := time.Now().UTC()
+	seedReclaimResilienceCandidate(t, store, "moved", path, realNow, false, false)
+	manager, checkout := newSelectiveReclaimManager(t, path)
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return reclaimFixtureEngine(worker, checkout, manager)
+	}
+	resourceID := db.CleanupObligationResourceID("moved", path)
+	for attempt := 0; attempt <= delegationCleanupRetryBudget; attempt++ {
+		now := realNow.Add(-20*time.Minute + time.Duration(attempt)*2*time.Minute)
+		if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), now, 72*time.Hour); err != nil {
+			t.Fatal(err)
+		}
+	}
+	obligation, err := store.GetCleanupObligation(ctx, resourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager.calls != 0 || obligation.State == db.CleanupObligationQuarantined || obligation.AttemptCount != 0 {
+		t.Fatalf("unavailable retired root spent the cleanup budget: calls=%d obligation=%+v", manager.calls, obligation)
+	}
+	// The retired root is usable (here: no mount keys); the worktree under it is reclaimed.
+	setRetired(fmt.Sprintf("root = %q\n", old))
+	if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), realNow.Add(2*time.Minute), 72*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.removed) != 1 || filepath.Clean(manager.removed[0]) != filepath.Clean(path) {
+		t.Fatalf("worktree under the retired root not reclaimed: removed=%v", manager.removed)
+	}
+	if outcome, err := store.GetCleanupObligation(ctx, resourceID); err != nil || outcome.State != db.CleanupObligationRemoved {
+		t.Fatalf("obligation after reclaim = %+v %v", outcome, err)
+	}
+}
+
 // TestDelegationCleanupAccountingFailureFailsClosed kills the mutant that logs
 // a cleanup-obligation persistence failure and reports a candidate-local skip.
 func TestDelegationCleanupAccountingFailureFailsClosed(t *testing.T) {

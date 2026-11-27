@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -22,7 +23,7 @@ func TestLoadWorktreeRootDefaultAndConfigured(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	want := WorktreeRoot{Root: "/mnt/box/worktrees", MountPoint: "/mnt/box", MountSource: "user@host:share", MountFSType: "fuse.sshfs"}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 	rootOnly, err := LoadWorktreeRoot(writeGateConfig(t, "[worktrees]\nroot = \"/srv/worktrees\"\n"))

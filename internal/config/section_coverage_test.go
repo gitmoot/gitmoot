@@ -38,6 +38,7 @@ var (
 	pinnedSectionHeaderSites = []string{
 		"cleanup_budget.go::LoadCleanupBudget",  // TestCleanupBudgetMalformedHeaderRefuses (#2360)
 		"worktrees.go::loadSingleSectionValues", // TestWorktreeRootMalformedHeaderRefuses (#2375), TestLoadJanitorCapacityRefusesInvalidSections (#2359)
+		"worktrees.go::loadArrayTableValues",    // TestLoadWorktreeRootRetiredRoots (#2763)
 		"admission.go::LoadAdmissionPolicy",
 		"credentials.go::LoadCredentialsConfig",
 		"daemon_runtime.go::LoadDaemonRuntimeConfig",

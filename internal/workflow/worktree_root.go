@@ -22,6 +22,7 @@ const CleanupRefusalWorktreeRootUnavailable = "worktree_root_unavailable"
 // WorktreePlacement resolves where gitmoot-created worktrees live for one resolved home.
 // Legacy (<home>/worktrees) is always recognised so existing worktrees keep their cleanup
 // identity; Root is where NEW worktrees are allocated (Legacy unless [worktrees] is configured).
+// [[worktrees.retired]] roots (#2763) are recognised for existing worktrees only, never allocated.
 type WorktreePlacement struct {
 	Home   string
 	Legacy string
@@ -56,9 +57,21 @@ func (p WorktreePlacement) DelegationPath(repo, parentJobID, delegationID string
 	return delegationWorktreePathUnder(p.Root, repo, parentJobID, delegationID, retryAttempt)
 }
 
-// UnderExternalRoot reports whether path is lexically inside the configured root.
-func (p WorktreePlacement) UnderExternalRoot(path string) bool {
-	return p.External() && pathWithin(p.config.Root, filepath.Clean(strings.TrimSpace(path)))
+// Retired lists the [[worktrees.retired]] roots. They identify EXISTING worktrees only (reopen,
+// cleanup, doctor accounting), each after PreflightWorktreeRoot; nothing is ever allocated there.
+func (p WorktreePlacement) Retired() []config.WorktreeRoot { return p.config.Retired }
+
+// existingRoots lists the non-legacy roots an existing worktree may sit under: the configured
+// root first, then every retired root. Each needs PreflightWorktreeRoot before a path under it
+// is trusted.
+func (p WorktreePlacement) existingRoots() []config.WorktreeRoot {
+	var roots []config.WorktreeRoot
+	if p.External() {
+		current := p.config
+		current.Retired = nil
+		roots = append(roots, current)
+	}
+	return append(roots, p.config.Retired...)
 }
 
 // Preflight proves the configured root is usable: it exists as a directory (gitmoot never creates
@@ -67,15 +80,21 @@ func (p WorktreePlacement) Preflight() error {
 	if !p.External() {
 		return nil
 	}
-	info, err := os.Stat(p.config.Root)
+	return PreflightWorktreeRoot(p.config)
+}
+
+// PreflightWorktreeRoot proves one configured or retired root is usable: it exists as a directory
+// and, with mount keys, sits on exactly that mount.
+func PreflightWorktreeRoot(root config.WorktreeRoot) error {
+	info, err := os.Stat(root.Root)
 	if err != nil {
-		return fmt.Errorf("%w: root %s: %v", ErrWorktreeRootUnavailable, p.config.Root, err)
+		return fmt.Errorf("%w: root %s: %v", ErrWorktreeRootUnavailable, root.Root, err)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("%w: root %s is not a directory", ErrWorktreeRootUnavailable, p.config.Root)
+		return fmt.Errorf("%w: root %s is not a directory", ErrWorktreeRootUnavailable, root.Root)
 	}
-	if p.config.HasMount() {
-		if _, err := verifyWorktreeMount(p.config); err != nil {
+	if root.HasMount() {
+		if _, err := verifyWorktreeMount(root); err != nil {
 			return fmt.Errorf("%w: %v", ErrWorktreeRootUnavailable, err)
 		}
 	}
@@ -101,17 +120,24 @@ func (p WorktreePlacement) PrepareParent(path string) error {
 	return nil
 }
 
-// PreflightWorktreePath refuses to reopen a recorded worktree under the configured root while that
-// root is unavailable. Paths outside it (the legacy layout, a task worktree) are not affected.
+// PreflightWorktreePath refuses to reopen a recorded worktree under the configured root, or under
+// a retired root, while that root is unavailable. Paths outside them (the legacy layout, a task
+// worktree) are not affected.
 func PreflightWorktreePath(home, path string) error {
 	placement, err := ResolveWorktreePlacement(home)
 	if err != nil {
 		return err
 	}
-	if !placement.UnderExternalRoot(path) {
-		return nil
+	path = filepath.Clean(strings.TrimSpace(path))
+	for _, root := range placement.existingRoots() {
+		if !pathWithin(root.Root, path) {
+			continue
+		}
+		if err := PreflightWorktreeRoot(root); err != nil {
+			return err
+		}
 	}
-	return placement.Preflight()
+	return nil
 }
 
 func pathWithin(root, path string) bool {
