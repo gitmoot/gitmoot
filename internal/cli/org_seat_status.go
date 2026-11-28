@@ -277,33 +277,51 @@ func buildOrgSeatStatus(
 		}
 
 		cutoff := now.Add(-24 * time.Hour)
+		seenReviews := make(map[string]struct{})
+		addReview := func(job db.Job, repo string, pr int) {
+			if _, dup := seenReviews[job.ID]; dup || !includeReviewRunInSeatStatus(job, cutoff) {
+				return
+			}
+			seenReviews[job.ID] = struct{}{}
+			var headSHA, decision, highestSeverity string
+			if payload, decErr := workflow.DecodeJobPayload(job); decErr == nil {
+				headSHA = strings.TrimSpace(payload.HeadSHA)
+				if payload.Result != nil {
+					decision = strings.TrimSpace(payload.Result.Decision)
+					highestSeverity = workflow.HighestOpenFindingSeverity(payload.Result)
+				}
+			}
+			out.Reviews.Items = append(out.Reviews.Items, orgSeatStatusReview{
+				RunID:           job.ID,
+				Repo:            repo,
+				PR:              pr,
+				HeadSHA:         headSHA,
+				State:           job.State,
+				Decision:        decision,
+				HighestSeverity: highestSeverity,
+			})
+		}
 		for _, ref := range reviewTargets {
 			jobs, err := store.ListReviewJobsForPullRequest(ctx, ref.Repo, int(ref.Number))
 			if err != nil {
 				return orgSeatStatusOutput{}, fmt.Errorf("list review runs for %s#%d: %w", ref.Repo, ref.Number, err)
 			}
 			for _, job := range jobs {
-				if !includeReviewRunInSeatStatus(job, cutoff) {
-					continue
-				}
-				var headSHA, decision, highestSeverity string
-				if payload, decErr := workflow.DecodeJobPayload(job); decErr == nil {
-					headSHA = strings.TrimSpace(payload.HeadSHA)
-					if payload.Result != nil {
-						decision = strings.TrimSpace(payload.Result.Decision)
-						highestSeverity = workflow.HighestOpenFindingSeverity(payload.Result)
-					}
-				}
-				out.Reviews.Items = append(out.Reviews.Items, orgSeatStatusReview{
-					RunID:           job.ID,
-					Repo:            ref.Repo,
-					PR:              int(ref.Number),
-					HeadSHA:         headSHA,
-					State:           job.State,
-					Decision:        decision,
-					HighestSeverity: highestSeverity,
-				})
+				addReview(job, ref.Repo, int(ref.Number))
 			}
+		}
+		// The role's own reviews count whatever the PR state: a post-merge
+		// (level 2) review runs on a merged PR, which the open-PR targets skip.
+		ownReviews, err := store.ListRecentReviewJobsByActingRole(ctx, role, cutoff.UTC().Format("2006-01-02"))
+		if err != nil {
+			return orgSeatStatusOutput{}, fmt.Errorf("list review runs for role %q: %w", role, err)
+		}
+		for _, job := range ownReviews {
+			payload, decErr := workflow.DecodeJobPayload(job)
+			if decErr != nil {
+				continue
+			}
+			addReview(job, strings.TrimSpace(payload.Repo), payload.PullRequest)
 		}
 
 		facts, err := store.ListAwaitedFacts(ctx, role, db.AwaitedFactStateWaiting)
