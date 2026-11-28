@@ -1455,13 +1455,18 @@ func declaredFindingState(wire reviewFindingWire) db.FindingState {
 }
 
 // HighestOpenFindingSeverity returns the highest canonical severity (P0 > P1 >
-// P2 > P3) among open findings in result, using the workflow's canonical
-// finding decoder (structured objects and bare strings) and declared open-state
-// rules (excluding answered, withdrawn, and superseded findings).
+// P2 > P3) among findings in result that the ledger would record as open: it
+// uses the canonical finding decoder (structured objects and bare strings) and
+// the ledger's effective state, so a declared answer with QUOTED evidence still
+// counts as open.
 func HighestOpenFindingSeverity(result *AgentResult) string {
 	if result == nil || len(result.Findings) == 0 {
 		return ""
 	}
+	// Run the ledger writer's own observation builder, as
+	// undischargeableDeclaredAnswers does, so a declared answer the ledger
+	// would reverse to OPEN (QUOTED evidence) still counts here.
+	payload := JobPayload{Result: result}
 	best := ""
 	bestRank := 0
 	for _, raw := range result.Findings {
@@ -1469,7 +1474,11 @@ func HighestOpenFindingSeverity(result *AgentResult) string {
 		if err != nil {
 			continue
 		}
-		if declaredFindingState(wire) != db.FindingOpen {
+		state := declaredFindingState(wire)
+		if obs, _, ok := (Engine{}).ledgerObservationWithDeclaredState(db.Job{}, payload, wire, "", ""); ok {
+			state = obs.State
+		}
+		if state != db.FindingOpen {
 			continue
 		}
 		sev := strings.ToUpper(strings.TrimSpace(wire.Severity))

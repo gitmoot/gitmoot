@@ -329,12 +329,12 @@ func buildOrgSeatStatus(
 	if len(wildcards) > 0 {
 		if len(scopeRepos) == 0 {
 			out.ReviewP2Issues.Note = fmt.Sprintf(
-				"wildcard scope (%s) matched no local known repositories (registered repos and role PR history); unregistered repositories are not searched",
+				"wildcard scope (%s) matched no locally known repository (registered repos and role PR history); repositories absent from both are not discovered through wildcards",
 				strings.Join(wildcards, ", "),
 			)
 		} else {
 			out.ReviewP2Issues.Note = fmt.Sprintf(
-				"wildcard scope (%s) expanded against local known repositories only (registered repos and role PR history); unregistered repositories are not searched",
+				"wildcard scope (%s) expanded against locally known repositories only (registered repos and role PR history); repositories absent from both are not discovered through wildcards",
 				strings.Join(wildcards, ", "),
 			)
 		}

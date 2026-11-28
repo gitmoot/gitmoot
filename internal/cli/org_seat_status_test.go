@@ -198,7 +198,7 @@ pane = "w1:p2"
 			Decision: "changes_requested",
 			Severity: "P1",
 			Findings: []json.RawMessage{
-				json.RawMessage(`{"id":"F1","severity":"P1","state":"answered","title":"fixed bug"}`),
+				json.RawMessage(`{"id":"F1","severity":"P1","state":"answered","file":"internal/cli/org_seat_status.go","line":10,"rationale":"fixed in head","title":"fixed bug"}`),
 				json.RawMessage(`{"id":"F2","severity":"P2","state":"open","title":"cleanup needed"}`),
 				json.RawMessage(`{"id":"F3","severity":"P3","state":"open","title":"nit"}`),
 			},
@@ -253,7 +253,8 @@ pane = "w1:p2"
 		WaiterRole:  "builder",
 		SubjectKind: db.AwaitedFactSubjectReviewVerdict,
 		SubjectKey:  key,
-		Deadline:    now.Add(6 * time.Hour),
+		// The store checks the deadline against the wall clock, not the stubbed now.
+		Deadline: time.Now().Add(6 * time.Hour),
 	}); err != nil {
 		t.Fatalf("subscribe awaited fact: %v", err)
 	}
@@ -409,13 +410,17 @@ func TestOrgSeatStatusJSONAndTable(t *testing.T) {
 		t.Fatalf("awaited_facts = %+v, want 1", got.AwaitedFacts)
 	}
 	// Local-only sections must not expose unreachable error fields in JSON.
-	var rawJSON map[string]map[string]any
-	if err := json.Unmarshal(jsonOut.Bytes(), &rawJSON); err == nil {
-		if _, has := rawJSON["reviews"]["error"]; has {
-			t.Fatalf("reviews JSON unexpectedly has error field: %v", rawJSON["reviews"])
+	var rawJSON map[string]json.RawMessage
+	if err := json.Unmarshal(jsonOut.Bytes(), &rawJSON); err != nil {
+		t.Fatalf("decode top-level JSON: %v", err)
+	}
+	for _, section := range []string{"reviews", "awaited_facts"} {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(rawJSON[section], &fields); err != nil {
+			t.Fatalf("decode %s section: %v (%s)", section, err, rawJSON[section])
 		}
-		if _, has := rawJSON["awaited_facts"]["error"]; has {
-			t.Fatalf("awaited_facts JSON unexpectedly has error field: %v", rawJSON["awaited_facts"])
+		if _, has := fields["error"]; has {
+			t.Fatalf("%s JSON unexpectedly has error field: %s", section, rawJSON[section])
 		}
 	}
 	if got.ReviewP2Issues.Error != "" || len(got.ReviewP2Issues.Items) != 1 {
@@ -689,7 +694,7 @@ pane = "w1:p3"
 	if len(got.ReviewP2Issues.Items) != 1 || got.ReviewP2Issues.Items[0].Number != 77 || got.ReviewP2Issues.Items[0].Repo != "acme/widget" {
 		t.Fatalf("review_p2_issues.items = %+v, want acme/widget#77", got.ReviewP2Issues.Items)
 	}
-	if !strings.Contains(got.ReviewP2Issues.Note, "acme/*") || !strings.Contains(got.ReviewP2Issues.Note, "unregistered") {
+	if !strings.Contains(got.ReviewP2Issues.Note, "acme/*") || !strings.Contains(got.ReviewP2Issues.Note, "not discovered through wildcards") {
 		t.Fatalf("review_p2_issues.note = %q, want wildcard discovery limit disclosure", got.ReviewP2Issues.Note)
 	}
 
@@ -762,7 +767,16 @@ func TestOrgSeatStatusSeverityRollupBareStringAndSuperseded(t *testing.T) {
 	createReview("job-rev-superseded-p1", 10, &workflow.AgentResult{
 		Decision: "changes_requested",
 		Findings: []json.RawMessage{
-			json.RawMessage(`{"id":"F1","severity":"P1","state":"superseded","title":"replaced by newer finding"}`),
+			json.RawMessage(`{"id":"F1","severity":"P1","state":"superseded","file":"internal/cli/org_seat_status.go","line":42,"rationale":"replaced by F2","title":"replaced by newer finding"}`),
+			json.RawMessage(`{"id":"F2","severity":"P2","state":"open","title":"still open"}`),
+		},
+	})
+	// Case 3: a P1 declared answered on QUOTED evidence stays open in the
+	// ledger, so it must still roll up as P1.
+	createReview("job-rev-quoted-answer-p1", 10, &workflow.AgentResult{
+		Decision: "changes_requested",
+		Findings: []json.RawMessage{
+			json.RawMessage(`{"id":"F1","severity":"P1","state":"answered","evidence_kind":"QUOTED","rationale":"looks fixed","title":"quoted answer"}`),
 			json.RawMessage(`{"id":"F2","severity":"P2","state":"open","title":"still open"}`),
 		},
 	})
@@ -792,6 +806,9 @@ func TestOrgSeatStatusSeverityRollupBareStringAndSuperseded(t *testing.T) {
 	}
 	if r, ok := byID["job-rev-superseded-p1"]; !ok || r.HighestSeverity != "P2" {
 		t.Fatalf("superseded-P1 + open-P2 review = %+v (found=%v), want HighestSeverity=P2", r, ok)
+	}
+	if r, ok := byID["job-rev-quoted-answer-p1"]; !ok || r.HighestSeverity != "P1" {
+		t.Fatalf("QUOTED-answered P1 + open-P2 review = %+v (found=%v), want HighestSeverity=P1", r, ok)
 	}
 }
 
