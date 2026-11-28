@@ -874,6 +874,8 @@ Usage of org interrupts:
 ```text
 Usage: gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]
 A handoff note that is a single flag-like word, such as --help or -x, is refused.
+For an agent:NAME binding whose old process has already exited, recycle resolves the pane from the seat's recorded identity or a unique unoccupied pane label; pass --pane ID if it cannot be proven.
+Model precedence: [org.roles.ROLE].model, then the model last recorded for the seat's session; warns and uses the runtime default if none is known.
 ```
 
 ## gitmoot org seat

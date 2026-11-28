@@ -3,11 +3,14 @@ package cockpit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/org"
@@ -311,27 +314,76 @@ func (p *herdrOrgProvider) Recycle(ctx context.Context, req org.RecycleRequest) 
 	pane := strings.TrimSpace(req.Pane)
 	kind := strings.TrimSpace(req.Kind)
 	agentName := strings.TrimSpace(req.AgentName)
-	if role == "" || pane == "" || kind == "" || agentName == "" || strings.TrimSpace(req.BootPrompt) == "" {
+	bootPrompt := sanitizeHerdrAgentArg(req.BootPrompt)
+	if role == "" || pane == "" || kind == "" || agentName == "" || bootPrompt == "" {
 		return fmt.Errorf("herdr recycle requires role, pane, kind, agent name, and boot prompt")
 	}
 	bounded, cancel := context.WithTimeout(ctx, herdrOrgRecycleDeadline)
 	defer cancel()
 	args := []string{"agent", "start", agentName, "--kind", kind, "--pane", pane, "--timeout", strconv.Itoa(herdrOrgRecycleTimeoutMS), "--"}
 	// Herdr snapshots do not expose the running model, so this can enforce the
-	// configured pin at recycle but cannot detect live-vs-pinned drift until
-	// Herdr provides that signal. Only inject --model for kinds gitmoot has
-	// verified support it (its own codex/claude/kimi runtimes) — herdr's other
-	// ~18 agent kinds are unverified and a rejected flag would break recycle
-	// outright, so an unsupported kind silently ignores the pin.
-	if model := strings.TrimSpace(req.Model); model != "" && herdrKindSupportsModelFlag(kind) {
+	// configured or last-recorded model at recycle. Only inject --model for
+	// kinds gitmoot has verified support it (its own codex/claude/kimi/omp
+	// runtimes) — herdr's other ~18 agent kinds are unverified and a rejected
+	// flag would break recycle outright, so an unsupported kind silently ignores
+	// the pin.
+	if model := sanitizeHerdrAgentArg(req.Model); model != "" && herdrKindSupportsModelFlag(kind) {
 		args = append(args, "--model", model)
 	}
-	args = append(args, req.BootPrompt)
+	args = append(args, bootPrompt)
 	_, err := p.run(bounded, args...)
 	if err != nil {
-		return fmt.Errorf("herdr agent start for org role %q (pane %q must already be at an interactive shell prompt): %w", role, pane, err)
+		err = wrapHerdrExitStderr(err)
+		return fmt.Errorf("herdr agent start for org role %q (pane %q must already be at an interactive shell prompt; command: %s): %w", role, pane, formatHerdrCommand(args), err)
 	}
 	return nil
+}
+
+// sanitizeHerdrAgentArg removes Unicode control characters (including newlines,
+// carriage returns, and tabs) from an `AGENT_ARG` passed to `herdr agent start`.
+// Herdr rejects any agent argument containing `char::is_control` because it
+// types the launch argv into the target pane's interactive shell PTY (#2767).
+func sanitizeHerdrAgentArg(value string) string {
+	rawLines := strings.FieldsFunc(value, func(r rune) bool {
+		return r == '\n' || r == '\r'
+	})
+	lines := make([]string, 0, len(rawLines))
+	for _, line := range rawLines {
+		cleaned := strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) {
+				return ' '
+			}
+			return r
+		}, line)
+		cleaned = strings.Join(strings.Fields(cleaned), " ")
+		if cleaned != "" {
+			lines = append(lines, cleaned)
+		}
+	}
+	return strings.Join(lines, "; ")
+}
+
+func wrapHerdrExitStderr(err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" && !strings.Contains(err.Error(), stderr) {
+			return fmt.Errorf("%w: %s", err, stderr)
+		}
+	}
+	return err
+}
+
+func formatHerdrCommand(args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, "herdr")
+	for _, arg := range args {
+		if arg == "" || strings.ContainsAny(arg, " \t\n\r\"'\\") {
+			parts = append(parts, strconv.Quote(arg))
+		} else {
+			parts = append(parts, arg)
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // herdrKindSupportsModelFlag reports whether the named herdr agent kind's CLI

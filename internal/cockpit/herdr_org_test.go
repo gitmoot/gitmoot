@@ -378,37 +378,37 @@ func TestHerdrOrgProviderRecycleCommand(t *testing.T) {
 		{
 			name: "unpinned preserves command",
 			kind: "codex",
-			want: []string{"agent", "start", "owner", "--kind", "codex", "--pane", "w1:p2", "--timeout", "30000", "--", "role: owner\n\nhandoff: ship it"},
+			want: []string{"agent", "start", "owner", "--kind", "codex", "--pane", "w1:p2", "--timeout", "30000", "--", "role: owner; handoff: ship it"},
 		},
 		{
 			name:  "pinned model precedes boot prompt",
 			kind:  "codex",
 			model: "sonnet",
-			want:  []string{"agent", "start", "owner", "--kind", "codex", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "sonnet", "role: owner\n\nhandoff: ship it"},
+			want:  []string{"agent", "start", "owner", "--kind", "codex", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "sonnet", "role: owner; handoff: ship it"},
 		},
 		{
 			name:  "pinned model trims stray whitespace",
 			kind:  "claude",
 			model: "  sonnet  ",
-			want:  []string{"agent", "start", "owner", "--kind", "claude", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "sonnet", "role: owner\n\nhandoff: ship it"},
+			want:  []string{"agent", "start", "owner", "--kind", "claude", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "sonnet", "role: owner; handoff: ship it"},
 		},
 		{
 			name:  "pinned model applies for kimi",
 			kind:  "kimi",
 			model: "k2",
-			want:  []string{"agent", "start", "owner", "--kind", "kimi", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "k2", "role: owner\n\nhandoff: ship it"},
+			want:  []string{"agent", "start", "owner", "--kind", "kimi", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "k2", "role: owner; handoff: ship it"},
 		},
 		{
 			name:  "pinned model applies for omp",
 			kind:  "omp",
 			model: "claude-opus-5",
-			want:  []string{"agent", "start", "owner", "--kind", "omp", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "claude-opus-5", "role: owner\n\nhandoff: ship it"},
+			want:  []string{"agent", "start", "owner", "--kind", "omp", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "claude-opus-5", "role: owner; handoff: ship it"},
 		},
 		{
 			name:  "pinned model ignored for an unverified kind",
 			kind:  "gemini",
 			model: "sonnet",
-			want:  []string{"agent", "start", "owner", "--kind", "gemini", "--pane", "w1:p2", "--timeout", "30000", "--", "role: owner\n\nhandoff: ship it"},
+			want:  []string{"agent", "start", "owner", "--kind", "gemini", "--pane", "w1:p2", "--timeout", "30000", "--", "role: owner; handoff: ship it"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -440,7 +440,7 @@ func TestHerdrOrgProviderRecycleFailureIsActionable(t *testing.T) {
 		return "", errors.New("pane is not at shell")
 	}, []config.OrgRole{{Name: "owner"}}, time.Now)
 	err := provider.Recycle(context.Background(), org.RecycleRequest{Role: "owner", Pane: "w1:p2", Kind: "codex", AgentName: "owner", BootPrompt: "brief"})
-	if err == nil || !strings.Contains(err.Error(), "interactive shell prompt") || !strings.Contains(err.Error(), "pane is not at shell") {
+	if err == nil || !strings.Contains(err.Error(), "interactive shell prompt") || !strings.Contains(err.Error(), "pane is not at shell") || !strings.Contains(err.Error(), "herdr agent start owner --kind codex --pane w1:p2") {
 		t.Fatalf("Recycle() error = %v", err)
 	}
 }

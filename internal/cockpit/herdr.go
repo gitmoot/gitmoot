@@ -3,6 +3,7 @@ package cockpit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -27,6 +28,14 @@ func newExecRunner(bin string) runner {
 		// herdr resolves the same socket the reachability check used.
 		cmd.Env = os.Environ()
 		out, err := cmd.Output()
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+					return string(out), fmt.Errorf("%w: %s", err, stderr)
+				}
+			}
+		}
 		return string(out), err
 	}
 }
