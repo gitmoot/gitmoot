@@ -523,21 +523,9 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 	// already accepts alternates for prose (#1928) and locators (#1936); state and
 	// identity were the last two fields with exactly one accepted spelling, and
 	// they are the two that decide whether an answer counts as one.
-	declared := db.FindingState(strings.ToLower(firstNonEmptyLedgerText(
-		strings.TrimSpace(wire.State), strings.TrimSpace(wire.Disposition))))
+	declared := declaredFindingState(wire)
 	obs.ContinuesUID = continuationUID(wire, declared)
-	switch declared {
-	case db.FindingAnswered:
-		obs.State = db.FindingAnswered
-	case db.FindingWithdrawn:
-		obs.State = db.FindingWithdrawn
-	case db.FindingSuperseded:
-		obs.State = db.FindingSuperseded
-	default:
-		// A REPORTED FINDING IS OPEN. Silence is never an answer, so an omitted
-		// state can only mean the finding stands.
-		obs.State = db.FindingOpen
-	}
+	obs.State = declared
 	// The reviewer's word, kept beside the state the evidence rules below may
 	// downgrade (#2566): the gate reads State, the design-notes sweep reads
 	// this, so a declared answer the gate still counts open is not filed as an
@@ -1449,6 +1437,52 @@ func isPromptHostileControl(r rune) bool {
 		return false
 	}
 	return r < 0x20 || r == 0x7f
+}
+
+// declaredFindingState resolves a decoded wire finding's effective state using
+// the canonical precedence (`state` before `disposition`, defaulting to open).
+func declaredFindingState(wire reviewFindingWire) db.FindingState {
+	declared := db.FindingState(strings.ToLower(firstNonEmptyLedgerText(
+		strings.TrimSpace(wire.State), strings.TrimSpace(wire.Disposition))))
+	switch declared {
+	case db.FindingAnswered, db.FindingWithdrawn, db.FindingSuperseded:
+		return declared
+	default:
+		// A REPORTED FINDING IS OPEN. Silence is never an answer, so an omitted
+		// state can only mean the finding stands.
+		return db.FindingOpen
+	}
+}
+
+// HighestOpenFindingSeverity returns the highest canonical severity (P0 > P1 >
+// P2 > P3) among open findings in result, using the workflow's canonical
+// finding decoder (structured objects and bare strings) and declared open-state
+// rules (excluding answered, withdrawn, and superseded findings).
+func HighestOpenFindingSeverity(result *AgentResult) string {
+	if result == nil || len(result.Findings) == 0 {
+		return ""
+	}
+	best := ""
+	bestRank := 0
+	for _, raw := range result.Findings {
+		wire, err := decodeReviewFinding(raw)
+		if err != nil {
+			continue
+		}
+		if declaredFindingState(wire) != db.FindingOpen {
+			continue
+		}
+		sev := strings.ToUpper(strings.TrimSpace(wire.Severity))
+		rank, ok := reviewseverity.Rank(sev)
+		if !ok {
+			continue
+		}
+		if best == "" || rank < bestRank {
+			best = sev
+			bestRank = rank
+		}
+	}
+	return best
 }
 
 // continuationUID decides whether a reviewer's `uid` names a finding it is

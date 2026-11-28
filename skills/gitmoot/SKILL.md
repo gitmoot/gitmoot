@@ -375,7 +375,10 @@ gitmoot org await list
 - `org seat status` is a read-only, one-call snapshot for a seat after waking
   or compaction: its open PRs (head, recorded review level, CI rollup, merge
   state), active or last-24h review runs, waiting awaited facts, and open
-  `review-p2` issues labelled `agent:<role>` in its scope repos.
+  `review-p2` issues labelled `agent:<role>` in its scope repos. It opens the
+  local store read-only (never creating `gitmoot.db` if absent; local sections
+  return empty with a note), and expands wildcard scopes (`org/*`, `*`) against
+  local known repositories while disclosing that discovery limit in a note.
 - `message escalate` asks a question of a role above or below you on the
   chart: your parent by default, or the role given with `--to`. Questions to a
   role on another branch are refused. The asker or the addressed role closes it

@@ -20,6 +20,17 @@ const (
 	postMergeIssueTitleMax            = 200
 )
 
+// PostMergeReviewP2IssueLabels returns the canonical GitHub issue labels used
+// when filing and querying post-merge P2 follow-up issues for an org role.
+func PostMergeReviewP2IssueLabels(role string) []string {
+	role = strings.TrimSpace(role)
+	agentLabel := postMergeUnassignedAgentLabel
+	if role != "" {
+		agentLabel = "agent:" + role
+	}
+	return []string{postMergeIssueLabel, agentLabel}
+}
+
 type postMergeFinding struct {
 	uid      string
 	severity string
@@ -73,10 +84,7 @@ func (e Engine) handlePostMergeReview(ctx context.Context, job db.Job, payload J
 	}
 
 	var urls []string
-	agentLabel := postMergeUnassignedAgentLabel
-	if role != "" {
-		agentLabel = "agent:" + role
-	}
+	issueLabels := PostMergeReviewP2IssueLabels(role)
 	for _, finding := range followups {
 		if e.PostMergeFollowUpIssue == nil {
 			e.addPostMergeEvent(ctx, job.ID, postMergeFollowupErrorEvent, "issue hook not wired")
@@ -88,7 +96,7 @@ func (e Engine) handlePostMergeReview(ctx context.Context, job db.Job, payload J
 		}
 		body := fmt.Sprintf("Post-merge review found a P2 finding in %s.\n\n- Pull request: #%d\n- Merged head: `%s`\n- Review job: `%s`\n- Severity: %s\n- Location: %s\n\n%s\n\nFix within a few days.\n\nfinding-uid: %s\n",
 			payload.Repo, payload.PullRequest, payload.HeadSHA, job.ID, finding.severity, finding.location, finding.detail, finding.uid)
-		url, err := e.PostMergeFollowUpIssue(ctx, payload.Repo, title, body, []string{postMergeIssueLabel, agentLabel})
+		url, err := e.PostMergeFollowUpIssue(ctx, payload.Repo, title, body, issueLabels)
 		if err != nil {
 			e.addPostMergeEvent(ctx, job.ID, postMergeFollowupErrorEvent, "P2 issue "+finding.uid+": "+err.Error())
 			continue

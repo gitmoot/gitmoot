@@ -23,13 +23,14 @@ import (
 )
 
 type fakeOrgSeatStatusGitHub struct {
-	pulls    map[string]github.PullRequest
-	pullErr  error
-	checks   map[string][]github.PullRequestCheck
-	checkErr error
-	issues   map[string][]github.Issue
-	issueErr error
-	getCalls []string
+	pulls         map[string]github.PullRequest
+	pullErr       error
+	checks        map[string][]github.PullRequestCheck
+	checkErr      error
+	checkErrByKey map[string]error
+	issues        map[string][]github.Issue
+	issueErr      error
+	getCalls      []string
 }
 
 func (f *fakeOrgSeatStatusGitHub) ListPullRequests(_ context.Context, repo github.Repository, state string) ([]github.PullRequest, error) {
@@ -62,10 +63,14 @@ func (f *fakeOrgSeatStatusGitHub) GetPullRequest(_ context.Context, repo github.
 }
 
 func (f *fakeOrgSeatStatusGitHub) ListPullRequestChecks(_ context.Context, repo github.Repository, number int64) ([]github.PullRequestCheck, error) {
+	key := fmt.Sprintf("%s#%d", repo.FullName(), number)
+	if err := f.checkErrByKey[key]; err != nil {
+		return nil, err
+	}
 	if f.checkErr != nil {
 		return nil, f.checkErr
 	}
-	return f.checks[fmt.Sprintf("%s#%d", repo.FullName(), number)], nil
+	return f.checks[key], nil
 }
 
 func (f *fakeOrgSeatStatusGitHub) ListOpenIssuesWithLabels(_ context.Context, repo github.Repository, labels []string) ([]github.Issue, error) {
@@ -270,6 +275,34 @@ pane = "w1:p2"
 	return home
 }
 
+type seatStatusJSON struct {
+	Role         string `json:"role"`
+	GeneratedAt  string `json:"generated_at"`
+	Note         string `json:"note"`
+	PullRequests struct {
+		Items []struct {
+			Repo             string           `json:"repo"`
+			PR               int              `json:"pr"`
+			HeadSHA          string           `json:"head_sha"`
+			ReviewLevel      string           `json:"review_level"`
+			CI               *orgSeatStatusCI `json:"ci"`
+			MergeStateStatus string           `json:"merge_state_status"`
+		} `json:"items"`
+		Error string `json:"error"`
+	} `json:"pull_requests"`
+	Reviews struct {
+		Items []orgSeatStatusReview `json:"items"`
+	} `json:"reviews"`
+	AwaitedFacts struct {
+		Items []db.AwaitedFact `json:"items"`
+	} `json:"awaited_facts"`
+	ReviewP2Issues struct {
+		Items []orgSeatStatusP2Issue `json:"items"`
+		Note  string                 `json:"note"`
+		Error string                 `json:"error"`
+	} `json:"review_p2_issues"`
+}
+
 func TestOrgSeatStatusJSONAndTable(t *testing.T) {
 	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
 	home := setupOrgSeatStatusFixture(t, now)
@@ -324,7 +357,7 @@ func TestOrgSeatStatusJSONAndTable(t *testing.T) {
 		t.Fatalf("org seat status --json exit=%d stderr=%s", code, jsonErr.String())
 	}
 
-	var got orgSeatStatusOutput
+	var got seatStatusJSON
 	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal json: %v\n%s", err, jsonOut.String())
 	}
@@ -345,19 +378,21 @@ func TestOrgSeatStatusJSONAndTable(t *testing.T) {
 	if got.PullRequests.Items[0].PR != 10 ||
 		got.PullRequests.Items[0].HeadSHA != "1111111222222233333334444444555555566666" ||
 		got.PullRequests.Items[0].ReviewLevel != reviewlevel.LevelRequired ||
-		got.PullRequests.Items[0].CI != (orgSeatStatusCI{Passed: 2, Pending: 0, Failed: 1}) ||
+		got.PullRequests.Items[0].CI == nil ||
+		*got.PullRequests.Items[0].CI != (orgSeatStatusCI{Passed: 2, Pending: 0, Failed: 1}) ||
 		got.PullRequests.Items[0].MergeStateStatus != "CLEAN" {
 		t.Fatalf("PR #10 = %+v", got.PullRequests.Items[0])
 	}
 	if got.PullRequests.Items[1].PR != 12 ||
 		got.PullRequests.Items[1].ReviewLevel != "unrecorded" ||
-		got.PullRequests.Items[1].CI != (orgSeatStatusCI{Passed: 0, Pending: 1, Failed: 0}) ||
+		got.PullRequests.Items[1].CI == nil ||
+		*got.PullRequests.Items[1].CI != (orgSeatStatusCI{Passed: 0, Pending: 1, Failed: 0}) ||
 		got.PullRequests.Items[1].MergeStateStatus != "BLOCKED" {
 		t.Fatalf("PR #12 = %+v", got.PullRequests.Items[1])
 	}
 
 	// Reviews: PR #10 recent (P1 answered -> highest P2) + PR #12 running. Old #10 and closed #11 excluded.
-	if got.Reviews.Error != "" || len(got.Reviews.Items) != 2 {
+	if len(got.Reviews.Items) != 2 {
 		t.Fatalf("reviews = %+v, want 2", got.Reviews)
 	}
 	if got.Reviews.Items[0].RunID != "job-rev-10-recent" ||
@@ -370,8 +405,18 @@ func TestOrgSeatStatusJSONAndTable(t *testing.T) {
 		t.Fatalf("review[1] = %+v", got.Reviews.Items[1])
 	}
 
-	if got.AwaitedFacts.Error != "" || len(got.AwaitedFacts.Items) != 1 {
+	if len(got.AwaitedFacts.Items) != 1 {
 		t.Fatalf("awaited_facts = %+v, want 1", got.AwaitedFacts)
+	}
+	// Local-only sections must not expose unreachable error fields in JSON.
+	var rawJSON map[string]map[string]any
+	if err := json.Unmarshal(jsonOut.Bytes(), &rawJSON); err == nil {
+		if _, has := rawJSON["reviews"]["error"]; has {
+			t.Fatalf("reviews JSON unexpectedly has error field: %v", rawJSON["reviews"])
+		}
+		if _, has := rawJSON["awaited_facts"]["error"]; has {
+			t.Fatalf("awaited_facts JSON unexpectedly has error field: %v", rawJSON["awaited_facts"])
+		}
 	}
 	if got.ReviewP2Issues.Error != "" || len(got.ReviewP2Issues.Items) != 1 {
 		t.Fatalf("review_p2_issues = %+v, want 1", got.ReviewP2Issues)
@@ -493,5 +538,323 @@ func TestOrgSeatStatusGitHubFailureStillRendersLocalSectionsAndExitsZero(t *test
 	out := stdout.String()
 	if !strings.Contains(out, "error: ") || !strings.Contains(out, "job-rev-10-recent") || !strings.Contains(out, "Awaited Facts (waiting)") {
 		t.Fatalf("table output missing error or local sections:\n%s", out)
+	}
+}
+
+func TestOrgSeatStatusMissingDatabaseDoesNotCreateDB(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	orgTOML := `
+[org]
+enforce = "warn"
+
+[org.roles."owner"]
+display_name = "Owner"
+scope = ["*"]
+merge_rule = "owner"
+pane = "w1:p1"
+
+[org.roles."builder"]
+display_name = "Builder"
+parent = "owner"
+scope = ["acme/widget"]
+merge_rule = "self"
+pane = "w1:p2"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(strings.TrimSpace(orgTOML)+"\n"), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+	stubOrgSeatStatus(t, &fakeOrgSeatStatusGitHub{}, now)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "seat", "status", "--role", "builder", "--json", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("missing DB exit=%d want 0, stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Stat(paths.Database); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only org seat status created database %s (stat err=%v)", paths.Database, err)
+	}
+
+	var got seatStatusJSON
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal json: %v\n%s", err, stdout.String())
+	}
+	if got.Note == "" {
+		t.Fatalf("expected note explaining missing local database, got empty note")
+	}
+	if len(got.PullRequests.Items) != 0 || len(got.Reviews.Items) != 0 || len(got.AwaitedFacts.Items) != 0 {
+		t.Fatalf("expected empty local sections when DB is missing, got %+v", got)
+	}
+
+	// Table output also surfaces the note and leaves no DB behind.
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "seat", "status", "--role", "builder", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("missing DB table exit=%d want 0, stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "note: ") {
+		t.Fatalf("table output missing note:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(paths.Database); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("table run created database %s (stat err=%v)", paths.Database, err)
+	}
+
+	// Hub client guard must still refuse without creating gitmoot.db.
+	clientTOML := orgTOML + "\n[client]\nhub = \"https://127.0.0.1:8790\"\ncerts = \"/tmp/certs\"\nname = \"builder-client\"\n"
+	if err := os.WriteFile(paths.ConfigFile, []byte(strings.TrimSpace(clientTOML)+"\n"), 0o600); err != nil {
+		t.Fatalf("write client config.toml: %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "seat", "status", "--role", "builder", "--home", home}, &stdout, &stderr); code != 1 {
+		t.Fatalf("hub client home exit=%d want 1, stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "hub client") {
+		t.Fatalf("hub client stderr=%q, want hub client error", stderr.String())
+	}
+	if _, err := os.Stat(paths.Database); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("hub client run created database %s (stat err=%v)", paths.Database, err)
+	}
+}
+
+func TestOrgSeatStatusWildcardScopeExpandsKnownRepos(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	orgTOML := `
+[org]
+enforce = "warn"
+
+[org.roles."owner"]
+display_name = "Owner"
+scope = ["*"]
+merge_rule = "owner"
+pane = "w1:p1"
+
+[org.roles."acme-lead"]
+display_name = "Acme Lead"
+parent = "owner"
+scope = ["acme/*"]
+merge_rule = "self"
+pane = "w1:p2"
+
+[org.roles."empty-wild"]
+display_name = "Empty Wild"
+parent = "owner"
+scope = ["other/*"]
+merge_rule = "self"
+pane = "w1:p3"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(strings.TrimSpace(orgTOML)+"\n"), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "acme", Name: "widget", Enabled: true}); err != nil {
+		t.Fatalf("upsert repo: %v", err)
+	}
+	_ = store.Close()
+
+	gh := &fakeOrgSeatStatusGitHub{
+		issues: map[string][]github.Issue{
+			"acme/widget|review-p2,agent:acme-lead": {
+				{
+					Number:    77,
+					Title:     "Cleanup wildcard match",
+					State:     "open",
+					CreatedAt: now.Add(-48 * time.Hour).Format(time.RFC3339),
+				},
+			},
+		},
+	}
+	stubOrgSeatStatus(t, gh, now)
+
+	// acme/* expands to registered acme/widget and discloses local-only discovery limit.
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "seat", "status", "--role", "acme-lead", "--json", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("wildcard acme/* exit=%d stderr=%q", code, stderr.String())
+	}
+	var got seatStatusJSON
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal json: %v\n%s", err, stdout.String())
+	}
+	if len(got.ReviewP2Issues.Items) != 1 || got.ReviewP2Issues.Items[0].Number != 77 || got.ReviewP2Issues.Items[0].Repo != "acme/widget" {
+		t.Fatalf("review_p2_issues.items = %+v, want acme/widget#77", got.ReviewP2Issues.Items)
+	}
+	if !strings.Contains(got.ReviewP2Issues.Note, "acme/*") || !strings.Contains(got.ReviewP2Issues.Note, "unregistered") {
+		t.Fatalf("review_p2_issues.note = %q, want wildcard discovery limit disclosure", got.ReviewP2Issues.Note)
+	}
+
+	// Wildcard matching no known repos discloses the unsearched scope instead of reporting empty "(none)".
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "seat", "status", "--role", "empty-wild", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("unmatched wildcard exit=%d stderr=%q", code, stderr.String())
+	}
+	table := stdout.String()
+	idx := strings.Index(table, "Open review-p2 Issues")
+	if idx < 0 {
+		t.Fatalf("missing Open review-p2 Issues section:\n%s", table)
+	}
+	p2Section := table[idx:]
+	if !strings.Contains(p2Section, "note: ") || !strings.Contains(p2Section, "other/*") {
+		t.Fatalf("expected wildcard note in P2 section, got:\n%s", p2Section)
+	}
+	if strings.Contains(p2Section, "(none)") {
+		t.Fatalf("unmatched wildcard should not render (none) as if searched empty:\n%s", p2Section)
+	}
+}
+
+func TestOrgSeatStatusSeverityRollupBareStringAndSuperseded(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	home := setupOrgSeatStatusFixture(t, now)
+
+	store, err := db.OpenAlreadyMigrated(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite", config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	defer rawDB.Close()
+
+	createReview := func(id string, pr int, result *workflow.AgentResult) {
+		t.Helper()
+		raw, err := json.Marshal(workflow.JobPayload{
+			Repo:        "acme/widget",
+			PullRequest: pr,
+			HeadSHA:     "1111111222222233333334444444555555566666",
+			Result:      result,
+		})
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		ts := now.Add(-1 * time.Hour).Format(time.RFC3339)
+		if err := store.CreateJob(ctx, db.Job{
+			ID: id, Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded),
+			Payload: string(raw), CreatedAt: ts, UpdatedAt: ts,
+		}); err != nil {
+			t.Fatalf("create job %s: %v", id, err)
+		}
+		if _, err := rawDB.ExecContext(ctx, `UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`, ts, ts, id); err != nil {
+			t.Fatalf("update timestamps %s: %v", id, err)
+		}
+	}
+
+	// Case 1: bare-string P1 finding must be decoded and rolled up as P1.
+	createReview("job-rev-bare-p1", 10, &workflow.AgentResult{
+		Decision: "changes_requested",
+		Findings: []json.RawMessage{
+			json.RawMessage(`"P1 internal/cli/org_seat_status.go:42 nil pointer dereference"`),
+		},
+	})
+	// Case 2: superseded P1 alongside open P2 must roll up as P2 (not P1).
+	createReview("job-rev-superseded-p1", 10, &workflow.AgentResult{
+		Decision: "changes_requested",
+		Findings: []json.RawMessage{
+			json.RawMessage(`{"id":"F1","severity":"P1","state":"superseded","title":"replaced by newer finding"}`),
+			json.RawMessage(`{"id":"F2","severity":"P2","state":"open","title":"still open"}`),
+		},
+	})
+	_ = store.Close()
+
+	gh := &fakeOrgSeatStatusGitHub{
+		pulls: map[string]github.PullRequest{
+			"acme/widget#10": {Number: 10, State: "open", HeadSHA: "1111111222222233333334444444555555566666", MergeableState: "clean"},
+		},
+	}
+	stubOrgSeatStatus(t, gh, now)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "seat", "status", "--role", "builder", "--json", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("severity rollup exit=%d stderr=%q", code, stderr.String())
+	}
+	var got orgSeatStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal json: %v\n%s", err, stdout.String())
+	}
+	byID := make(map[string]orgSeatStatusReview, len(got.Reviews.Items))
+	for _, r := range got.Reviews.Items {
+		byID[r.RunID] = r
+	}
+	if r, ok := byID["job-rev-bare-p1"]; !ok || r.HighestSeverity != "P1" {
+		t.Fatalf("bare-string P1 review = %+v (found=%v), want HighestSeverity=P1", r, ok)
+	}
+	if r, ok := byID["job-rev-superseded-p1"]; !ok || r.HighestSeverity != "P2" {
+		t.Fatalf("superseded-P1 + open-P2 review = %+v (found=%v), want HighestSeverity=P2", r, ok)
+	}
+}
+
+func TestOrgSeatStatusFailedCILookupRendersUnavailable(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	home := setupOrgSeatStatusFixture(t, now)
+	gh := &fakeOrgSeatStatusGitHub{
+		pulls: map[string]github.PullRequest{
+			"acme/widget#10": {Number: 10, State: "open", HeadSHA: "1111111222222233333334444444555555566666", MergeableState: "clean"},
+			"acme/widget#12": {Number: 12, State: "open", HeadSHA: "9999999888888877777776666666555555544444", MergeableState: "blocked"},
+		},
+		checkErrByKey: map[string]error{
+			"acme/widget#10": errors.New("checks API 502"),
+		},
+		checks: map[string][]github.PullRequestCheck{
+			"acme/widget#12": {}, // successful lookup with 0 checks
+		},
+	}
+	stubOrgSeatStatus(t, gh, now)
+
+	var jsonOut, jsonErr bytes.Buffer
+	if code := Run([]string{"org", "seat", "status", "--role", "builder", "--json", "--home", home}, &jsonOut, &jsonErr); code != 0 {
+		t.Fatalf("json exit=%d stderr=%q", code, jsonErr.String())
+	}
+	var got seatStatusJSON
+	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal json: %v\n%s", err, jsonOut.String())
+	}
+	if len(got.PullRequests.Items) != 2 {
+		t.Fatalf("pull_requests.items = %+v, want 2", got.PullRequests.Items)
+	}
+	if got.PullRequests.Items[0].PR != 10 || got.PullRequests.Items[0].CI != nil {
+		t.Fatalf("PR #10 with failed checks should have nil CI in JSON, got %+v", got.PullRequests.Items[0])
+	}
+	if got.PullRequests.Items[1].PR != 12 || got.PullRequests.Items[1].CI == nil || *got.PullRequests.Items[1].CI != (orgSeatStatusCI{}) {
+		t.Fatalf("PR #12 with successful 0 checks should have zero-count CI, got %+v", got.PullRequests.Items[1])
+	}
+
+	var tableOut, tableErr bytes.Buffer
+	if code := Run([]string{"org", "seat", "status", "--role", "builder", "--home", home}, &tableOut, &tableErr); code != 0 {
+		t.Fatalf("table exit=%d stderr=%q", code, tableErr.String())
+	}
+	table := tableOut.String()
+	var sawPR10, sawPR12 bool
+	for _, line := range strings.Split(table, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "acme/widget") {
+			continue
+		}
+		if strings.Contains(trimmed, "#10") {
+			sawPR10 = true
+			if !strings.Contains(trimmed, "unavailable") || strings.Contains(trimmed, "0 pass/0 pend/0 fail") {
+				t.Fatalf("PR #10 row should render unavailable (not 0/0/0): %q", line)
+			}
+		}
+		if strings.Contains(trimmed, "#12") {
+			sawPR12 = true
+			if !strings.Contains(trimmed, "0 pass/0 pend/0 fail") {
+				t.Fatalf("PR #12 row with successful 0 checks should render 0 pass/0 pend/0 fail: %q", line)
+			}
+		}
+	}
+	if !sawPR10 || !sawPR12 {
+		t.Fatalf("expected both PR #10 and PR #12 rows in table:\n%s", table)
 	}
 }

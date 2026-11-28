@@ -675,10 +675,32 @@ func (c *GhClient) ListRecentClosedPullRequests(ctx context.Context, repo Reposi
 // so the result is filtered down to plain issues here (IsPullRequest == true is
 // dropped) to keep the issue-comment watcher from duplicating the PR-watcher.
 func (c *GhClient) ListIssues(ctx context.Context, repo Repository, state string) ([]Issue, error) {
+	return c.listIssues(ctx, repo, state, nil)
+}
+
+// ListOpenIssuesWithLabels returns open non-PR issues in repo carrying all
+// specified labels.
+func (c *GhClient) ListOpenIssuesWithLabels(ctx context.Context, repo Repository, labels []string) ([]Issue, error) {
+	if strings.TrimSpace(repo.FullName()) == "" {
+		return nil, fmt.Errorf("repository owner/name is required")
+	}
+	return c.listIssues(ctx, repo, "open", labels)
+}
+
+func (c *GhClient) listIssues(ctx context.Context, repo Repository, state string, labels []string) ([]Issue, error) {
 	if state == "" {
 		state = "open"
 	}
 	args := []string{"-X", "GET", endpoint(repo, "issues"), "-f", "state=" + state}
+	cleaned := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if trimmed := strings.TrimSpace(label); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	if len(cleaned) > 0 {
+		args = append(args, "-f", "labels="+strings.Join(cleaned, ","))
+	}
 	var issues []Issue
 	var err error
 	if conditionalEnabled() {
@@ -692,36 +714,6 @@ func (c *GhClient) ListIssues(ctx context.Context, repo Repository, state string
 	} else {
 		issues, err = apiPaginatedJSON[Issue](ctx, c, args...)
 	}
-	if err != nil {
-		return nil, err
-	}
-	filtered := make([]Issue, 0, len(issues))
-	for _, issue := range issues {
-		if issue.IsPullRequest {
-			continue
-		}
-		filtered = append(filtered, issue)
-	}
-	return filtered, nil
-}
-
-// ListOpenIssuesWithLabels returns open non-PR issues in repo carrying all
-// specified labels.
-func (c *GhClient) ListOpenIssuesWithLabels(ctx context.Context, repo Repository, labels []string) ([]Issue, error) {
-	if strings.TrimSpace(repo.FullName()) == "" {
-		return nil, fmt.Errorf("repository owner/name is required")
-	}
-	cleaned := make([]string, 0, len(labels))
-	for _, label := range labels {
-		if trimmed := strings.TrimSpace(label); trimmed != "" {
-			cleaned = append(cleaned, trimmed)
-		}
-	}
-	args := []string{"-X", "GET", endpoint(repo, "issues"), "-f", "state=open"}
-	if len(cleaned) > 0 {
-		args = append(args, "-f", "labels="+strings.Join(cleaned, ","))
-	}
-	issues, err := apiPaginatedJSON[Issue](ctx, c, args...)
 	if err != nil {
 		return nil, err
 	}

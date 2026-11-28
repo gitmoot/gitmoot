@@ -428,6 +428,27 @@ func TestListIssuesFiltersOutPullRequests(t *testing.T) {
 	runner.wantArgs(t, 0, "api", "-i", "-X", "GET", "repos/gitmoot/gitmoot/issues", "-f", "state=open", "-f", "per_page=100")
 }
 
+func TestListOpenIssuesWithLabelsSharesListIssuesPath(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `[
+				{"number":51,"title":"Batch cleanup","state":"open","created_at":"2026-11-25T10:00:00Z"},
+				{"number":52,"title":"PR with same labels","state":"open","pull_request":{"url":"https://api.github.com/repos/gitmoot/gitmoot/pulls/52"}}
+			]`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	issues, err := client.ListOpenIssuesWithLabels(context.Background(), Repository{Owner: "gitmoot", Name: "gitmoot"}, []string{" review-p2 ", "", "agent:builder"})
+	if err != nil {
+		t.Fatalf("ListOpenIssuesWithLabels returned error: %v", err)
+	}
+	if len(issues) != 1 || issues[0].Number != 51 || issues[0].IsPullRequest {
+		t.Fatalf("issues = %+v, want only non-PR issue #51", issues)
+	}
+	runner.wantArgs(t, 0, "api", "-i", "-X", "GET", "repos/gitmoot/gitmoot/issues", "-f", "state=open", "-f", "labels=review-p2,agent:builder", "-f", "per_page=100")
+}
+
 func TestGetIssueReturnsCanonicalIssueAndRejectsPullRequest(t *testing.T) {
 	repo := Repository{Owner: "gitmoot", Name: "gitmoot"}
 	t.Run("issue", func(t *testing.T) {
