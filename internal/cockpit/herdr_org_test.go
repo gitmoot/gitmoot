@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -442,6 +443,71 @@ func TestHerdrOrgProviderRecycleFailureIsActionable(t *testing.T) {
 	err := provider.Recycle(context.Background(), org.RecycleRequest{Role: "owner", Pane: "w1:p2", Kind: "codex", AgentName: "owner", BootPrompt: "brief"})
 	if err == nil || !strings.Contains(err.Error(), "interactive shell prompt") || !strings.Contains(err.Error(), "pane is not at shell") || !strings.Contains(err.Error(), "herdr agent start owner --kind codex --pane w1:p2") {
 		t.Fatalf("Recycle() error = %v", err)
+	}
+}
+
+func TestHerdrOrgProviderRecycleLeavesStderrEnrichmentToRunner(t *testing.T) {
+	_, rawExitErr := exec.Command("sh", "-c", "printf 'raw-exit-stderr\\n' >&2; exit 1").Output()
+	if rawExitErr == nil {
+		t.Fatal("expected sh exit error")
+	}
+	provider := newHerdrOrgProvider(func(context.Context, ...string) (string, error) {
+		return "", rawExitErr
+	}, []config.OrgRole{{Name: "owner"}}, time.Now)
+	err := provider.Recycle(context.Background(), org.RecycleRequest{Role: "owner", Pane: "w1:p2", Kind: "omp", AgentName: "owner", BootPrompt: "brief"})
+	if err == nil {
+		t.Fatal("Recycle() error = nil, want failure")
+	}
+	if strings.Contains(err.Error(), "raw-exit-stderr") {
+		t.Fatalf("Recycle() annotated ExitError.Stderr outside runner: %v", err)
+	}
+
+	_, execErr := newExecRunner("sh")(context.Background(), "-c", "printf 'runner-owned-stderr\\n' >&2; exit 1")
+	if execErr == nil || !strings.Contains(execErr.Error(), "runner-owned-stderr") {
+		t.Fatalf("newExecRunner() error = %v, want runner-owned stderr", execErr)
+	}
+}
+
+func TestHerdrOrgProviderRecyclePreservesHorizontalSpacing(t *testing.T) {
+	var got []string
+	provider := newHerdrOrgProvider(func(_ context.Context, args ...string) (string, error) {
+		got = append([]string(nil), args...)
+		return "", nil
+	}, []config.OrgRole{{Name: "owner"}}, time.Now)
+	req := org.RecycleRequest{
+		Role:       "owner",
+		Pane:       "w1:p2",
+		Kind:       "omp",
+		AgentName:  "owner",
+		BootPrompt: "  indented  line\n    two\tspaces  here\x00end",
+	}
+	if err := provider.Recycle(context.Background(), req); err != nil {
+		t.Fatalf("Recycle() error = %v", err)
+	}
+	wantPrompt := "  indented  line;     two spaces  here end"
+	if len(got) == 0 || got[len(got)-1] != wantPrompt {
+		t.Fatalf("boot prompt arg = %q, want %q", got[len(got)-1], wantPrompt)
+	}
+}
+
+func TestHerdrOrgProviderRecycleFailureCommandUsesPOSIXQuoting(t *testing.T) {
+	provider := newHerdrOrgProvider(func(context.Context, ...string) (string, error) {
+		return "", errors.New("pane busy")
+	}, []config.OrgRole{{Name: "owner"}}, time.Now)
+	req := org.RecycleRequest{
+		Role:       "owner",
+		Pane:       "w1:p2",
+		Kind:       "omp",
+		AgentName:  "owner",
+		BootPrompt: "check $HOME and 'quotes' $(id)",
+	}
+	err := provider.Recycle(context.Background(), req)
+	if err == nil {
+		t.Fatal("Recycle() error = nil, want failure")
+	}
+	wantQuoted := `'check $HOME and '\''quotes'\'' $(id)'`
+	if !strings.Contains(err.Error(), wantQuoted) {
+		t.Fatalf("Recycle() error = %q, want POSIX single-quoted %q", err.Error(), wantQuoted)
 	}
 }
 

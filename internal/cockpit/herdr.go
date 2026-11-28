@@ -125,6 +125,7 @@ type registeredAgent struct {
 	MachineProfileID string          `json:"machine_profile_id"`
 	Archived         json.RawMessage `json:"archived"`
 	AgentSession     struct {
+		Kind  string `json:"kind"`
 		Value string `json:"value"`
 	} `json:"agent_session"`
 	// Live state, read for remote agents, which the local api snapshot does not list.

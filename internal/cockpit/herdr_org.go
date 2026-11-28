@@ -3,9 +3,7 @@ package cockpit
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -186,7 +184,9 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		resolved := org.PaneBinding{PaneID: paneID}
 		if strings.HasPrefix(binding, "agent:") {
 			if agent, ok := registeredAgentForBinding(agents, binding); ok {
-				resolved.AgentName, resolved.Session = agent.Name, strings.TrimSpace(agent.AgentSession.Value)
+				resolved.AgentName = agent.Name
+				resolved.Session = strings.TrimSpace(agent.AgentSession.Value)
+				resolved.SessionKind = strings.TrimSpace(agent.AgentSession.Kind)
 			}
 		}
 		bindings[role.Name] = resolved
@@ -242,7 +242,12 @@ func (p *herdrOrgProvider) remoteRole(
 	state := mapHerdrAgentStatus(agent.AgentStatus)
 	state.Activity = mapHerdrCompletedTurn(agent.LastCompletedTurn)
 	states[role] = state
-	bindings[role] = org.PaneBinding{PaneID: agent.PaneID, AgentName: agent.Name, Session: strings.TrimSpace(agent.AgentSession.Value)}
+	bindings[role] = org.PaneBinding{
+		PaneID:      agent.PaneID,
+		AgentName:   agent.Name,
+		Session:     strings.TrimSpace(agent.AgentSession.Value),
+		SessionKind: strings.TrimSpace(agent.AgentSession.Kind),
+	}
 	if strings.TrimSpace(agent.Agent) != "" {
 		title := strings.TrimSpace(agent.TerminalTitleText)
 		if title == "" {
@@ -262,7 +267,12 @@ func liveLocalAgents(agents []registeredAgent, unrestored map[string]bool) []org
 			(len(agent.Archived) != 0 && string(agent.Archived) != "null") || unrestored[agent.PaneID] {
 			continue
 		}
-		live = append(live, org.LiveAgent{Name: agent.Name, PaneID: agent.PaneID, Session: strings.TrimSpace(agent.AgentSession.Value)})
+		live = append(live, org.LiveAgent{
+			Name:        agent.Name,
+			PaneID:      agent.PaneID,
+			Session:     strings.TrimSpace(agent.AgentSession.Value),
+			SessionKind: strings.TrimSpace(agent.AgentSession.Kind),
+		})
 	}
 	return live
 }
@@ -327,13 +337,12 @@ func (p *herdrOrgProvider) Recycle(ctx context.Context, req org.RecycleRequest) 
 	// runtimes) — herdr's other ~18 agent kinds are unverified and a rejected
 	// flag would break recycle outright, so an unsupported kind silently ignores
 	// the pin.
-	if model := sanitizeHerdrAgentArg(req.Model); model != "" && herdrKindSupportsModelFlag(kind) {
+	if model := strings.TrimSpace(sanitizeHerdrAgentArg(req.Model)); model != "" && herdrKindSupportsModelFlag(kind) {
 		args = append(args, "--model", model)
 	}
 	args = append(args, bootPrompt)
 	_, err := p.run(bounded, args...)
 	if err != nil {
-		err = wrapHerdrExitStderr(err)
 		return fmt.Errorf("herdr agent start for org role %q (pane %q must already be at an interactive shell prompt; command: %s): %w", role, pane, formatHerdrCommand(args), err)
 	}
 	return nil
@@ -343,6 +352,7 @@ func (p *herdrOrgProvider) Recycle(ctx context.Context, req org.RecycleRequest) 
 // carriage returns, and tabs) from an `AGENT_ARG` passed to `herdr agent start`.
 // Herdr rejects any agent argument containing `char::is_control` because it
 // types the launch argv into the target pane's interactive shell PTY (#2767).
+// Valid horizontal spacing (indentation and repeated spaces) is preserved.
 func sanitizeHerdrAgentArg(value string) string {
 	rawLines := strings.FieldsFunc(value, func(r rune) bool {
 		return r == '\n' || r == '\r'
@@ -355,35 +365,39 @@ func sanitizeHerdrAgentArg(value string) string {
 			}
 			return r
 		}, line)
-		cleaned = strings.Join(strings.Fields(cleaned), " ")
-		if cleaned != "" {
+		if strings.TrimSpace(cleaned) != "" {
 			lines = append(lines, cleaned)
 		}
 	}
 	return strings.Join(lines, "; ")
 }
 
-func wrapHerdrExitStderr(err error) error {
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" && !strings.Contains(err.Error(), stderr) {
-			return fmt.Errorf("%w: %s", err, stderr)
-		}
-	}
-	return err
-}
-
 func formatHerdrCommand(args []string) string {
 	parts := make([]string, 0, len(args)+1)
 	parts = append(parts, "herdr")
 	for _, arg := range args {
-		if arg == "" || strings.ContainsAny(arg, " \t\n\r\"'\\") {
-			parts = append(parts, strconv.Quote(arg))
-		} else {
-			parts = append(parts, arg)
-		}
+		parts = append(parts, posixShellQuote(arg))
 	}
 	return strings.Join(parts, " ")
+}
+
+func posixShellQuote(arg string) string {
+	if arg == "" {
+		return "''"
+	}
+	safe := true
+	for i := 0; i < len(arg); i++ {
+		c := arg[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '_' || c == '-' || c == '.' || c == '/' || c == ':' || c == '@' || c == '+' || c == '=') {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 }
 
 // herdrKindSupportsModelFlag reports whether the named herdr agent kind's CLI

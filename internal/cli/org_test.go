@@ -1630,6 +1630,100 @@ func TestRunOrgRecycleResolvesExitedRegisteredSeat(t *testing.T) {
 			t.Fatalf("code=%d calls=%d stderr=%q", code, calls, stderr.String())
 		}
 	})
+
+	t.Run("refuses when recorded pane is relabelled for another agent-bound role", func(t *testing.T) {
+		home, paths := setupOrgRecycleHome(t, "agent:owner")
+		file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.WriteString("\n[org.roles.\"other\"]\nparent = \"owner\"\nscope = [\"*\"]\nmerge_rule = \"owner\"\npane = \"agent:other\"\n"); err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		file.Close()
+
+		store, err := dbtest.Open(t, paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordOrgSeatAgentIdentity(context.Background(), "owner", "owner", "w1:pDK", "", now); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		store.Close()
+
+		calls := 0
+		withOrgProvider(t, orgFixtureProvider{
+			snapshot: org.Snapshot{
+				States:       map[string]org.RoleLiveState{"owner": {State: org.StateUnknown}},
+				PaneBindings: map[string]org.PaneBinding{"owner": {Detail: `no Herdr pane bound as "agent:owner"`}},
+				Panes:        []org.LivePane{{PaneID: "w1:pDK", Label: "other"}},
+			},
+			recycle: func(context.Context, org.RecycleRequest) error {
+				calls++
+				return nil
+			},
+		})
+		var stdout, stderr bytes.Buffer
+		code := runOrgRecycle([]string{"owner", "--kind", "omp", "--handoff", "Continue docs.", "--home", home}, &stdout, &stderr)
+		if code != 1 || calls != 0 || !strings.Contains(stderr.String(), `claimed by org role "other"`) {
+			t.Fatalf("code=%d calls=%d stderr=%q", code, calls, stderr.String())
+		}
+	})
+
+	t.Run("refuses reachable remote binding before local start", func(t *testing.T) {
+		home, _ := setupOrgRecycleHome(t, "agent:peer/other")
+		calls := 0
+		withOrgProvider(t, orgFixtureProvider{
+			snapshot: org.Snapshot{
+				States: map[string]org.RoleLiveState{"owner": {State: org.StateIdle}},
+				PaneBindings: map[string]org.PaneBinding{
+					"owner": {PaneID: "remote:p1", AgentName: "other"},
+				},
+			},
+			recycle: func(context.Context, org.RecycleRequest) error {
+				calls++
+				return nil
+			},
+		})
+		var stdout, stderr bytes.Buffer
+		code := runOrgRecycle([]string{"owner", "--kind", "omp", "--handoff", "Continue docs.", "--home", home}, &stdout, &stderr)
+		if code != 1 || calls != 0 || !strings.Contains(stderr.String(), `remote binding "agent:peer/other"`) {
+			t.Fatalf("code=%d calls=%d stderr=%q", code, calls, stderr.String())
+		}
+	})
+
+	t.Run("starts under configured agent alias", func(t *testing.T) {
+		home, _ := setupOrgRecycleHome(t, "agent:seat-alias")
+		var requests []org.RecycleRequest
+		withOrgProvider(t, orgFixtureProvider{
+			snapshot: org.Snapshot{
+				States:       map[string]org.RoleLiveState{"owner": {State: org.StateUnknown}},
+				PaneBindings: map[string]org.PaneBinding{"owner": {Detail: `no Herdr pane bound as "agent:seat-alias"`}},
+				Panes:        []org.LivePane{{PaneID: "w1:p9", Label: "seat-alias"}},
+			},
+			recycle: func(_ context.Context, req org.RecycleRequest) error {
+				requests = append(requests, req)
+				return nil
+			},
+		})
+		var stdout, stderr bytes.Buffer
+		code := runOrgRecycle([]string{"owner", "--kind", "omp", "--handoff", "Continue docs.", "--json", "--home", home}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+		if len(requests) != 1 || requests[0].Pane != "w1:p9" || requests[0].AgentName != "seat-alias" {
+			t.Fatalf("requests = %+v, want Pane=w1:p9 AgentName=seat-alias", requests)
+		}
+		var out orgRecycleOutput
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal json output: %v (%q)", err, stdout.String())
+		}
+		if out.AgentName != "seat-alias" {
+			t.Fatalf("output AgentName = %q, want seat-alias", out.AgentName)
+		}
+	})
 }
 
 func TestRunOrgRecycleSurfacesHerdrStderrAndSanitizesBootPrompt(t *testing.T) {
@@ -1834,6 +1928,153 @@ func TestRunOrgRecyclePreservesModelOrWarns(t *testing.T) {
 		}
 		if !strings.Contains(stderr.String(), "warning: no model configured or recorded") || !strings.Contains(stderr.String(), "runtime default") {
 			t.Fatalf("stderr = %q, want runtime default warning", stderr.String())
+		}
+	})
+
+	t.Run("ignores superseded identity session and falls back to agent row", func(t *testing.T) {
+		home, paths := setupOrgRecycleHome(t, "agent:replacement")
+		oldSessionFile := filepath.Join(t.TempDir(), "old-session.jsonl")
+		if err := os.WriteFile(oldSessionFile, []byte(`{"type":"model_change","model":"openai-codex/gpt-old"}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store, err := dbtest.Open(t, paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordOrgSeatAgentIdentity(context.Background(), "owner", "old-agent", "w1:pOld", oldSessionFile, now); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		if err := store.UpsertAgent(context.Background(), db.Agent{
+			Name: "owner", Role: "owner", Runtime: "omp", Model: "anthropic/claude-fallback",
+		}); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		store.Close()
+
+		var requests []org.RecycleRequest
+		withOrgProvider(t, orgFixtureProvider{
+			snapshot: org.Snapshot{
+				States:       map[string]org.RoleLiveState{"owner": {State: org.StateUnknown}},
+				PaneBindings: map[string]org.PaneBinding{"owner": {Detail: `no Herdr pane bound as "agent:replacement"`}},
+				Panes:        []org.LivePane{{PaneID: "w1:pNew", Label: "replacement"}},
+			},
+			recycle: func(_ context.Context, req org.RecycleRequest) error {
+				requests = append(requests, req)
+				return nil
+			},
+		})
+		var stdout, stderr bytes.Buffer
+		if code := runOrgRecycle([]string{"owner", "--kind", "omp", "--handoff", "Use fallback.", "--home", home}, &stdout, &stderr); code != 0 {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+		if len(requests) != 1 || requests[0].Pane != "w1:pNew" || requests[0].Model != "anthropic/claude-fallback" {
+			t.Fatalf("requests = %+v, want Pane=w1:pNew Model=anthropic/claude-fallback", requests)
+		}
+	})
+
+	t.Run("ignores non-file session kind and falls back to agent row", func(t *testing.T) {
+		t.Setenv("HERDR_SOCKET_PATH", "/tmp/throwaway")
+		t.Setenv("HERDR_ENV", "")
+
+		home, paths := setupOrgRecycleHome(t, "agent:owner")
+		sessionFile := filepath.Join(t.TempDir(), "session.jsonl")
+		if err := os.WriteFile(sessionFile, []byte(`{"type":"model_change","model":"openai-codex/gpt-from-file"}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store, err := dbtest.Open(t, paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpsertAgent(context.Background(), db.Agent{
+			Name: "owner", Role: "owner", Runtime: "omp", Model: "anthropic/claude-agent-row",
+		}); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		store.Close()
+
+		argsFile := filepath.Join(t.TempDir(), "args.txt")
+		binDir := t.TempDir()
+		herdrPath := filepath.Join(binDir, "herdr")
+		script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "api" ] && [ "$2" = "snapshot" ]; then
+  printf '{"result":{"snapshot":{"version":"1","panes":[{"pane_id":"w1:p2","label":"owner"}]}}}\n'
+  exit 0
+fi
+if [ "$1" = "agent" ] && [ "$2" = "list" ]; then
+  printf '{"result":{"agents":[{"name":"owner","pane_id":"w1:p2","agent_session":{"kind":"id","value":%q}}]}}\n'
+  exit 0
+fi
+if [ "$1" = "agent" ] && [ "$2" = "start" ]; then
+  for arg in "$@"; do
+    printf '%%s\n' "$arg" >> %q
+  done
+  exit 0
+fi
+exit 1
+`, sessionFile, argsFile)
+		if err := os.WriteFile(herdrPath, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		var stdout, stderr bytes.Buffer
+		if code := runOrgRecycle([]string{"owner", "--kind", "omp", "--handoff", "Fallback model.", "--home", home}, &stdout, &stderr); code != 0 {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+		rawArgs, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(rawArgs)
+		if !strings.Contains(got, "anthropic/claude-agent-row") || strings.Contains(got, "openai-codex/gpt-from-file") {
+			t.Fatalf("captured herdr args = %q, want fallback model anthropic/claude-agent-row", got)
+		}
+	})
+
+	t.Run("ignores relative opaque session reference even when matching file exists in cwd", func(t *testing.T) {
+		workDir := t.TempDir()
+		t.Chdir(workDir)
+		if err := os.WriteFile(filepath.Join(workDir, "opaque-session.jsonl"), []byte(`{"type":"model_change","model":"openai-codex/gpt-relative"}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		home, paths := setupOrgRecycleHome(t, "agent:owner")
+		store, err := dbtest.Open(t, paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordOrgSeatAgentIdentity(context.Background(), "owner", "owner", "w1:pDK", "opaque-session.jsonl", now); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		if err := store.UpsertAgent(context.Background(), db.Agent{
+			Name: "owner", Role: "owner", Runtime: "omp", Model: "anthropic/claude-agent-row",
+		}); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		store.Close()
+
+		var requests []org.RecycleRequest
+		withOrgProvider(t, orgFixtureProvider{
+			snapshot: org.Snapshot{
+				States:       map[string]org.RoleLiveState{"owner": {State: org.StateUnknown}},
+				PaneBindings: map[string]org.PaneBinding{"owner": {Detail: `no Herdr pane bound as "agent:owner"`}},
+				Panes:        []org.LivePane{{PaneID: "w1:pDK", Label: "owner"}},
+			},
+			recycle: func(_ context.Context, req org.RecycleRequest) error {
+				requests = append(requests, req)
+				return nil
+			},
+		})
+		var stdout, stderr bytes.Buffer
+		if code := runOrgRecycle([]string{"owner", "--kind", "omp", "--handoff", "Fallback model.", "--home", home}, &stdout, &stderr); code != 0 {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+		if len(requests) != 1 || requests[0].Model != "anthropic/claude-agent-row" {
+			t.Fatalf("requests = %+v, want fallback Model=anthropic/claude-agent-row", requests)
 		}
 	})
 }
