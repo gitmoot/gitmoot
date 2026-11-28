@@ -304,6 +304,48 @@ FROM (SELECT ? AS repo, ? AS pull_request) acting_scope`, repo, pullRequest).Sca
 	return strings.TrimSpace(role), nil
 }
 
+// ListPullRequestsByActingRole returns distinct (repo, pull_request) pairs from
+// jobs whose payload acting_org_role matches role (case-insensitively) and whose
+// pull_request is positive, ordered by lower(repo), pull_request.
+func (s *Store) ListPullRequestsByActingRole(ctx context.Context, role string) ([]PullRequestRef, error) {
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role == "" {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT trim(repo), pull_request
+FROM jobs
+WHERE pull_request > 0
+	AND trim(repo) != ''
+	AND json_valid(payload)
+	AND json_type(payload, '$.acting_org_role') = 'text'
+	AND lower(trim(json_extract(payload, '$.acting_org_role'))) = ?
+ORDER BY lower(trim(repo)), pull_request`, role)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type key struct {
+		repoLower string
+		pr        int64
+	}
+	seen := make(map[key]struct{})
+	var refs []PullRequestRef
+	for rows.Next() {
+		var ref PullRequestRef
+		if err := rows.Scan(&ref.Repo, &ref.Number); err != nil {
+			return nil, err
+		}
+		k := key{repoLower: strings.ToLower(ref.Repo), pr: ref.Number}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
+}
+
 // ResolvePullRequestOwner returns the strongest stored org owner for one pull
 // request task. The PR implementer's acting role (PullRequestActingRole) wins,
 // then the earliest implementing agent for the task. An unresolved owner is

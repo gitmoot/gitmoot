@@ -364,6 +364,7 @@ Read your inbox when you start or resume, and keep message ids in handoffs.
 ```sh
 gitmoot org chart
 gitmoot org brief --role <role>
+gitmoot org seat status [--role <role>] [--json]
 gitmoot message escalate --to <role> "question"
 gitmoot org await list
 ```
@@ -371,6 +372,10 @@ gitmoot org await list
 - `org chart` shows every role under its parent with its live session state
   (it reads Herdr); `--json` for scripts. `org brief --role <role>` prints that
   role's brief, including how to use messages.
+- `org seat status` is a read-only, one-call snapshot for a seat after waking
+  or compaction: its open PRs (head, recorded review level, CI rollup, merge
+  state), active or last-24h review runs, waiting awaited facts, and open
+  `review-p2` issues labelled `agent:<role>` in its scope repos.
 - `message escalate` asks a question of a role above or below you on the
   chart: your parent by default, or the role given with `--to`. Questions to a
   role on another branch are refused. The asker or the addressed role closes it
