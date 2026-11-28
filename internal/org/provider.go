@@ -51,9 +51,10 @@ type Snapshot struct {
 // agent's own session reference (omp's session file); with the pane it is the
 // identity that survives a rename, since Herdr has no stable agent id.
 type LiveAgent struct {
-	Name    string
-	PaneID  string
-	Session string
+	Name        string
+	PaneID      string
+	Session     string
+	SessionKind string
 }
 
 // SessionActivity is the live, non-durable session metadata Herdr reports for a
@@ -72,10 +73,11 @@ type PaneBinding struct {
 	PaneID    string
 	Detail    string
 	Ambiguous bool
-	// AgentName and Session identify the registered agent an "agent:NAME"
-	// binding resolved to (#2502); empty for other bindings.
-	AgentName string
-	Session   string
+	// AgentName, Session, and SessionKind identify the registered agent an
+	// "agent:NAME" binding resolved to (#2502); empty for other bindings.
+	AgentName   string
+	Session     string
+	SessionKind string
 	// Unavailable means Herdr still lists the bound agent but could not start
 	// its process (#2554); Detail carries Herdr's reason.
 	Unavailable bool

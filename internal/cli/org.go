@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -1500,6 +1502,8 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 	if helpRequested(args) {
 		fmt.Fprintln(stdout, "Usage: gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
 		fmt.Fprintln(stdout, "A handoff note that is a single flag-like word, such as --help or -x, is refused.")
+		fmt.Fprintln(stdout, "For an agent:NAME binding whose old process has already exited, recycle resolves the pane from the seat's recorded identity or a unique unoccupied pane label; pass --pane ID if it cannot be proven.")
+		fmt.Fprintln(stdout, "Model precedence: [org.roles.ROLE].model, then the model last recorded for the seat's session; warns and uses the runtime default if none is known.")
 		return 0
 	}
 	roleArg := ""
@@ -1581,24 +1585,26 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 	snapshotCtx, cancelSnapshot := context.WithTimeout(ctx, orgRecycleSnapshotTimeout)
 	snapshot, snapshotErr := provider.Snapshot(snapshotCtx)
 	cancelSnapshot()
-	if strings.HasPrefix(pane, "agent:") {
-		binding, found := snapshot.PaneBindings[role.Name]
-		if snapshotErr != nil || !found || binding.PaneID == "" {
-			fmt.Fprintln(stderr, "org recycle: registered seat does not resolve; refusing handoff")
-			return 1
-		}
-		pane = binding.PaneID
+	target, err := resolveOrgRecycleTarget(ctx, store, cfg, role, pane, snapshot, snapshotErr)
+	if err != nil {
+		fmt.Fprintf(stderr, "org recycle: %v\n", err)
+		return 1
+	}
+	pane = target.PaneID
+	model := resolveOrgRecycleModel(ctx, store, role, target)
+	if model == "" {
+		fmt.Fprintf(stderr, "org recycle: warning: no model configured or recorded for role %q; %s will use its runtime default model\n", role.Name, kind)
 	}
 	brief := buildOrgBriefOutput(cfg, presence, role, snapshot, snapshotErr)
 	var boot strings.Builder
 	printOrgBrief(&boot, brief)
 	fmt.Fprintf(&boot, "\nhandoff: %s\n", handoff)
-	req := org.RecycleRequest{Role: role.Name, Pane: pane, Kind: kind, AgentName: role.Name, Model: role.Model, BootPrompt: boot.String()}
+	req := org.RecycleRequest{Role: role.Name, Pane: pane, Kind: kind, AgentName: target.AgentName, Model: model, BootPrompt: boot.String()}
 	if err := provider.Recycle(ctx, req); err != nil {
 		fmt.Fprintf(stderr, "org recycle: %v (handoff journaled in campaign %s)\n", err, workflowID)
 		return 1
 	}
-	out := orgRecycleOutput{Role: role.Name, Pane: pane, Kind: kind, AgentName: role.Name, WorkflowID: workflowID}
+	out := orgRecycleOutput{Role: role.Name, Pane: pane, Kind: kind, AgentName: target.AgentName, WorkflowID: workflowID}
 	if *jsonOutput {
 		if err := writeJSON(stdout, out); err != nil {
 			fmt.Fprintf(stderr, "org recycle: %v\n", err)
@@ -1608,6 +1614,287 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "recycled org role %s as %s in pane %s; handoff journaled in campaign %s\n", role.Name, kind, pane, workflowID)
 	return 0
+}
+
+type orgRecycleTarget struct {
+	PaneID      string
+	AgentName   string
+	Session     string
+	SessionKind string
+}
+
+func orgRecycleAgentName(role config.OrgRole, pane string) string {
+	for _, candidate := range []string{strings.TrimSpace(role.Pane), strings.TrimSpace(pane)} {
+		if !strings.HasPrefix(candidate, "agent:") {
+			continue
+		}
+		if _, _, remote := cockpit.RemoteBinding(candidate); remote {
+			continue
+		}
+		if name := strings.TrimSpace(strings.TrimPrefix(candidate, "agent:")); name != "" {
+			return name
+		}
+	}
+	return role.Name
+}
+
+// resolveOrgRecycleTarget resolves the target pane, successor agent name, and
+// matching session provenance for `org recycle`.
+// When the old agent process has already exited (the precondition for
+// `herdr agent start`), Herdr's `agent list` no longer lists it. In that case
+// we still prove the target pane safely via (1) the seat's recorded
+// org_seat_agent_identity pane or (2) a unique live pane whose label matches
+// <name>, refusing whenever the candidate pane is occupied by a live agent or
+// claimed by another org role (#2767).
+func resolveOrgRecycleTarget(ctx context.Context, store *db.Store, cfg config.OrgConfig, role config.OrgRole, pane string, snapshot org.Snapshot, snapshotErr error) (orgRecycleTarget, error) {
+	pane = strings.TrimSpace(pane)
+	target := orgRecycleTarget{
+		PaneID:    pane,
+		AgentName: orgRecycleAgentName(role, pane),
+	}
+	if !strings.HasPrefix(pane, "agent:") {
+		if snapshotErr == nil {
+			if binding, found := snapshot.PaneBindings[role.Name]; found && binding.PaneID == pane && strings.TrimSpace(binding.Session) != "" {
+				target.Session = strings.TrimSpace(binding.Session)
+				target.SessionKind = strings.TrimSpace(binding.SessionKind)
+				return target, nil
+			}
+		}
+		if store != nil {
+			if known, found, err := store.GetOrgSeatAgentIdentity(ctx, role.Name); err == nil && found && strings.TrimSpace(known.PaneID) == pane {
+				configured := strings.TrimSpace(role.Pane)
+				if strings.HasPrefix(configured, "agent:") {
+					if _, _, remote := cockpit.RemoteBinding(configured); !remote {
+						if strings.TrimSpace(strings.TrimPrefix(configured, "agent:")) != strings.TrimSpace(known.AgentName) {
+							return target, nil
+						}
+					}
+				}
+				target.Session = strings.TrimSpace(known.Session)
+			}
+		}
+		return target, nil
+	}
+	if _, _, remote := cockpit.RemoteBinding(pane); remote {
+		return orgRecycleTarget{}, fmt.Errorf("registered seat does not resolve; refusing handoff (remote binding %q cannot be resolved to a local pane; pass --pane <id>)", pane)
+	}
+	if snapshotErr != nil {
+		return orgRecycleTarget{}, fmt.Errorf("registered seat does not resolve; refusing handoff (Herdr snapshot failed: %v; pass --pane <id> if the pane is at an interactive shell prompt)", snapshotErr)
+	}
+	agentName := strings.TrimSpace(strings.TrimPrefix(pane, "agent:"))
+	if agentName == "" {
+		return orgRecycleTarget{}, fmt.Errorf("registered seat does not resolve; refusing handoff (empty agent name in %q; pass --pane <id>)", pane)
+	}
+	if pane == strings.TrimSpace(role.Pane) {
+		if binding, found := snapshot.PaneBindings[role.Name]; found && binding.PaneID != "" {
+			target.PaneID = binding.PaneID
+			target.Session = strings.TrimSpace(binding.Session)
+			target.SessionKind = strings.TrimSpace(binding.SessionKind)
+			return target, nil
+		}
+	}
+	livePaneByID := make(map[string]org.LivePane, len(snapshot.Panes))
+	for _, p := range snapshot.Panes {
+		if p.PaneID != "" {
+			livePaneByID[p.PaneID] = p
+		}
+	}
+	occupiedPaneIDs := make(map[string]string, len(snapshot.Agents))
+	for _, agent := range snapshot.Agents {
+		if agent.PaneID != "" {
+			occupiedPaneIDs[agent.PaneID] = agent.Name
+		}
+	}
+	members := loadOrgRoster(ctx, store, cfg).Members()
+	otherRoleClaimsPane := func(candidatePaneID, candidateLabel string) (string, bool) {
+		for _, other := range members {
+			if other.Name == role.Name {
+				continue
+			}
+			otherPane := strings.TrimSpace(other.Pane)
+			if _, _, remote := cockpit.RemoteBinding(otherPane); remote {
+				continue
+			}
+			if otherPane != "" && (otherPane == candidatePaneID || (candidateLabel != "" && otherPane == candidateLabel)) {
+				return other.Name, true
+			}
+			if strings.HasPrefix(otherPane, "agent:") {
+				otherAgent := strings.TrimSpace(strings.TrimPrefix(otherPane, "agent:"))
+				if otherAgent != "" {
+					if candidateLabel != "" && candidateLabel == otherAgent {
+						return other.Name, true
+					}
+					if binding, found := snapshot.PaneBindings[other.Name]; found && binding.PaneID == candidatePaneID {
+						return other.Name, true
+					}
+					for _, liveAgent := range snapshot.Agents {
+						if liveAgent.Name == otherAgent && liveAgent.PaneID == candidatePaneID {
+							return other.Name, true
+						}
+					}
+				}
+			}
+			if store != nil {
+				otherID, ok, err := store.GetOrgSeatAgentIdentity(ctx, other.Name)
+				if err != nil {
+					return other.Name, true
+				}
+				if ok && strings.TrimSpace(otherID.PaneID) == candidatePaneID {
+					if !strings.HasPrefix(otherPane, "agent:") || strings.TrimSpace(strings.TrimPrefix(otherPane, "agent:")) == strings.TrimSpace(otherID.AgentName) {
+						return other.Name, true
+					}
+				}
+			}
+		}
+		return "", false
+	}
+
+	var reason string
+	if store != nil {
+		if known, found, err := store.GetOrgSeatAgentIdentity(ctx, role.Name); err == nil && found && known.AgentName == agentName {
+			if knownPane := strings.TrimSpace(known.PaneID); knownPane != "" {
+				if livePane, live := livePaneByID[knownPane]; live {
+					if occupant, busy := occupiedPaneIDs[knownPane]; busy {
+						reason = fmt.Sprintf("recorded pane %s is occupied by live agent %q", knownPane, occupant)
+					} else if ownerRole, claimed := otherRoleClaimsPane(knownPane, livePane.Label); claimed {
+						reason = fmt.Sprintf("recorded pane %s is claimed by org role %q", knownPane, ownerRole)
+					} else {
+						target.PaneID = knownPane
+						target.Session = strings.TrimSpace(known.Session)
+						return target, nil
+					}
+				} else {
+					reason = fmt.Sprintf("recorded pane %s is no longer present", knownPane)
+				}
+			}
+		}
+	}
+
+	var labelMatches []org.LivePane
+	for _, p := range snapshot.Panes {
+		if p.PaneID != "" && p.Label == agentName {
+			labelMatches = append(labelMatches, p)
+		}
+	}
+	switch len(labelMatches) {
+	case 1:
+		cand := labelMatches[0]
+		if occupant, busy := occupiedPaneIDs[cand.PaneID]; busy {
+			reason = fmt.Sprintf("pane %s (label %q) is occupied by live agent %q", cand.PaneID, cand.Label, occupant)
+		} else if ownerRole, claimed := otherRoleClaimsPane(cand.PaneID, cand.Label); claimed {
+			reason = fmt.Sprintf("pane %s (label %q) is claimed by org role %q", cand.PaneID, cand.Label, ownerRole)
+		} else {
+			target.PaneID = cand.PaneID
+			return target, nil
+		}
+	case 0:
+		if reason == "" {
+			reason = fmt.Sprintf("no live agent or unoccupied pane labeled %q found", agentName)
+		}
+	default:
+		reason = fmt.Sprintf("multiple live panes are labeled %q", agentName)
+	}
+	return orgRecycleTarget{}, fmt.Errorf("registered seat does not resolve; refusing handoff (%s; pass --pane <id> if the target pane is at an interactive shell prompt)", reason)
+}
+
+// resolveOrgRecycleModel determines the model to pass to the recycled seat:
+//  1. Configured [org.roles.<role>].model.
+//  2. Last model recorded in the selected seat's local omp session file.
+//  3. Registered gitmoot agent row's model for the role, if any.
+func resolveOrgRecycleModel(ctx context.Context, store *db.Store, role config.OrgRole, target orgRecycleTarget) string {
+	if configured := strings.TrimSpace(role.Model); configured != "" {
+		return configured
+	}
+	if model := readOMPSessionLastModel(target.SessionKind, target.Session); model != "" {
+		return model
+	}
+	if store != nil {
+		if agent, err := store.GetAgent(ctx, role.Name); err == nil {
+			if model := strings.TrimSpace(agent.Model); model != "" {
+				return model
+			}
+		}
+	}
+	return ""
+}
+
+func isLocalOMPSessionKind(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "", "file", "path", "file_path", "session_file":
+		return true
+	default:
+		return false
+	}
+}
+
+// readOMPSessionLastModel reads a local omp session .jsonl file and returns the
+// last active model recorded by a `model_change` event (e.g.
+// "anthropic/claude-opus-5-5"), falling back to the last assistant message's
+// provider/model when no `model_change` entry is present. Non-file session
+// kinds, relative/opaque references, and non-regular files are ignored.
+func readOMPSessionLastModel(kind, path string) string {
+	if !isLocalOMPSessionKind(kind) {
+		return ""
+	}
+	path = strings.TrimSpace(path)
+	if path == "" || !filepath.IsAbs(path) || !strings.EqualFold(filepath.Ext(path), ".jsonl") {
+		return ""
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	reader := bufio.NewReaderSize(f, 64*1024)
+	lastModelChange := ""
+	lastAssistantModel := ""
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			if strings.Contains(string(line), `"model_change"`) {
+				var entry struct {
+					Type  string `json:"type"`
+					Model string `json:"model"`
+				}
+				if json.Unmarshal(line, &entry) == nil && entry.Type == "model_change" {
+					if m := strings.TrimSpace(entry.Model); m != "" {
+						lastModelChange = m
+					}
+				}
+			} else if strings.Contains(string(line), `"assistant"`) {
+				var entry struct {
+					Type    string `json:"type"`
+					Message struct {
+						Role     string `json:"role"`
+						Provider string `json:"provider"`
+						Model    string `json:"model"`
+					} `json:"message"`
+				}
+				if json.Unmarshal(line, &entry) == nil && entry.Type == "message" && entry.Message.Role == "assistant" {
+					m := strings.TrimSpace(entry.Message.Model)
+					p := strings.TrimSpace(entry.Message.Provider)
+					if m != "" {
+						if p != "" && !strings.Contains(m, "/") {
+							lastAssistantModel = p + "/" + m
+						} else {
+							lastAssistantModel = m
+						}
+					}
+				}
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	if lastModelChange != "" {
+		return lastModelChange
+	}
+	return lastAssistantModel
 }
 
 func validOrgRecycleKind(kind string) bool {
