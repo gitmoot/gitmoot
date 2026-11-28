@@ -145,6 +145,10 @@ func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, 
 	}
 	result.State = "retryable"
 	completed, err := e.finishProducerCleanupReceipt(ctx, receipt)
+	if errors.Is(err, ErrWorktreeRootUnavailable) {
+		result.State, result.Decision = "refused", result.Decision.refuse(CleanupRefusalWorktreeRootUnavailable)
+		return result, true, nil
+	}
 	if err != nil {
 		return result, true, err
 	}
@@ -152,7 +156,15 @@ func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, 
 	return result, true, nil
 }
 
+// finishProducerCleanupReceipt records the removal of a receipt's resource. It is the only place
+// a cleanup is accounted removed, so it re-proves the absence itself (#2763 review): the root
+// owning the path is preflighted around a fresh absence check, and a root that cannot be proven,
+// or moved mounts meanwhile, returns ErrWorktreeRootUnavailable and records nothing. Callers defer
+// that as retryable without spending the failure budget.
 func (e Engine) finishProducerCleanupReceipt(ctx context.Context, receipt db.CleanupReceipt) (db.CleanupReceipt, error) {
+	if err := proveWorktreeAbsent(e.Home, receipt.ExpectedPath); err != nil {
+		return db.CleanupReceipt{}, err
+	}
 	var evidence cleanupEvidence
 	if err := json.Unmarshal([]byte(receipt.Evidence), &evidence); err != nil {
 		return db.CleanupReceipt{}, err
@@ -239,6 +251,9 @@ func (e Engine) ReclaimAbsentWorktreeOutcome(ctx context.Context, jobID string, 
 		return false, err
 	}
 	if _, err := e.finishProducerCleanupReceipt(ctx, receipt); err != nil {
+		if errors.Is(err, ErrWorktreeRootUnavailable) {
+			return false, nil
+		}
 		return false, err
 	}
 	return true, nil

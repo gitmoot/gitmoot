@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -13,20 +14,20 @@ mount_fstype = "fuse.sshfs"
 
 // #2375: no section keeps the default layout; a full section is parsed exactly.
 func TestLoadWorktreeRootDefaultAndConfigured(t *testing.T) {
-	none, err := LoadWorktreeRoot(writeGateConfig(t, "[workflow]\nrequire_workflow = true\n"))
-	if err != nil || none.Configured() || none.HasMount() {
+	none, err := LoadWorktreeRoots(writeGateConfig(t, "[workflow]\nrequire_workflow = true\n"))
+	if err != nil || none.Active.Configured() || none.Active.HasMount() || len(none.Retired) != 0 {
 		t.Fatalf("no [worktrees] = %+v %v, want the default layout", none, err)
 	}
-	got, err := LoadWorktreeRoot(writeGateConfig(t, "[worktrees]\n"+fixtureWorktreeMount))
+	got, err := LoadWorktreeRoots(writeGateConfig(t, "[worktrees]\n"+fixtureWorktreeMount))
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	want := WorktreeRoot{Root: "/mnt/box/worktrees", MountPoint: "/mnt/box", MountSource: "user@host:share", MountFSType: "fuse.sshfs"}
-	if got != want {
+	want := WorktreeRoots{Active: WorktreeRoot{Root: "/mnt/box/worktrees", MountPoint: "/mnt/box", MountSource: "user@host:share", MountFSType: "fuse.sshfs"}}
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
-	rootOnly, err := LoadWorktreeRoot(writeGateConfig(t, "[worktrees]\nroot = \"/srv/worktrees\"\n"))
-	if err != nil || rootOnly.Root != "/srv/worktrees" || rootOnly.HasMount() {
+	rootOnly, err := LoadWorktreeRoots(writeGateConfig(t, "[worktrees]\nroot = \"/srv/worktrees\"\n"))
+	if err != nil || rootOnly.Active.Root != "/srv/worktrees" || rootOnly.Active.HasMount() {
 		t.Fatalf("root-only section = %+v %v", rootOnly, err)
 	}
 }
@@ -52,7 +53,7 @@ func TestLoadWorktreeRootRefusesInvalidSections(t *testing.T) {
 		"empty section is root": "",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got, err := LoadWorktreeRoot(writeGateConfig(t, "[worktrees]\n"+body)); err == nil {
+			if got, err := LoadWorktreeRoots(writeGateConfig(t, "[worktrees]\n"+body)); err == nil {
 				t.Fatalf("accepted %q as %+v", body, got)
 			}
 		})
@@ -60,11 +61,11 @@ func TestLoadWorktreeRootRefusesInvalidSections(t *testing.T) {
 }
 
 func TestWorktreeRootMalformedHeaderRefuses(t *testing.T) {
-	if _, err := LoadWorktreeRoot(writeGateConfig(t, "[worktrees\n"+fixtureWorktreeMount)); err == nil {
+	if _, err := LoadWorktreeRoots(writeGateConfig(t, "[worktrees\n"+fixtureWorktreeMount)); err == nil {
 		t.Fatal("a malformed [worktrees header was accepted")
 	}
-	got, err := LoadWorktreeRoot(writeGateConfig(t, "[worktrees]\n"+fixtureWorktreeMount+"[disk_guard\nmin_free_bytes = 1\n"))
-	if err != nil || got.Root != "/mnt/box/worktrees" {
+	got, err := LoadWorktreeRoots(writeGateConfig(t, "[worktrees]\n"+fixtureWorktreeMount+"[disk_guard\nmin_free_bytes = 1\n"))
+	if err != nil || got.Active.Root != "/mnt/box/worktrees" {
 		t.Fatalf("an unrelated malformed header broke [worktrees]: %+v %v", got, err)
 	}
 }

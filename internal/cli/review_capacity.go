@@ -136,15 +136,15 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 // Remote source preparation writes control state and logs, not local Git.
 func reviewHostDevices(ctx context.Context, store *db.Store, paths config.Paths, repo string, sourceOnly bool, checkouts ...string) (map[uint64]string, error) {
 	hostPaths := []string{paths.Home}
-	var root config.WorktreeRoot
+	var roots config.WorktreeRoots
 	if !sourceOnly {
 		var err error
-		hostPaths, root, err = janitorHostPaths(ctx, store, paths, repo, checkouts...)
+		hostPaths, roots, err = janitorHostPaths(ctx, store, paths, repo, checkouts...)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return janitorHostDevices(hostPaths, root)
+	return janitorHostDevices(hostPaths, roots)
 }
 
 // janitorSampleStaleError is a Janitor sample that expired before the check

@@ -26,10 +26,12 @@ type mountEntry struct {
 }
 
 // WorktreeStorageDevice measures a path (or its nearest existing ancestor)
-// through a pinned descriptor. network is true only for the configured sshfs
-// mount, never for a local mount. No pathname lookup of cfg.Root is performed.
-// The caller must omit this path, not delete its device from other paths.
-func WorktreeStorageDevice(path string, cfg config.WorktreeRoot) (device uint64, network bool, err error) {
+// through a pinned descriptor. network is true only when the path is on the
+// sshfs mount one of roots declares (the active root or a retired one, #2763),
+// each proven independently; never for a local mount. No pathname lookup of a
+// root is performed. The caller must omit this path, not delete its device from
+// other paths.
+func WorktreeStorageDevice(path string, roots ...config.WorktreeRoot) (device uint64, network bool, err error) {
 	var fd int
 	for p := filepath.Clean(path); ; p = filepath.Dir(p) {
 		fd, err = unix.Open(p, unix.O_PATH|unix.O_CLOEXEC, 0)
@@ -45,7 +47,12 @@ func WorktreeStorageDevice(path string, cfg config.WorktreeRoot) (device uint64,
 	if err := unix.Fstat(fd, &st); err != nil {
 		return 0, false, err
 	}
-	return uint64(st.Dev), worktreeNetworkFD(fd, cfg), nil
+	for _, root := range roots {
+		if worktreeNetworkFD(fd, root) {
+			return uint64(st.Dev), true, nil
+		}
+	}
+	return uint64(st.Dev), false, nil
 }
 
 // The descriptor pins both the inode and mount while the local mount table is

@@ -135,7 +135,7 @@ func TestJanitorCapacityDisabledStartsNoProcess(t *testing.T) {
 func TestJanitorPressureHoldsQueuedWorkUntilRecovery(t *testing.T) {
 	ctx, store, paths, worker := diskGuardDispatchFixture(t)
 	enableJanitorCapacity(t, paths)
-	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoot{})
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoots{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestJanitorCapacityExpiresDuringASlowCall(t *testing.T) {
 	previousNow := janitorNow
 	janitorNow = func() time.Time { return clock }
 	t.Cleanup(func() { janitorNow = previousNow })
-	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoot{})
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoots{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +270,7 @@ func TestJanitorCapacityExpiryIsCheckedAtTheAdmissionBoundary(t *testing.T) {
 	previousNow := janitorNow
 	janitorNow = func() time.Time { return clock }
 	t.Cleanup(func() { janitorNow = previousNow })
-	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoot{})
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoots{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +393,7 @@ func TestJanitorPressureRoutesReviewWithCapAndAlerts(t *testing.T) {
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 15_000_000_000}, nil
 	})
-	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoot{})
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoots{})
 	if err != nil {
 		t.Fatal(err)
 	}

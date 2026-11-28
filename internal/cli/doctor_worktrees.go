@@ -38,12 +38,15 @@ type delegationWorktreeUsage struct {
 	Quarantined    int    `json:"quarantined"`
 	Truncated      bool   `json:"truncated"`
 	Root           string `json:"root"`
-	// Roots lists every scanned root: <home>/worktrees, plus the [worktrees] root (#2375)
-	// while it is proven to be on its mount.
+	// Roots lists every scanned root: <home>/worktrees, plus the [worktrees] root (#2375) and each
+	// [[worktrees.retired]] root (#2763) while it is proven to be on its mount.
 	Roots []string `json:"roots"`
 	// UnavailableRoot is a configured [worktrees] root that failed its mount preflight; it is
 	// not scanned, so nothing under it is counted, reclaimed or reported as gone.
 	UnavailableRoot string `json:"unavailableRoot,omitempty"`
+	// UnavailableRetiredRoots are [[worktrees.retired]] roots that failed their preflight; like
+	// UnavailableRoot they are not scanned, and cleanup of worktrees under them waits.
+	UnavailableRetiredRoots []string `json:"unavailableRetiredRoots,omitempty"`
 	// ConfigError is a [worktrees] section that cannot be loaded: allocation refuses, and only
 	// the legacy root is scanned.
 	ConfigError string `json:"configError,omitempty"`
@@ -71,11 +74,20 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	placement, err := workflow.ResolveWorktreePlacement(paths.Home)
 	if err != nil {
 		usage.ConfigError = err.Error()
-	} else if placement.External() {
-		if err := placement.Preflight(); err != nil {
-			usage.UnavailableRoot = placement.Root
-		} else {
-			usage.Roots = append(usage.Roots, placement.Root)
+	} else {
+		if placement.External() {
+			if err := placement.Preflight(); err != nil {
+				usage.UnavailableRoot = placement.Root
+			} else {
+				usage.Roots = append(usage.Roots, placement.Root)
+			}
+		}
+		for _, retired := range placement.Retired() {
+			if err := workflow.PreflightWorktreeRoot(retired); err != nil {
+				usage.UnavailableRetiredRoots = append(usage.UnavailableRetiredRoots, retired.Root)
+			} else {
+				usage.Roots = append(usage.Roots, retired.Root)
+			}
 		}
 	}
 	jobs, err := store.ListJobs(ctx)
@@ -224,6 +236,9 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	}
 	if usage.UnavailableRoot != "" {
 		usage.Summary += fmt.Sprintf("; configured worktree root %s is unavailable (mount preflight failed) and was not scanned", usage.UnavailableRoot)
+	}
+	if len(usage.UnavailableRetiredRoots) > 0 {
+		usage.Summary += fmt.Sprintf("; retired worktree roots unavailable (preflight failed) and not scanned: %s", strings.Join(usage.UnavailableRetiredRoots, ", "))
 	}
 	if usage.Truncated {
 		usage.Summary += " (bounded scan truncated; counts and bytes are lower bounds)"
@@ -420,6 +435,6 @@ func delegationWorktreeDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 
 func buildDelegationWorktreeDoctorCheck(usage delegationWorktreeUsage) doctor.Check {
 	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL; %d cleanup quarantined)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal, usage.Quarantined)
-	warn := usage.Truncated || usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0 || usage.UnavailableRoot != "" || usage.ConfigError != ""
+	warn := usage.Truncated || usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0 || usage.UnavailableRoot != "" || len(usage.UnavailableRetiredRoots) > 0 || usage.ConfigError != ""
 	return doctor.Check{Name: "worktrees", OK: !warn, Required: false, Detail: detail}
 }

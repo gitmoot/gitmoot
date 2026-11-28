@@ -36,8 +36,9 @@ var (
 	// refusal, 7 by routing, 3 in TestMalformedHeaderRoutingRemainingLoaders,
 	// and review_router.go by TestReviewRouterMalformedHeaderEndsSection.
 	pinnedSectionHeaderSites = []string{
-		"cleanup_budget.go::LoadCleanupBudget",  // TestCleanupBudgetMalformedHeaderRefuses (#2360)
-		"worktrees.go::loadSingleSectionValues", // TestWorktreeRootMalformedHeaderRefuses (#2375), TestLoadJanitorCapacityRefusesInvalidSections (#2359)
+		"cleanup_budget.go::LoadCleanupBudget", // TestCleanupBudgetMalformedHeaderRefuses (#2360)
+		"worktrees.go::singleSectionValues",    // TestWorktreeRootMalformedHeaderRefuses (#2375), TestLoadJanitorCapacityRefusesInvalidSections (#2359), TestWorktreeRootHeaderSpellings (#2763)
+		"worktrees.go::arrayTableValues",       // TestLoadWorktreeRootRetiredRoots, TestWorktreeRootHeaderSpellings (#2763)
 		"admission.go::LoadAdmissionPolicy",
 		"credentials.go::LoadCredentialsConfig",
 		"daemon_runtime.go::LoadDaemonRuntimeConfig",

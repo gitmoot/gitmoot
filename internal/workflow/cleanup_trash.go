@@ -205,9 +205,10 @@ func (e Engine) moveWorktreeToTrash(ctx context.Context, jobID, path string, gen
 		return db.PendingCleanupTrash{}, fmt.Errorf("record cleanup trash: %w", err)
 	}
 	if err := mover.MoveWorktree(ctx, path, record.Path); err != nil {
-		if _, statErr := os.Lstat(record.Path); errors.Is(statErr, os.ErrNotExist) {
+		if _, statErr := os.Lstat(record.Path); errors.Is(statErr, os.ErrNotExist) && proveWorktreeAbsent(e.Home, record.Path) == nil {
 			// Nothing was created, and we still hold the checkout lock: close
-			// the record now. Otherwise the sweep handles what is there.
+			// the record now. Otherwise (including an unproven root) the sweep
+			// handles what is there.
 			err = errors.Join(err, e.recordCleanupTrashRemoved(ctx, jobID, record.Path))
 		}
 		return db.PendingCleanupTrash{}, fmt.Errorf("move producer worktree aside: %w", err)
@@ -337,6 +338,10 @@ func (e Engine) DisposeCleanupTrash(ctx context.Context, record db.PendingCleanu
 	}()
 	info, statErr := os.Lstat(trash)
 	if errors.Is(statErr, os.ErrNotExist) {
+		// Absent proves nothing while the owning root may have lost its mount (#2763 review).
+		if err := proveWorktreeAbsent(e.Home, trash); err != nil {
+			return fmt.Errorf("cleanup trash %s: %w", trash, err)
+		}
 		return e.recordCleanupTrashRemoved(ctx, job.ID, trash)
 	}
 	if statErr != nil {

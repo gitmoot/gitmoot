@@ -19,7 +19,7 @@ func verifyWorktreeMount(cfg config.WorktreeRoot) (uint64, error) {
 }
 
 // WorktreeStorageDevice cannot prove a network mount off Linux; retain coverage.
-func WorktreeStorageDevice(path string, _ config.WorktreeRoot) (uint64, bool, error) {
+func WorktreeStorageDevice(path string, _ ...config.WorktreeRoot) (uint64, bool, error) {
 	for p := filepath.Clean(path); ; p = filepath.Dir(p) {
 		info, err := os.Stat(p)
 		if err == nil {

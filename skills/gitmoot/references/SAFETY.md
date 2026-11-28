@@ -41,6 +41,15 @@ What gitmoot enforces today, and what a seat must not work around.
   them to the review prompt.
 - The disk guard refuses new dispatches when the gitmoot home's filesystem is
   below its free-space floor (`[disk_guard]`, default 2 GiB and 5%).
+- **Worktree roots and `[[worktrees.retired]]`.** Moving `[worktrees]` to a new
+  root keeps each former root — together with its `mount_point`, `mount_source`,
+  and `mount_fstype` keys — as a `[[worktrees.retired]]` entry so existing
+  worktrees there can still be reopened, cleaned up, and accounted for. Retired
+  roots never serve new allocations. Their `fuse.sshfs` mount keys also keep
+  checkouts still on that mount out of review and janitor host-disk capacity
+  measurement. An `unavailableRetiredRoots` warning from `gitmoot doctor` means
+  a retired root failed preflight (for example, its mount is absent), so cleanup
+  of worktrees under it waits rather than treating missing paths as removed.
 
 ## The merge gate
 
