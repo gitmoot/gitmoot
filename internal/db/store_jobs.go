@@ -642,6 +642,29 @@ func (s *Store) ListReviewJobsForPullRequest(ctx context.Context, repo string, p
 	return scanJobs(rows)
 }
 
+// ListRecentReviewJobsByActingRole returns review jobs whose payload acting
+// org role is role (case-insensitive) and that are queued, running, or were
+// created or updated on or after sinceDate (a YYYY-MM-DD day; callers apply
+// the exact time window), newest first. It serves `org seat status`, whose
+// seat's own post-merge reviews run on merged PRs (#2770).
+func (s *Store) ListRecentReviewJobsByActingRole(ctx context.Context, role, sinceDate string) ([]Job, error) {
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role == "" {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs
+		WHERE type = 'review'
+			AND (state IN ('queued', 'running') OR substr(created_at, 1, 10) >= ? OR substr(updated_at, 1, 10) >= ?)
+			AND json_valid(payload)
+			AND json_type(payload, '$.acting_org_role') = 'text'
+			AND lower(trim(json_extract(payload, '$.acting_org_role'))) = ?
+		ORDER BY created_at DESC, id DESC`, sinceDate, sinceDate, role)
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
+}
+
 // ListReviewJobsAtHeads returns the succeeded review jobs of repo (compared
 // case-insensitively; rows whose repo projection is unset are included for the
 // caller to match by payload) whose payload head_sha is one of heads, compared

@@ -812,6 +812,74 @@ func TestOrgSeatStatusSeverityRollupBareStringAndSuperseded(t *testing.T) {
 	}
 }
 
+// A seat's own post-merge (level 2) review runs on a merged PR; it must still
+// appear, while another role's review on that merged PR stays out (#2770).
+func TestOrgSeatStatusIncludesOwnReviewsOnMergedPRs(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	home := setupOrgSeatStatusFixture(t, now)
+
+	store, err := db.OpenAlreadyMigrated(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	ctx := context.Background()
+	rawDB, err := sql.Open("sqlite", config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	defer rawDB.Close()
+	createReview := func(id, role string, pr int, age time.Duration) {
+		t.Helper()
+		raw, err := json.Marshal(workflow.JobPayload{
+			Repo:          "acme/other",
+			PullRequest:   pr,
+			HeadSHA:       "2222222333333344444445555555666666677777",
+			ActingOrgRole: role,
+			Result:        &workflow.AgentResult{Decision: "approved"},
+		})
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		if err := store.CreateJob(ctx, db.Job{
+			ID: id, Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded), Payload: string(raw),
+		}); err != nil {
+			t.Fatalf("create job %s: %v", id, err)
+		}
+		ts := now.Add(-age).Format("2006-01-02 15:04:05")
+		if _, err := rawDB.ExecContext(ctx, `UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`, ts, ts, id); err != nil {
+			t.Fatalf("update timestamps %s: %v", id, err)
+		}
+	}
+	createReview("job-own-post-merge", "builder", 35, 2*time.Hour)
+	createReview("job-other-role", "someone-else", 36, 2*time.Hour)
+	createReview("job-own-stale", "builder", 37, 30*time.Hour)
+	_ = store.Close()
+
+	stubOrgSeatStatus(t, &fakeOrgSeatStatusGitHub{pulls: map[string]github.PullRequest{
+		"acme/widget#10": {Number: 10, State: "open", HeadSHA: "1111111222222233333334444444555555566666", MergeableState: "clean"},
+	}}, now)
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "seat", "status", "--role", "builder", "--json", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+	var got orgSeatStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal json: %v\n%s", err, stdout.String())
+	}
+	byID := make(map[string]orgSeatStatusReview, len(got.Reviews.Items))
+	for _, r := range got.Reviews.Items {
+		byID[r.RunID] = r
+	}
+	if r, ok := byID["job-own-post-merge"]; !ok || r.Repo != "acme/other" || r.PR != 35 {
+		t.Fatalf("own post-merge review = %+v (found=%v); reviews = %+v", r, ok, got.Reviews.Items)
+	}
+	for _, id := range []string{"job-other-role", "job-own-stale"} {
+		if _, ok := byID[id]; ok {
+			t.Fatalf("%s must not appear; reviews = %+v", id, got.Reviews.Items)
+		}
+	}
+}
+
 func TestOrgSeatStatusFailedCILookupRendersUnavailable(t *testing.T) {
 	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
 	home := setupOrgSeatStatusFixture(t, now)
