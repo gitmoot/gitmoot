@@ -107,7 +107,8 @@ type PullRequest struct {
 	BaseSHA          string
 	HeadSHA          string
 	MergeSHA         string
-	Mergeable        *bool `json:"mergeable"`
+	Mergeable        *bool  `json:"mergeable"`
+	MergeableState   string `json:"mergeable_state,omitempty"`
 	// Labels carries the PR's GitHub labels (parsed from the list/get JSON, no
 	// extra API call). It is additive (#650): existing callers that ignore it are
 	// byte-identical; the opt-in risk classifier reads label names from it.
@@ -142,17 +143,18 @@ func (p PullRequest) LabelNames() []string {
 
 func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	type wire struct {
-		Number    int64           `json:"number"`
-		Title     string          `json:"title"`
-		State     string          `json:"state"`
-		URL       string          `json:"html_url"`
-		Merged    bool            `json:"merged"`
-		Draft     json.RawMessage `json:"draft"`
-		MergedAt  string          `json:"merged_at"`
-		Body      string          `json:"body"`
-		Mergeable *bool           `json:"mergeable"`
-		MergeSHA  string          `json:"merge_commit_sha"`
-		Head      struct {
+		Number         int64           `json:"number"`
+		Title          string          `json:"title"`
+		State          string          `json:"state"`
+		URL            string          `json:"html_url"`
+		Merged         bool            `json:"merged"`
+		Draft          json.RawMessage `json:"draft"`
+		MergedAt       string          `json:"merged_at"`
+		Body           string          `json:"body"`
+		Mergeable      *bool           `json:"mergeable"`
+		MergeableState string          `json:"mergeable_state"`
+		MergeSHA       string          `json:"merge_commit_sha"`
+		Head           struct {
 			Ref  string `json:"ref"`
 			SHA  string `json:"sha"`
 			Repo *struct {
@@ -187,6 +189,7 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	p.MergedAt = decoded.MergedAt
 	p.Body = decoded.Body
 	p.Mergeable = decoded.Mergeable
+	p.MergeableState = strings.TrimSpace(decoded.MergeableState)
 	p.HeadRef = decoded.Head.Ref
 	p.HeadRepoFullName = ""
 	if decoded.Head.Repo != nil {
@@ -292,11 +295,12 @@ func issueNumberFromURL(issueURL string) int64 {
 }
 
 type Issue struct {
-	Number int64  `json:"number"`
-	Title  string `json:"title"`
-	State  string `json:"state"`
-	URL    string `json:"html_url"`
-	Body   string `json:"body"`
+	Number    int64  `json:"number"`
+	Title     string `json:"title"`
+	State     string `json:"state"`
+	URL       string `json:"html_url"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at,omitempty"`
 	// IsPullRequest is true when this row came back from the /issues listing as a
 	// pull request. The GitHub issues endpoint returns issues AND PRs; PRs carry
 	// a `pull_request` object. Callers that want plain issues filter these out so
@@ -311,6 +315,7 @@ func (i *Issue) UnmarshalJSON(data []byte) error {
 		State       string          `json:"state"`
 		URL         string          `json:"html_url"`
 		Body        string          `json:"body"`
+		CreatedAt   string          `json:"created_at"`
 		PullRequest json.RawMessage `json:"pull_request"`
 	}
 	var decoded wire
@@ -322,6 +327,7 @@ func (i *Issue) UnmarshalJSON(data []byte) error {
 	i.State = decoded.State
 	i.URL = decoded.URL
 	i.Body = decoded.Body
+	i.CreatedAt = decoded.CreatedAt
 	i.IsPullRequest = len(decoded.PullRequest) > 0 && string(decoded.PullRequest) != "null"
 	return nil
 }
@@ -669,10 +675,32 @@ func (c *GhClient) ListRecentClosedPullRequests(ctx context.Context, repo Reposi
 // so the result is filtered down to plain issues here (IsPullRequest == true is
 // dropped) to keep the issue-comment watcher from duplicating the PR-watcher.
 func (c *GhClient) ListIssues(ctx context.Context, repo Repository, state string) ([]Issue, error) {
+	return c.listIssues(ctx, repo, state, nil)
+}
+
+// ListOpenIssuesWithLabels returns open non-PR issues in repo carrying all
+// specified labels.
+func (c *GhClient) ListOpenIssuesWithLabels(ctx context.Context, repo Repository, labels []string) ([]Issue, error) {
+	if strings.TrimSpace(repo.FullName()) == "" {
+		return nil, fmt.Errorf("repository owner/name is required")
+	}
+	return c.listIssues(ctx, repo, "open", labels)
+}
+
+func (c *GhClient) listIssues(ctx context.Context, repo Repository, state string, labels []string) ([]Issue, error) {
 	if state == "" {
 		state = "open"
 	}
 	args := []string{"-X", "GET", endpoint(repo, "issues"), "-f", "state=" + state}
+	cleaned := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if trimmed := strings.TrimSpace(label); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	if len(cleaned) > 0 {
+		args = append(args, "-f", "labels="+strings.Join(cleaned, ","))
+	}
 	var issues []Issue
 	var err error
 	if conditionalEnabled() {

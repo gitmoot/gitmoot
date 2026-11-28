@@ -66,6 +66,7 @@ disagrees, trust its live `--help`.
 - [gitmoot org seat add](#gitmoot-org-seat-add)
 - [gitmoot org seat bind](#gitmoot-org-seat-bind)
 - [gitmoot org seat rm](#gitmoot-org-seat-rm)
+- [gitmoot org seat status](#gitmoot-org-seat-status)
 - [gitmoot org show](#gitmoot-org-show)
 - [gitmoot org status](#gitmoot-org-status)
 - [gitmoot org validate](#gitmoot-org-validate)
@@ -726,6 +727,7 @@ Usage:
   gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]
   gitmoot org seat bind --name ROLE --agent NAME [--home DIR]
   gitmoot org seat rm NAME [--force] [--no-checkout] [--home DIR]
+  gitmoot org seat status [--role ROLE] [--json] [--home DIR]
   gitmoot org await review --repo OWNER/REPO --pr NUMBER --head SHA --ttl DURATION [--role ROLE] [--home DIR]
   gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired|superseded] [--json] [--home DIR]
   gitmoot org await withdraw [--role ROLE] --reason TEXT [--home DIR] ID
@@ -883,6 +885,7 @@ Usage:
   gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]
   gitmoot org seat bind --name ROLE --agent NAME [--home DIR]
   gitmoot org seat rm NAME [--force] [--no-checkout] [--home DIR]
+  gitmoot org seat status [--role ROLE] [--json] [--home DIR]
 ```
 
 ## gitmoot org seat add
@@ -925,6 +928,18 @@ Usage of org seat rm:
     	home directory to use instead of the current user's home
   -no-checkout
     	the seat works outside any Git checkout: allow removal when its pane directories are not a Git checkout (a checkout that is found is still inspected)
+```
+
+## gitmoot org seat status
+
+```text
+Usage of org seat status:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print JSON
+  -role string
+    	organization role to inspect (defaults to GITMOOT_ORG_ROLE or bound Herdr pane)
 ```
 
 ## gitmoot org show

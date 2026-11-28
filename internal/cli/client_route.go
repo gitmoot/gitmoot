@@ -159,22 +159,46 @@ func claimTurnHookViaHub(request turnHookRequest) (handled bool, output *turnHoo
 	return true, answer.HookOutput, nil
 }
 
-// openOrgDatabase opens the org database, refusing on a hub client home
-// (#2710): a client has no org database of its own, and opening one would
-// answer from an empty store as if the org had no work.
+// ensureLocalOrgHome refuses when paths points at a hub client home (#2710):
+// a client has no org database of its own, and opening one would answer from
+// an empty store as if the org had no work.
 //
 // A config file that cannot be read is not a client: [client] cannot be in
 // effect without a readable file, and the database must stay reachable then
 // (an unwritable or missing config plane never blocked it before). A
 // [client] section that is present but invalid still refuses.
-func openOrgDatabase(paths config.Paths) (*db.Store, error) {
+func ensureLocalOrgHome(paths config.Paths) error {
 	client, err := config.LoadClientConfig(paths)
 	var unreadable *fs.PathError
 	if err != nil && !errors.As(err, &unreadable) {
-		return nil, err
+		return err
 	}
 	if client.Enabled() {
-		return nil, errHubClientHome
+		return errHubClientHome
+	}
+	return nil
+}
+
+// openOrgDatabase opens the org database, refusing on a hub client home (#2710).
+func openOrgDatabase(paths config.Paths) (*db.Store, error) {
+	if err := ensureLocalOrgHome(paths); err != nil {
+		return nil, err
 	}
 	return db.Open(paths.Database)
+}
+
+// openOrgDatabaseReadOnly opens the org database read-only without creating it
+// or running migrations, while keeping the hub-client guard (#2710). If the
+// database file does not exist, it returns os.ErrNotExist.
+func openOrgDatabaseReadOnly(paths config.Paths) (*db.Store, error) {
+	if err := ensureLocalOrgHome(paths); err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(paths.Database); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	return db.OpenReadOnly(paths.Database)
 }

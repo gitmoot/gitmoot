@@ -136,6 +136,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat bind --name ROLE --agent NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--no-checkout] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat status [--role ROLE] [--json] [--home DIR]")
 
 	fmt.Fprintln(w, "  gitmoot org await review --repo OWNER/REPO --pr NUMBER --head SHA --ttl DURATION [--role ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired|superseded] [--json] [--home DIR]")
@@ -166,6 +167,8 @@ func runOrgSeat(args []string, stdout, stderr io.Writer) int {
 		return runOrgSeatBind(args[1:], stdout, stderr)
 	case "rm":
 		return runOrgSeatRemove(args[1:], stdout, stderr)
+	case "status":
+		return runOrgSeatStatus(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown org seat command %q\n", args[0])
 		printOrgSeatUsage(stderr)
@@ -178,6 +181,7 @@ func printOrgSeatUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat bind --name ROLE --agent NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--no-checkout] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat status [--role ROLE] [--json] [--home DIR]")
 }
 
 func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
